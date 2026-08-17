@@ -51,13 +51,12 @@ def ripemd(x: bytes) -> bytes:
         md.update(x)
         return md.digest()
     except BaseException:
-        # ripemd160 is not guaranteed to be available in hashlib on all platforms.
-        # Historically, our Android builds had hashlib/openssl which did not have it.
-        # see https://github.com/spesmilo/electrum/issues/7093
-        # We bundle a pure python implementation as fallback that gets used now:
-        from . import ripemd
-        md = ripemd.new(x)
-        return md.digest()
+        # ripemd160 is not guaranteed in hashlib on all platforms/openssl
+        # builds (spesmilo/electrum#7093). Fallback is pycryptodome —
+        # the 393-line hand-rolled pure-python ripemd.py was removed
+        # during the 4.8 port (library policy: no hand-rolled crypto).
+        from Crypto.Hash import RIPEMD160
+        return RIPEMD160.new(x).digest()
 
 
 def hmac_oneshot(key: bytes, msg: bytes, digest) -> bytes:
