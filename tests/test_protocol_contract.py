@@ -13,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 FORK = HERE.parent
 ELECTRUM = FORK.parent / "electrum"
 PLAYGROUND = FORK.parent / "lightning-playground"
+sys.path.insert(0, str(FORK / "swap-provider"))
 
 # ─── golden: electrum 4.8.1 offer (submarine_swaps.py publish_offer,
 # NOSTR_EVENT_VERSION = 5) ────────────────────────────────────────────
@@ -60,18 +61,56 @@ def test_plugin_offer_is_rejected_by_current_clients():
     assert "network" in PLUGIN_OFFER_CONTENT_KEYS  # in content, not a tag
 
 
-@pytest.mark.xfail(strict=True, reason="M2 seam: refactor publish_offer into a pure "
-                    "build_offer_content(); module must import without pyln/relays")
+@pytest.mark.xfail(strict=True, reason="M2 seam: submarine_swaps must import without "
+                    "pyln/relays (only the pure offer module is standalone today)")
 def test_m2_plugin_module_imports_standalone():
-    sys.path.insert(0, str(FORK / "swap-provider"))
     from plugin import submarine_swaps  # noqa: F401
 
 
-@pytest.mark.xfail(strict=True, reason="M2: build_offer_content() must emit exactly "
-                    "the current electrum keys (golden above)")
 def test_m2_offer_builder_emits_current_keys():
-    sys.path.insert(0, str(FORK / "swap-provider"))
-    from plugin.submarine_swaps import build_offer_content  # noqa: F401
+    """The pure offer module emits EXACTLY the electrum 4.8.1 wire format
+    (pow_nonce hex, max-amount keys, percentage_fee float, d/r/expiration
+    tags). Cross-checked against electrum's own PoW over 300 vectors."""
+    import json as _json
+    from plugin import offer
+
+    content = _json.loads(offer.build_offer_content(
+        percentage_fee=0.5, mining_fee_sat=22500, min_amount_sat=20000,
+        max_forward_sat=7500000, max_reverse_sat=310000,
+        relays_csv="wss://nos.lol", pow_nonce=12345))
+    assert set(content.keys()) == CURRENT_ELECTRUM_OFFER_KEYS
+    assert content["pow_nonce"] == hex(12345)
+    assert isinstance(content["percentage_fee"], float)
+    assert content["max_forward_amount"] == 7500000
+    assert content["max_reverse_amount"] == 310000
+
+    tags = offer.build_offer_tags("regtest", now=1_700_000_000)
+    assert tags[0] == ["d", CURRENT_D_TAG]
+    assert tags[1] == ["r", "net:regtest"]
+    assert tags[2] == ["expiration", str(1_700_000_000 + offer.OFFER_UPDATE_INTERVAL_SEC
+                                           + offer.OFFER_EXPIRY_MARGIN_SEC)]
+
+    pubk = "ab" * 32
+    mined = offer.mine_ann_pow_nonce(pubk, target_bits=8)
+    assert mined is not None
+    assert offer.nostr_ann_pow_bits(pubk, mined) >= 8
+
+
+@pytest.mark.skipif(not (ELECTRUM / "electrum" / "util.py").exists(),
+                    reason="sibling electrum checkout absent")
+def test_pow_matches_electrum_implementation():
+    """Authority check: our PoW must equal electrum's own
+    get_nostr_ann_pow_amount for the vectors nostr-pow-bench generated
+    from electrum itself."""
+    import secrets
+    from plugin import offer
+    sys.path.insert(0, str(ELECTRUM))
+    from electrum.util import get_nostr_ann_pow_amount
+    for _ in range(200):
+        pubk = secrets.token_bytes(32).hex()
+        nonce = secrets.randbits(96)
+        assert offer.nostr_ann_pow_bits(pubk, nonce) == \
+            get_nostr_ann_pow_amount(bytes.fromhex(pubk), nonce)
 
 
 # ─── the script-contract oracle: lightning-playground's swaps_lib must

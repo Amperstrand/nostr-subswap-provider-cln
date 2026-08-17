@@ -874,24 +874,26 @@ class NostrTransport:  # (Logger):
 
     async def publish_offer(self):
         assert self.sm.is_server
-        update = {
-            "version": self.NOSTR_EVENT_VERSION,
-            'network': constants.net.NET_NAME,
-            'relays': self.sm.config.nostr_relays_csv,'percentage_fee': self.sm.percentage,
-            'normal_mining_fee': self.sm.normal_fee,
-            'reverse_mining_fee': self.sm.lockup_fee,
-            'claim_mining_fee': self.sm.claim_fee,
-            'min_amount': self.sm._min_amount,
-            'max_amount': self.sm._max_amount,
-        }
-        tags = [['d', 'electrum-swap-announcement'], ['expiration', str(int(time.time() + self.FEE_UPDATE_INVERVAL_SEC))]]
+        # wire format: plugin.offer (electrum 4.8.1 parity; the old
+        # 2025 format — no pow_nonce, pre-versioning d-tag — is rejected
+        # by every current client; see PORT-NOTES.md)
+        from .offer import build_offer_content, build_offer_tags
+        content = build_offer_content(
+            percentage_fee=self.sm.percentage,
+            mining_fee_sat=self.sm.normal_fee,
+            min_amount_sat=self.sm._min_amount,
+            max_forward_sat=self.sm._max_amount,
+            max_reverse_sat=self.sm._max_amount,
+            relays_csv=self.sm.config.nostr_relays_csv,
+            pow_nonce=self.config.ann_pow_nonce)
+        tags = build_offer_tags(net_name=self.config.net_name)
         event_id = await aionostr._add_event(
             self.relay_manager,
             kind=self.STATUS_NIP38,
-            content=json.dumps(update),
+            content=content,
             tags=tags,
             private_key=self.nostr_private_key)
-        self.logger.debug(f'published fee update. Update: {update} | Event id: {event_id}')
+        self.logger.debug(f'published offer: {content} | event id: {event_id}')
         self.sm.is_initialized.set()
 
     @log_exceptions

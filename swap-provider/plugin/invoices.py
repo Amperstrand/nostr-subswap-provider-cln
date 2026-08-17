@@ -260,6 +260,26 @@ class HoldInvoice:
                 stored_htlc.fail()
         self.funding_status = InvoiceState.FAILED
 
+    HTLC_EXPIRY_HORIZON_SEC = 60 * 10
+
+    def cancel_expired_htlcs(self, horizon_sec: int = None) -> bool:
+        """Fail accepted HTLCs older than the horizon (stale partial
+        payments — e.g. a payer abandoned an incomplete MPP set). The
+        hold callback fires per HTLC via fail_timeout (mpp timeout
+        failure code). Returns True if any HTLC was cancelled.
+        (Implemented during the 4.8 port: the upstream test exercised
+        this method but no implementation had landed before archival.)"""
+        if horizon_sec is None:
+            horizon_sec = self.HTLC_EXPIRY_HORIZON_SEC
+        now = int(time.time())
+        changed = False
+        for stored_htlc in self.incoming_htlcs:
+            if stored_htlc.state == HtlcState.ACCEPTED and \
+                    now - stored_htlc.created_at > horizon_sec:
+                stored_htlc.fail_timeout()
+                changed = True
+        return changed
+
     def settle(self, preimage: Union[bytes, str]) -> None:
         """Settle the invoice with the given preimage"""
         if isinstance(preimage, str):

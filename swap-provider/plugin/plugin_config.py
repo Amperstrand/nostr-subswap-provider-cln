@@ -11,13 +11,15 @@ from .json_db import StoredObject
 from .cln_logger import PluginLogger
 from . import constants
 from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest
-from .bitcoin_core_rpc import BitcoinRPCCredentials
 
 
 class PluginConfig:
 
     """Simple configuration class for swap server"""
     def __init__(self, *, nostr_secret: bytes, cln_configuration: dict, logger: PluginLogger):
+        # lazy: keeps this module importable without the bitcoinrpc fork
+        # (config/PoW tests must not need a running node)
+        from .bitcoin_core_rpc import BitcoinRPCCredentials
         self.nostr_keypair = Keypair.from_private_key(nostr_secret) # plugin.derive_secret("NOSTRSECRET"))
         self.cln_config: dict = cln_configuration
         self.bcore_rpc_credentials = BitcoinRPCCredentials.from_cln_config_dict(cln_configuration)
@@ -42,6 +44,37 @@ class PluginConfig:
                             cln_configuration=cln_plugin_handler.fetch_cln_configuration(),
                             logger=logger)
         constants.net = config.network
+
+        # electrum 4.8.1 announcement PoW: current clients discard offers
+        # whose pow_nonce doesn't reach the target bits. ANN_POW_NONCE
+        # pins a pre-mined nonce (30-bit targets: mine externally with
+        # ../nostr-pow-bench, ~90s rust / ~1s cuda); ANN_POW_TARGET below
+        # 24 bits is mined in-process at startup (regtest/tests).
+        from .offer import mine_ann_pow_nonce, nostr_ann_pow_bits
+        config.ann_pow_target_bits = int(os.getenv("ANN_POW_TARGET_BITS", "30").strip())
+        if pinned := os.getenv("ANN_POW_NONCE"):
+            config.ann_pow_nonce = int(pinned.strip(), 0)
+            achieved = nostr_ann_pow_bits(config.nostr_keypair.pubkey.hex()[2:],
+                                          config.ann_pow_nonce)
+            if achieved < config.ann_pow_target_bits:
+                raise Exception(f"pinned ANN_POW_NONCE reaches only {achieved} bits "
+                                f"(< target {config.ann_pow_target_bits}); clients would "
+                                f"discard the offer. Mine a nonce for THIS nostr pubkey "
+                                f"with ../nostr-pow-bench, or lower ANN_POW_TARGET_BITS.")
+        elif config.ann_pow_target_bits <= 24:
+            mined = mine_ann_pow_nonce(config.nostr_keypair.pubkey.hex()[2:],
+                                       config.ann_pow_target_bits, deadline_s=120)
+            if mined is None:
+                raise Exception(f"in-process PoW mining did not reach "
+                                f"{config.ann_pow_target_bits} bits in 120s")
+            config.ann_pow_nonce = mined
+        else:
+            raise Exception(f"ANN_POW_TARGET_BITS={config.ann_pow_target_bits} "
+                            f"requires ANN_POW_NONCE (pin a nonce mined with "
+                            f"../nostr-pow-bench for pubkey "
+                            f"{config.nostr_keypair.pubkey.hex()[2:]})")
+        config.net_name = config.network.NET_NAME
+
         if relays := os.getenv("NOSTR_RELAYS"):
             config.nostr_relays.extend(url.strip() for url in relays.split(","))
         else:
