@@ -61,9 +61,10 @@ def test_plugin_offer_is_rejected_by_current_clients():
     assert "network" in PLUGIN_OFFER_CONTENT_KEYS  # in content, not a tag
 
 
-@pytest.mark.xfail(strict=True, reason="M2 seam: submarine_swaps must import without "
-                    "pyln/relays (only the pure offer module is standalone today)")
 def test_m2_plugin_module_imports_standalone():
+    """Flipped green in M2: CLN-bound collaborators are TYPE_CHECKING-only
+    + future-annotations, so the protocol/wire core imports without pyln
+    or a node. (Found + fixed two upstream import-crashers doing this.)"""
     from plugin import submarine_swaps  # noqa: F401
 
 

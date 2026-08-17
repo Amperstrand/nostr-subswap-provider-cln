@@ -1,3 +1,6 @@
+# annotations stay unevaluated so CLN-bound types (TYPE_CHECKING-only
+# imports below) can appear in signatures without pyln at import time
+from __future__ import annotations
 import asyncio
 import traceback
 
@@ -27,11 +30,17 @@ from . import constants
 from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_DELTA,
                        MIN_FINAL_CLTV_DELTA_FOR_CLIENT, CLAIM_FEE_SIZE, LOCKUP_FEE_SIZE,
                         MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE)
-from .cln_chain import CLNChainWallet
-from .cln_lightning import CLNLightning, InvoiceNotFoundError
+# CLN-bound collaborators are import-time-free so the protocol/wire logic
+# (swap scripts, offers, fee math) stays testable without a node — the
+# cln_* classes only appear in annotations; InvoiceNotFoundError is
+# imported at its single raise site.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .cln_chain import CLNChainWallet
+    from .cln_lightning import CLNLightning
+    from .chain_monitor import ChainMonitor
 from .plugin_config import PluginConfig
 from .cln_logger import PluginLogger
-from .chain_monitor import ChainMonitor
 
 
 # REVERSE SWAPS:
@@ -220,6 +229,7 @@ class SwapManager:
         self.invoices_to_pay[key] = 1000000000000 # lock
         try:
             if (invoice := self.lnworker.get_invoice(key)) is None:
+                from .cln_lightning import InvoiceNotFoundError
                 raise InvoiceNotFoundError()
             success, log = await self.lnworker.pay_invoice(bolt11=invoice.lightning_invoice, attempts=5)
         except Exception:
@@ -612,7 +622,9 @@ class SwapManager:
         )
         return tx
 
-    @log_exceptions
+    # upstream bug (port find #2): @log_exceptions asserts its target is
+    # a coroutine — on this sync method it crashed the entire module at
+    # import, so upstream's own tests could never import it
     def broadcast_funding_tx(self, swap: SwapData, tx: PartialTransaction) -> None:
         swap.funding_txid = tx.txid()
         self.wallet.broadcast_transaction(tx)
