@@ -18,10 +18,13 @@ class BitcoinCoreRPC:
     def __init__(self, logger: PluginLogger,
                         bcore_rpc_credentials: 'BitcoinRPCCredentials' = None):
         self._wallet_name = "cln-subswapplugin"
-        self.iface = BitcoinRPC.from_config(url=bcore_rpc_credentials.url,
-                                            auth=bcore_rpc_credentials.auth,
-                                            wallet_name=self._wallet_name,)
+        # PyPI bitcoinrpc selects wallets via the URL path (/wallet/<name>),
+        # unlike the dead f321x fork's wallet_name kwarg
+        self.iface = BitcoinRPC.from_config(
+            url=f"{bcore_rpc_credentials.url}/wallet/{self._wallet_name}",
+            auth=bcore_rpc_credentials.auth,)
         self._logger = logger
+        self._network = bcore_rpc_credentials.network
 
     async def _test_connection(self) -> None:
         """Test the connection to the Bitcoin Core node"""
@@ -99,8 +102,11 @@ class BitcoinCoreRPC:
 
             blockheader = await self.iface.getblockheader(block_hash=result["bestblockhash"],
                                                           verbose=True)
-            # if last block is older than 60 minutes something is probably wrong and we should wait
-            if blockheader["time"] < time.time() - 60 * 60:
+            # freshness gate makes sense on live networks only: regtest
+            # chains sit idle between lab actions (tip hours old), which
+            # deadlocked the plugin's startup sync forever (port find #3)
+            if self._network != "regtest" and \
+                    blockheader["time"] < time.time() - 60 * 60:
                 return False
         except Exception as e:
             raise BitcoinCoreRPCError(f"ChainMonitor is_up_to_date: Could not get blockchain info: {e}")
@@ -311,16 +317,30 @@ class BitcoinRPCCredentials:
     datadir: Optional[str] = None
     timeout: int = attr.ib(default=60, validator=attr.validators.instance_of(int))
 
+    # CLN ≥24.11 omits default-valued configs from listconfigs entirely
+    # (observed on v26.06: bitcoin-rpcport absent on regtest) — the
+    # per-network default is used when the key is missing
+    _NETWORK_DEFAULT_RPCPORT = {
+        "bitcoin": 8332, "testnet": 18332, "signet": 38332, "regtest": 18443,
+    }
+
+    network: Optional[str] = None
+
     @classmethod
     def from_cln_config_dict(cls, cln_config: dict) -> "BitcoinRPCCredentials":
         """Load the credentials from the cln config dict fetched with lightning-listconfigs"""
+        network = cln_config.get("network", {}).get("value_str", "bitcoin")
+        rpcport_entry = cln_config.get("bitcoin-rpcport")
+        port = (rpcport_entry or {}).get(
+            "value_int", cls._NETWORK_DEFAULT_RPCPORT.get(network, 8332))
         return cls(
             host=cln_config["bitcoin-rpcconnect"]["value_str"],
-            port=cln_config["bitcoin-rpcport"]["value_int"],
+            port=port,
             user=cln_config["bitcoin-rpcuser"]["value_str"],
             password=cln_config["bitcoin-rpcpassword"]["value_str"],
             datadir=cln_config.get("bitcoin-datadir", {}).get("value_str"),
-            timeout=cln_config.get("bitcoin-rpcclienttimeout", {}).get("value_int", 60)
+            timeout=cln_config.get("bitcoin-rpcclienttimeout", {}).get("value_int", 60),
+            network=network,
         )
 
     def __str__(self) -> str:

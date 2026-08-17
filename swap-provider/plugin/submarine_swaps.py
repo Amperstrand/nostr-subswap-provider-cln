@@ -865,6 +865,18 @@ class NostrTransport:  # (Logger):
         self.logger.info(f'starting nostr transport with pubkey: {self.nostr_pubkey}')
         self.logger.info(f'nostr relays: {self.relays}')
         await self.relay_manager.connect()
+        # electrum_aionostr's connect() is fire-and-forget: it returns
+        # before websocket handshakes finish, filters self.relays to the
+        # already-connected (often none), and a subscribe over zero
+        # relays cleanly ENDS the get_events generator (empty-queue EOSE
+        # sentinel) — the DM listener died instantly and silently with
+        # the 2025 fork's blocking connect(). Wait for readiness.
+        for _ in range(120):
+            if any(r.connected for r in self.relay_manager.relays):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            self.logger.error("nostr relays never became ready")
         self.is_connected.set()
         try:
             async with self.taskgroup as group:
