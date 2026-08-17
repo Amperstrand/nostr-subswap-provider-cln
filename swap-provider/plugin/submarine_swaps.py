@@ -831,7 +831,10 @@ class NostrTransport:  # (Logger):
     #  - for client-server RPCs (using DMs)
     #     (todo: we should use onion messages for that)
 
-    NOSTR_DM = 4
+    # electrum ≥4.6 uses ephemeral kind 25582 for swap DMs (the plugin's
+    # 2025-era kind 4 never sees current clients' requests — port find #7;
+    # matches boltz-bridge's nostr-transport kind)
+    NOSTR_DM = 25582
     STATUS_NIP38 = 30315
     FEE_UPDATE_INVERVAL_SEC = 60*10
     NOSTR_EVENT_TIMEOUT = 60*60*24
