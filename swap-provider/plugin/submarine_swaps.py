@@ -964,10 +964,17 @@ class NostrTransport:  # (Logger):
 
 
     async def send_direct_message(self, pubkey: str, content: str) -> str:
+        # PORT FIND #8: electrum_aionostr's direct_message= kwarg FORCES
+        # kind=4, overriding kind= — replies went out as kind 4 while
+        # current clients listen on 25582 and never matched them. Mirror
+        # electrum's own server path: pre-encrypt, explicit kind, p-tag.
+        our_private_key = aionostr.key.PrivateKey(self.private_key)
+        recv_pubkey_hex = aionostr.util.from_nip19(pubkey)['object'].hex() if pubkey.startswith('npub') else pubkey
+        encrypted = our_private_key.encrypt_message(content, recv_pubkey_hex)
         event_id = await aionostr._add_event(
             self.relay_manager,
             kind=self.NOSTR_DM,
-            content=content,
+            content=encrypted,
             private_key=self.nostr_private_key,
-            direct_message=pubkey)
+            tags=[['p', recv_pubkey_hex]])
         return event_id
