@@ -655,7 +655,7 @@ class SwapManager:
         # specifically: an invoice whose rhash != swap hash must NEVER be
         # accepted (observed live 2026-08-19: external provider c70d7bc9
         # accepted a mismatched invoice and claimed the client's lockup —
-        # playground issue #15 evidence).
+        # playground issue #16 evidence).
         try:
             invoice = Invoice.from_bech32(request['invoice'])
         except Exception as e:
