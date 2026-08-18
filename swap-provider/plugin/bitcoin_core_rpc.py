@@ -78,10 +78,24 @@ class BitcoinCoreRPC:
             raise BitcoinCoreRPCError(f"ChainMonitor: Could not get wallet info: {e}")
 
     async def _init(self):
-        """Initialize the Bitcoin Core RPC connection"""
+        """Initialize the Bitcoin Core RPC connection. Retries: bitcoind
+        (or its wallet) may still be starting when the plugin launches —
+        a single-shot connect killed the plugin on fast lab resets and
+        would kill it on any node restart race (port find #11)."""
         assert self.iface is not None, "ChainMonitor: Bitcoin Core RPC interface not set"
         assert self._logger is not None, "ChainMonitor: Logger not set"
-        await self._test_connection()
+        last_err = None
+        for attempt in range(60):
+            try:
+                await self._test_connection()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt % 6 == 0:
+                    self._logger.info(f"ChainMonitor: waiting for Bitcoin Core: {e}")
+                await asyncio.sleep(5)
+        else:
+            raise BitcoinCoreRPCError(f"ChainMonitor: bitcoind never came up: {last_err}")
         if not await self._txindex_enabled():
             raise BitcoinCoreRPCError("ChainMonitor: txindex is not enabled")
         await self._create_or_load_wallet(self._wallet_name)

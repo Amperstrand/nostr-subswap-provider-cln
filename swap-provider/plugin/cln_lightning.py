@@ -57,6 +57,7 @@ class CLNLightning:
         self._preimages = db.get_dict('lightning_preimages')  # RHASH -> preimage
         self._invoices = db.get_dict('invoices')  # type: Dict[str, Invoice]
         self._hold_invoices = db.get_dict('hold_invoices')  # type: Dict[str, HoldInvoice]  # HASH[hex] -> bolt11
+        self._decoded_invoices = {}  # bolt11 -> decoded dict (see handle_htlc)
         self._payment_secret_key = plugin_instance.derive_secret("payment_secret")
         self.monitoring_tasks = [] # type: List[asyncio.Task]
         self._logger.debug("CLNLightning initialized")
@@ -123,7 +124,12 @@ class CLNLightning:
                         if invoice is None:
                             # no hold invoice has been saved before registering this callback
                             self._logger.error(f"callback_handler: hold invoice {payment_hash} not found")
-                            self._hold_invoice_callbacks.pop(payment_hash)
+                            # PORT FIND #10: pop(key, None) — the expiry
+                            # sweeper's unregister_hold_invoice_callback can
+                            # remove the entry between our items() snapshot
+                            # and this pop; a bare pop raised KeyError and
+                            # poisoned the iteration for every other swap
+                            self._hold_invoice_callbacks.pop(payment_hash, None)
                             continue
                         if invoice.funding_status is InvoiceState.FUNDED:
                             prepay_invoice_hash = invoice.get_prepay_invoice()
@@ -187,10 +193,17 @@ class CLNLightning:
             target_invoice.incoming_htlcs.add(htlc)
 
         try:
-            # decode target invoice using cln rpc
-            decoded_invoice = self._rpc.decodepay(target_invoice.bolt11)
+            # PORT FIND #12: CLN v26 removed `decodepay`; `decode` returns
+            # the same fields for bolt11 (payment_secret, min_final_cltv).
+            # Cached: CLN replays unresolved HTLCs on every restart — no
+            # need to re-RPC for an invoice we already decoded.
+            if target_invoice.bolt11 in self._decoded_invoices:
+                decoded_invoice = self._decoded_invoices[target_invoice.bolt11]
+            else:
+                decoded_invoice = self._rpc.decode(target_invoice.bolt11)
+                self._decoded_invoices[target_invoice.bolt11] = decoded_invoice
         except Exception as e:
-            self._logger.error(f"handle_htlc: decodepay rpc failed: {e}")
+            self._logger.error(f"handle_htlc: decode rpc failed: {e}")
             htlc.fail()
             return True
 

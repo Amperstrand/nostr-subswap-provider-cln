@@ -641,9 +641,16 @@ class SwapManager:
         self.percentage = float(self.config.swapserver_fee_millionths) / 10000
         self._min_amount = 20000
         self._max_amount = 10000000
+        # PORT FIND #9: one mining_fee everywhere, like electrum's server.
+        # The client derives its expected onchainAmount from the OFFER's
+        # mining_fee (pre-batcher formula), then also subtracts it again
+        # as its own claim cost in get_recv_amount. If the server
+        # subtracts a DIFFERENT fee (we used a 153-vB lockup fee = 155
+        # while the offer said 138), the client's strict equality check
+        # fails: 'onchain_amount is not what we estimated' / '< expected'.
         self.normal_fee = self.get_fee(size_vb=CLAIM_FEE_SIZE)
-        self.lockup_fee = self.get_fee(size_vb=LOCKUP_FEE_SIZE)
-        self.claim_fee = self.get_fee(size_vb=CLAIM_FEE_SIZE)
+        self.lockup_fee = self.normal_fee
+        self.claim_fee = self.normal_fee
 
     def get_max_amount(self):
         return self._max_amount
