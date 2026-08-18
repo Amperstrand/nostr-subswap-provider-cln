@@ -179,6 +179,7 @@ class SwapManager:
                 with NostrTransport(config=self.config, sm=self) as transport:
                     await transport.is_connected.wait()
                     self.logger.info(f'nostr is connected')
+                    last_advertised_max = None
                     while True:
                         # todo: publish everytime fees have changed
                         self.server_update_pairs()
@@ -186,7 +187,15 @@ class SwapManager:
                         if not self.is_initialized.is_set():  # if publish offer didn't set initialized we retry faster
                             await asyncio.sleep(10)
                             continue
-                        await asyncio.sleep(600)
+                        # converge fast while caps still move: the first
+                        # pass after a restart races peer reconnection and
+                        # advertises the 20k floor; recompute on a short
+                        # cadence until the advertised cap stabilizes
+                        if last_advertised_max != self._max_amount:
+                            last_advertised_max = self._max_amount
+                            await asyncio.sleep(30)
+                        else:
+                            await asyncio.sleep(600)
             except asyncio.TimeoutError:
                 self.logger.warning(f"Nostr timeout, restarting Nostr module")
             await asyncio.sleep(15)
@@ -640,7 +649,17 @@ class SwapManager:
         """ for server """
         self.percentage = float(self.config.swapserver_fee_millionths) / 10000
         self._min_amount = 20000
-        self._max_amount = 10000000
+        # R3: advertised cap must be config-driven (MAX_SWAP_AMOUNT env,
+        # default 10M). A hardcoded 10M made the offer LIE on signet where
+        # real capacity is a few hundred k — clients would negotiate swaps
+        # the node can't fund. Plugin config clamps to available capacity
+        # at update time (min(env cap, spendable onchain, LN send+recv)).
+        self._max_amount = min(
+            int(getattr(self.config, "max_swap_amount", 10_000_000)),
+            max(20000, int(self.wallet.balance_sat())),
+            max(20000, int(self.lnworker.num_sats_can_receive())
+                + int(self.lnworker.num_sats_can_send())),
+        )
         # PORT FIND #9: one mining_fee everywhere, like electrum's server.
         # The client derives its expected onchainAmount from the OFFER's
         # mining_fee (pre-batcher formula), then also subtracts it again
@@ -934,18 +953,37 @@ class NostrTransport:  # (Logger):
     async def check_direct_messages(self):
         privkey = aionostr.key.PrivateKey(self.private_key)
         query = {"kinds": [self.NOSTR_DM], "limit":0, "#p": [self.nostr_pubkey]}
+        # PORT FIND #13: the relay STORES swap DMs (ephemeral kind or not),
+        # so every restart REPLAYS them. A replayed addswapinvoice hits
+        # 'assert spending_txid is None' on an already-spent swap and the
+        # AssertionError killed the entire nostr taskgroup — one old DM
+        # murdered the transport. Per-event isolation: log, skip, survive.
+        seen_event_ids = set()
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
             try:
                 content = privkey.decrypt_message(event.content, event.pubkey)
                 content = json.loads(content)
             except Exception:
                 continue
+            if event.id in seen_event_ids:
+                continue
+            seen_event_ids.add(event.id)
             content['event_id'] = event.id
             content['event_pubkey'] = event.pubkey
             if 'reply_to' in content:
                 self.dm_replies[content['reply_to']].set_result(content)
             elif self.sm.is_server and 'method' in content:
-                await self.handle_request(content)
+                # handle_request POPS event_id/event_pubkey from the dict —
+                # capture first or the failure log below KeyErrors (the
+                # exact second-order crash the first #13 fix produced)
+                req_event_id = content['event_id']
+                try:
+                    await self.handle_request(content)
+                except Exception:
+                    self.logger.warning(
+                        f"swap request {req_event_id[:10]} failed (likely "
+                        f"replay of an already-executed request) — skipped:\n"
+                        f"{traceback.format_exc()}")
             else:
                 print('unknown message', content)
 

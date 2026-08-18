@@ -85,6 +85,15 @@ class PluginConfig:
         else:
             config.logger.warning(f"No swap fee in env. Using default value: {config.swapserver_fee_millionths}")
 
+        # R3: honest advertised cap — the offer must not promise capacity
+        # the node cannot fund (clamped again at server_update_pairs time)
+        if max_amt := os.getenv("MAX_SWAP_AMOUNT"):
+            config.max_swap_amount = int(max_amt.strip())
+        else:
+            config.max_swap_amount = 10_000_000
+            config.logger.warning(f"No MAX_SWAP_AMOUNT in env. Advertising default "
+                                  f"{config.max_swap_amount} (clamped to real capacity).")
+
         if block_target := os.getenv("CONFIRMATION_TARGET_BLOCKS"):
             block_target = int(block_target.strip())
             if not 0 < block_target < 200:
