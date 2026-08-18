@@ -442,16 +442,48 @@ class SwapManager:
         self.lnwatcher.add_callback(swap.lockup_address, callback)
 
     def hold_invoice_callback(self, payment_hash: bytes) -> None:
+        # AUDIT A5: a provider must never park a payer's funds. Unknown
+        # hash (post-restart orphan / replayed DM) or funding failure →
+        # cancel the HTLCs NOW (electrum returns silently in both cases —
+        # its payments hang until CLTV; our issue #10). create_funding_tx
+        # was outside the try: an insufficient-onchain exception escaped
+        # into the CLN htlc hook.
+        key = payment_hash.hex()
+        swap = self.swaps.get(key)
+        if swap is None:
+            invoice = self.lnworker.get_hold_invoice(payment_hash)
+            if invoice:
+                self.logger.warning(f'hold invoice {key[:10]} has no swap '
+                                    'state — cancelling HTLCs')
+                invoice.cancel_all_htlcs()
+            return
+        if swap.funding_txid is None:
+            try:
+                tx = self.create_funding_tx(swap=swap)
+                self.broadcast_funding_tx(swap, tx)
+            except Exception as e:
+                self.logger.error(f'funding tx failed, failing swap {key[:10]}: {e}')
+                self._fail_swap(swap, f'funding tx failed: {e}')
+
+    def _require_amount(self, raw, field='invoiceAmount') -> int:
+        """AUDIT A4: type/range validation with a clean error reply —
+        _get_recv_amount returning None used to flow into script
+        construction as None (traceback)."""
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            raise RequestFieldError(f'{field} must be an integer, got {type(raw).__name__}')
+        if raw <= 0:
+            raise RequestFieldError(f'{field} must be positive, got {raw}')
+        return raw
+
+    def _require_fresh_payment_hash(self, payment_hash: bytes) -> None:
+        """AUDIT A3: electrum's three duplicate-hash guards — a client
+        replaying the same preimageHash clobbers swap state / hold
+        invoices without them."""
         key = payment_hash.hex()
         if key in self.swaps:
-            swap = self.swaps[key]
-            if swap.funding_txid is None:
-                tx = self.create_funding_tx(swap=swap)
-                try:
-                    self.broadcast_funding_tx(swap, tx)
-                except Exception as e:
-                    self.logger.error(f'broadcast funding tx failed: {e}')
-                    self._fail_swap(swap, 'broadcast funding tx failed')
+            raise RequestFieldError('payment_hash already in use')
+        if self.lnworker.get_preimage(payment_hash) is not None:
+            raise RequestFieldError('payment_hash already in use')
 
     async def create_normal_swap(self, *, lightning_amount_sat: int, payment_hash: bytes, their_pubkey: bytes = None):
         """ server method """
@@ -460,6 +492,12 @@ class SwapManager:
         our_privkey = os.urandom(32)
         our_pubkey = ECPrivkey(our_privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_recv_amount(lightning_amount_sat, is_reverse=True) # what the client is going to receive
+        if onchain_amount_sat is None:
+            # AUDIT A4: out of [min,max] bounds or below dust — was None
+            # flowing into script construction (traceback)
+            raise RequestFieldError(
+                f'amount out of bounds or below dust '
+                f'(min {self.get_min_amount()}, max {self.get_max_amount()})')
         redeem_script = construct_script(
             WITNESS_TEMPLATE_REVERSE_SWAP,
             {1:32, 5:ripemd(payment_hash), 7:their_pubkey, 10:locktime, 13:our_pubkey}
@@ -552,6 +590,10 @@ class SwapManager:
         privkey = os.urandom(32)
         our_pubkey = ECPrivkey(privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_send_amount(lightning_amount_sat, is_reverse=False)
+        if onchain_amount_sat is None:
+            raise RequestFieldError(
+                f'amount out of bounds (min {self.get_min_amount()}, '
+                f'max {self.get_max_amount()})')
         preimage = os.urandom(32)
         payment_hash = sha256(preimage)
         redeem_script = construct_script(
@@ -607,18 +649,45 @@ class SwapManager:
         self.add_lnwatcher_callback(swap)
         return swap
 
-    def server_add_swap_invoice(self, request):
-        invoice = request['invoice']
-        invoice = Invoice.from_bech32(invoice)
+    def server_add_swap_invoice(self, request: dict) -> dict:
+        # AUDIT A2: electrum validates far more here — port its checks and
+        # reply with clean errors instead of raw asserts. The hash check
+        # specifically: an invoice whose rhash != swap hash must NEVER be
+        # accepted (observed live 2026-08-19: external provider c70d7bc9
+        # accepted a mismatched invoice and claimed the client's lockup —
+        # playground issue #15 evidence).
+        try:
+            invoice = Invoice.from_bech32(request['invoice'])
+        except Exception as e:
+            raise RequestFieldError(f'invoice is not valid bolt11: {e!r}')
         key = invoice.rhash
         payment_hash = bytes.fromhex(key)
-        assert key in self.swaps
-        swap = self.swaps[key]
-        assert swap.lightning_amount == int(invoice.get_amount_sat())
+        their_pubkey = self._parse_client_key(
+            'refundPublicKey', request.get('refundPublicKey', ''), 33)
+        swap = self.swaps.get(key)
+        if swap is None or not swap.is_reverse:
+            raise RequestFieldError('unknown swap for this invoice')
+        if swap.lightning_amount != int(invoice.get_amount_sat() or 0):
+            raise RequestFieldError(
+                f'invoice amount != swap amount '
+                f'({invoice.get_amount_sat()} != {swap.lightning_amount})')
+        if sha256(hex_to_bytes(swap.preimage)) != payment_hash:
+            raise RequestFieldError('invoice hash does not match the swap')
+        if swap.spending_txid is not None:
+            raise RequestFieldError('swap already in flight')
+        # re-derive the redeem script: their_pubkey must reproduce
+        # phase-1's script or the refund path silently mis-binds
+        our_pubkey = ECPrivkey(swap.privkey).get_public_key_bytes(compressed=True)
+        redeem_script = construct_script(
+            WITNESS_TEMPLATE_REVERSE_SWAP,
+            {1: 32, 5: ripemd(payment_hash), 7: their_pubkey,
+             10: swap.locktime, 13: our_pubkey}
+        )
+        if swap.redeem_script != redeem_script:
+            raise RequestFieldError('refundPublicKey does not match phase-1')
+        if key in self.invoices_to_pay:
+            raise RequestFieldError('invoice already bound')
         self.lnworker.save_invoice(invoice)
-        # check that we have the preimage
-        assert sha256(hex_to_bytes(swap.preimage)) == payment_hash
-        assert swap.spending_txid is None
         self.invoices_to_pay[key] = 0
         return {}
 
@@ -672,7 +741,14 @@ class SwapManager:
         # subtracts a DIFFERENT fee (we used a 153-vB lockup fee = 155
         # while the offer said 138), the client's strict equality check
         # fails: 'onchain_amount is not what we estimated' / '< expected'.
-        self.normal_fee = self.get_fee(size_vb=CLAIM_FEE_SIZE)
+        # AUDIT A1 (#14): electrum adopts a new mining_fee only when it
+        # moved >10% (submarine_swaps.py:1382) — without that hysteresis
+        # our live-CLN-feerate re-cache drifted quotes off the published
+        # offer within minutes. Mirror the hysteresis exactly.
+        new_fee = self.get_fee(size_vb=CLAIM_FEE_SIZE)
+        if self.normal_fee is None or \
+                abs(self.normal_fee - new_fee) / self.normal_fee > 0.1:
+            self.normal_fee = new_fee
         self.lockup_fee = self.normal_fee
         self.claim_fee = self.normal_fee
 
@@ -803,7 +879,7 @@ class SwapManager:
     async def server_create_normal_swap(self, request):
         # normal for client, reverse for server
         #request = await r.json()
-        lightning_amount_sat = request['invoiceAmount']
+        lightning_amount_sat = self._require_amount(request['invoiceAmount'])
         their_pubkey = self._parse_client_key('refundPublicKey', request['refundPublicKey'], 33)
         assert len(their_pubkey) == 33
         if self.lnworker.num_sats_can_send() < lightning_amount_sat:
@@ -832,9 +908,10 @@ class SwapManager:
         req_type = request['type']
         assert request['pairId'] == 'BTC/BTC'
         if req_type == 'reversesubmarine':
-            lightning_amount_sat=request['invoiceAmount']
+            lightning_amount_sat=self._require_amount(request['invoiceAmount'])
             payment_hash=self._parse_client_key('preimageHash', request['preimageHash'], 32)
             their_pubkey=self._parse_client_key('claimPublicKey', request['claimPublicKey'], 33)
+            self._require_fresh_payment_hash(payment_hash)
             assert len(payment_hash) == 32
             assert len(their_pubkey) == 33
             if self.lnworker.num_sats_can_receive() < lightning_amount_sat:
