@@ -94,6 +94,33 @@ class PluginConfig:
             config.logger.warning(f"No MAX_SWAP_AMOUNT in env. Advertising default "
                                   f"{config.max_swap_amount} (clamped to real capacity).")
 
+        # Chain lookups: 'txindex' (default) or 'esplora'.
+        # txindex: bitcoind must run -txindex (NOT prunable; ~25-30GB on
+        #   signet) — zero external deps, works for every lookup.
+        # esplora: raw-tx/height lookups via an esplora-API endpoint
+        #   (mempool.space/signet, self-hosted esplora, or the lab's
+        #   mempool-shim). bitcoind stays PRUNED and wallet-watch-only
+        #   (address detection is wallet-based and prune-safe: lockups
+        #   are imported at swap creation, needing only recent blocks).
+        #   TRADEOFF: a third party (or your esplora) learns swap txids
+        #   — acceptable on signet, think twice on mainnet; and the
+        #   endpoint becomes swap-critical infrastructure.
+        config.chain_lookup_mode = os.getenv("CHAIN_LOOKUP_MODE", "txindex").strip()
+        if config.chain_lookup_mode not in ("txindex", "esplora"):
+            raise Exception(f"CHAIN_LOOKUP_MODE must be txindex|esplora, got "
+                            f"'{config.chain_lookup_mode}'")
+        # endpoint list with fallback — the trustedcoin pattern (the
+        # reference CLN plugin for explorer backends): every lookup
+        # iterates the list until one answers; signet default is
+        # mempool.space/signet (trustedcoin's own entire signet list)
+        urls_csv = os.getenv("ESPLORA_URLS", "").strip()
+        single = os.getenv("ESPLORA_URL", "").strip()
+        config.esplora_urls = [u.rstrip("/") for u in urls_csv.split(",") if u.strip()] \
+            or ([single.rstrip("/")] if single else [])
+        if config.chain_lookup_mode == "esplora" and not config.esplora_urls:
+            raise Exception("CHAIN_LOOKUP_MODE=esplora requires ESPLORA_URLS "
+                            "(csv, tried in order) or ESPLORA_URL")
+
         if block_target := os.getenv("CONFIRMATION_TARGET_BLOCKS"):
             block_target = int(block_target.strip())
             if not 0 < block_target < 200:

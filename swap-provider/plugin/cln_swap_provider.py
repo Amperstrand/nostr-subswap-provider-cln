@@ -53,6 +53,9 @@ class CLNSwapProvider:
 
         self.chain_monitor = ChainMonitor(bcore_rpc_credentials=self.config.bcore_rpc_credentials,
                                           logger=self.logger)
+        self.chain_monitor.set_lookup_mode(
+            getattr(self.config, "chain_lookup_mode", "txindex"),
+            getattr(self.config, "esplora_urls", []))
         await self.chain_monitor.run()
 
         # cln chain wallet

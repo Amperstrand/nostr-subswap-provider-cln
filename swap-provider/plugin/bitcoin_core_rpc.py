@@ -25,6 +25,10 @@ class BitcoinCoreRPC:
             auth=bcore_rpc_credentials.auth,)
         self._logger = logger
         self._network = bcore_rpc_credentials.network
+        # lookup mode (txindex|esplora) + esplora base URL; set via
+        # set_lookup_mode before _init when running under the plugin
+        self._chain_lookup_mode = "txindex"
+        self._esplora_urls = []
 
     async def _test_connection(self) -> None:
         """Test the connection to the Bitcoin Core node"""
@@ -96,8 +100,12 @@ class BitcoinCoreRPC:
                 await asyncio.sleep(5)
         else:
             raise BitcoinCoreRPCError(f"ChainMonitor: bitcoind never came up: {last_err}")
-        if not await self._txindex_enabled():
-            raise BitcoinCoreRPCError("ChainMonitor: txindex is not enabled")
+        # txindex only required in txindex lookup mode; esplora mode keeps
+        # bitcoind prunable (see plugin_config CHAIN_LOOKUP_MODE tradeoffs)
+        if self._chain_lookup_mode == "txindex":
+            if not await self._txindex_enabled():
+                raise BitcoinCoreRPCError("ChainMonitor: txindex is not enabled "
+                                          "(or set CHAIN_LOOKUP_MODE=esplora)")
         await self._create_or_load_wallet(self._wallet_name)
         await self._validate_wallet_name(self._wallet_name)
         while not await self.is_up_to_date():
@@ -175,7 +183,52 @@ class BitcoinCoreRPC:
                 )
             raise BitcoinCoreRPCError(f"ChainMonitor register_address: Could not import address: {e}")
 
+    def set_lookup_mode(self, mode: str, esplora_urls: list[str] | str = "") -> None:
+        self._chain_lookup_mode = mode
+        self._esplora_urls = ([u.rstrip("/") for u in esplora_urls]
+                              if isinstance(esplora_urls, list)
+                              else ([esplora_urls.rstrip("/")] if esplora_urls else []))
+
+    async def _esplora_get(self, path: str) -> Optional[dict | str]:
+        # trustedcoin pattern: iterate endpoints until one answers;
+        # transport errors AND 4xx both fall through to the next
+        import aiohttp
+        last_exc = None
+        for base in self._esplora_urls:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"{base}{path}",
+                                           timeout=aiohttp.ClientTimeout(total=20)) as r:
+                        if r.status in (400, 404):
+                            return None  # esplora convention: unknown txid
+                        r.raise_for_status()
+                        ct = r.headers.get("Content-Type", "")
+                        return await (r.json() if "json" in ct else r.text())
+            except Exception as e:
+                last_exc = e
+                continue
+        raise BitcoinCoreRPCError(f"esplora lookup {path} failed on all "
+                                  f"{len(self._esplora_urls)} endpoints: {last_exc}")
+
     async def get_tx_height(self, txid_hex: str) -> TxMinedInfo:
+        if self._chain_lookup_mode == "esplora":
+            # esplora GET /tx/{txid}: status{confirmed, block_height,
+            # block_hash, block_time} + top-level locktime — all TxMinedInfo
+            # fields in ONE call (no blockheader round-trip needed)
+            tx = await self._esplora_get(f"/tx/{txid_hex}")
+            if tx is None:
+                raise BitcoinCoreRPCError(f"ChainMonitor get_tx_height: esplora "
+                                          f"does not know tx {txid_hex}")
+            status = tx.get("status") or {}
+            confirmed = status.get("confirmed", False)
+            return TxMinedInfo(
+                height=status.get("block_height") if confirmed else None,
+                conf=1 if confirmed else 0,  # esplora gives no conf count; confirmed is what flows check
+                timestamp=status.get("block_time") if confirmed else None,
+                txpos=None,
+                header_hash=status.get("block_hash") if confirmed else None,
+                wanted_height=tx.get("locktime") if tx.get("locktime", 0) > 0 else None,
+            )
         try:
             raw_tx = await self.iface.getrawtransaction(txid=txid_hex, verbose=True)
 
@@ -199,6 +252,11 @@ class BitcoinCoreRPC:
     async def get_transaction(self, txid_hex: str) -> Optional[Transaction]:
         """getrawtransaction into Transaction object"""
         self._logger.debug(f"ChainMonitor: get_transaction: {txid_hex}")
+        if self._chain_lookup_mode == "esplora":
+            raw = await self._esplora_get(f"/tx/{txid_hex}/hex")
+            if raw is None:
+                return None  # unknown tx — same contract as the -5 path below
+            return Transaction(raw=raw)
         try:
             raw_tx = await self.iface.getrawtransaction(txid=txid_hex, verbose=False)
             return Transaction(raw=raw_tx)
