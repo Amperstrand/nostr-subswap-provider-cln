@@ -14,6 +14,11 @@ from decimal import Decimal
 from typing import Optional, Dict, Tuple, Union
 import electrum_aionostr as aionostr
 from electrum_ecc import ECPrivkey
+
+
+class RequestFieldError(Exception):
+    """Client sent a malformed field; maps to a clean error REPLY."""
+
 from electrum_aionostr.util import to_nip19
 from collections import defaultdict
 
@@ -780,11 +785,26 @@ class SwapManager:
         tx.finalize_psbt()
         return tx
 
+    @staticmethod
+    def _parse_client_key(field: str, raw, expected_len: int):
+        """Hex pubkey/hash parse with a clean error payload instead of a
+        traceback (a malformed client field must yield a reply the client
+        can act on, never a dropped request — issue #11)."""
+        try:
+            val = bytes.fromhex(raw)
+        except (ValueError, TypeError):
+            raise RequestFieldError(
+                f'{field} must be hex, got len={len(raw) if isinstance(raw, str) else type(raw).__name__}')
+        if len(val) != expected_len:
+            raise RequestFieldError(
+                f'{field} must be {expected_len * 2} hex chars, got {len(val) * 2}')
+        return val
+
     async def server_create_normal_swap(self, request):
         # normal for client, reverse for server
         #request = await r.json()
         lightning_amount_sat = request['invoiceAmount']
-        their_pubkey = bytes.fromhex(request['refundPublicKey'])
+        their_pubkey = self._parse_client_key('refundPublicKey', request['refundPublicKey'], 33)
         assert len(their_pubkey) == 33
         if self.lnworker.num_sats_can_send() < lightning_amount_sat:
             self.logger.warning(f'not enough outgoing capacity to satisfy swap: {self.lnworker.num_sats_can_send()} sat,'
@@ -813,8 +833,8 @@ class SwapManager:
         assert request['pairId'] == 'BTC/BTC'
         if req_type == 'reversesubmarine':
             lightning_amount_sat=request['invoiceAmount']
-            payment_hash=bytes.fromhex(request['preimageHash'])
-            their_pubkey=bytes.fromhex(request['claimPublicKey'])
+            payment_hash=self._parse_client_key('preimageHash', request['preimageHash'], 32)
+            their_pubkey=self._parse_client_key('claimPublicKey', request['claimPublicKey'], 33)
             assert len(payment_hash) == 32
             assert len(their_pubkey) == 33
             if self.lnworker.num_sats_can_receive() < lightning_amount_sat:
@@ -996,13 +1016,21 @@ class NostrTransport:  # (Logger):
         event_pubkey = request.pop('event_pubkey')
         self.logger.info(f'received swap request: id={event_id} {method} {request}')
         if method == 'addswapinvoice':
-            r = self.sm.server_add_swap_invoice(request)
+            handler = self.sm.server_add_swap_invoice
         elif method == 'createswap':
-            r = await self.sm.server_create_swap(request)
+            handler = self.sm.server_create_swap
         elif method == 'createnormalswap':
-            r = await self.sm.server_create_normal_swap(request)
+            handler = self.sm.server_create_normal_swap
         else:
+            handler = None
             r = {'error': f'unknown swap method: {method}'}
+        if handler is not None:
+            try:
+                r = await handler(request) if asyncio.iscoroutinefunction(handler) else handler(request)
+            except RequestFieldError as e:
+                # malformed client input gets a REPLY, never silence —
+                # the client would otherwise hang until its own timeout (#11)
+                r = {'error': str(e)}
         r['reply_to'] = event_id
         self.logger.debug(f'sending response id={event_id}')
         await self.send_direct_message(event_pubkey, json.dumps(r))

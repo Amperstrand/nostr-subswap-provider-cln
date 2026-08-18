@@ -34,6 +34,12 @@ class PluginLogger:
         msg = f"ERROR: {msg}"  # CLN/plugin doesnt support ERROR, so we use info
         self.logger(msg, level="info")
 
+    def exception(self, msg: str):
+        # @log_exceptions calls this — without it every handler crash
+        # turns into a mangled AttributeError that hides the real error
+        import traceback as _tb
+        self.error(f"{msg}\n{_tb.format_exc()}")
+
     def change_level(self, level: str):
         self.level = level
 
