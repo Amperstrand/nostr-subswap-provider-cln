@@ -690,7 +690,11 @@ class SwapManager:
             {1: 32, 5: ripemd(payment_hash), 7: our_pubkey,
              10: swap.locktime, 13: their_pubkey}
         )
-        if swap.redeem_script != redeem_script:
+        # swap.redeem_script is HEX-string storage (bytes_to_hex in both
+        # add_*_swap paths) — comparing it raw against bytes is ALWAYS
+        # unequal and rejected every legit bind (earned live, same
+        # hex-vs-bytes class as the privkey trap)
+        if bytes.fromhex(swap.redeem_script) != redeem_script:
             raise RequestFieldError('refundPublicKey does not match phase-1')
         if key in self.invoices_to_pay:
             raise RequestFieldError('invoice already bound')
