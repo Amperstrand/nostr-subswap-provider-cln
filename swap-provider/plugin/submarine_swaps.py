@@ -677,7 +677,11 @@ class SwapManager:
             raise RequestFieldError('swap already in flight')
         # re-derive the redeem script: their_pubkey must reproduce
         # phase-1's script or the refund path silently mis-binds
-        our_pubkey = ECPrivkey(swap.privkey).get_public_key_bytes(compressed=True)
+        # SwapData.privkey is HEX in this port (see sign_tx's
+        # hex_to_bytes(swap.privkey)) — ECPrivkey asserts raw bytes and
+        # crashed every addswapinvoice (earned live; electrum stores
+        # bytes, do not copy that shape blindly)
+        our_pubkey = ECPrivkey(hex_to_bytes(swap.privkey)).get_public_key_bytes(compressed=True)
         redeem_script = construct_script(
             WITNESS_TEMPLATE_REVERSE_SWAP,
             {1: 32, 5: ripemd(payment_hash), 7: their_pubkey,
