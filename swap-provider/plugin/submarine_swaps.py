@@ -1108,6 +1108,13 @@ class NostrTransport:  # (Logger):
                 # malformed client input gets a REPLY, never silence —
                 # the client would otherwise hang until its own timeout (#11)
                 r = {'error': str(e)}
+            except Exception:
+                # internal errors too: the newaddr KeyError crash hung the
+                # client for its full timeout — a server must always answer
+                import traceback as _tb
+                self.logger.error(f'internal error serving {method}: '
+                                  f'{_tb.format_exc()}')
+                r = {'error': f'internal error serving {method}'}
         r['reply_to'] = event_id
         self.logger.debug(f'sending response id={event_id}')
         await self.send_direct_message(event_pubkey, json.dumps(r))

@@ -108,9 +108,13 @@ class CLNChainWallet:
         return math.ceil(feerate_pervb * size_vbyte)
 
     def get_receiving_address(self) -> str:
-        """Returns a new receiving address from the CLN wallet."""
+        """Returns a new receiving address from the CLN wallet.
+        addresstype MUST be explicit: bare newaddr on v26.06 returns only
+        {'p2tr': …} — indexing ['bech32'] crashed every real swap creation
+        (KeyError('bech32'), earned 2026-08-19: dryruns quote fine because
+        they never touch the server; first funded swap hit the crash)."""
         try:
-            address = self.rpc.newaddr()['bech32']
+            address = self.rpc.newaddr('bech32')['bech32']
         except RpcError as e:
             raise Exception("get_receiving_address failed to call newaddr rpc: " + str(e))
         return address
