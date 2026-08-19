@@ -240,6 +240,19 @@ class SwapManager:
 
     async def pay_pending_ln_invoice(self, key):
         self.logger.debug(f'trying to pay invoice {key}')
+        # attempt cap: an unpayable invoice (e.g. d2 bind whose hints the
+        # payer can't route — alias-scid mismatch) must not retry forever.
+        # Earned live: one invoice retried every 60s for 2.5h+, spamming
+        # logs and pinning the swap. 15 attempts then fail the swap.
+        if (n := self._invoice_attempts.setdefault(key, 0) + 1) > 15:
+            self.logger.warning(f'giving up on invoice {key} after {n - 1} '
+                                'attempts (unpayable)')
+            self._invoice_attempts.pop(key, None)
+            self._fail_swap(self.swaps.get(key, None),
+                            'invoice unpayable after 15 attempts')
+            self.invoices_to_pay.pop(key, None)
+            return
+        self._invoice_attempts[key] = n
         self.invoices_to_pay[key] = 1000000000000 # lock
         try:
             if (invoice := self.lnworker.get_invoice(key)) is None:
@@ -259,11 +272,13 @@ class SwapManager:
             self.invoices_to_pay[key] = now() + 60
         else:
             self.logger.info(f'paid invoice {key}')
+            self._invoice_attempts.pop(key, None)
             self.lnworker.delete_invoice(key)
             self.invoices_to_pay.pop(key, None)
 
     async def pay_pending_ln_invoices(self):
         self.invoices_to_pay = {}
+        self._invoice_attempts = {}
         while True:
             await asyncio.sleep(5)
             for key, not_before in list(self.invoices_to_pay.items()):
