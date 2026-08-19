@@ -721,7 +721,12 @@ class SwapManager:
 
     def server_update_pairs(self) -> None:
         """ for server """
-        self.percentage = float(self.config.swapserver_fee_millionths) / 10000
+        # AUDIT/#14 true root cause: float fee math. float(2000)/10000 ->
+        # Decimal(float) = 0.2000000000000000111… overcharges by 1 sat vs
+        # the client's Decimal(str(offer 0.2)) -> strict quote check fails
+        # (19671 < 19672, earned live). Pure Decimal, electrum-parity
+        # (submarine_swaps.py:1374). Offer builder's float() still emits 0.2.
+        self.percentage = Decimal(self.config.swapserver_fee_millionths) / Decimal(10000)
         self._min_amount = 20000
         # R3: advertised cap must be config-driven (MAX_SWAP_AMOUNT env,
         # default 10M). A hardcoded 10M made the offer LIE on signet where
