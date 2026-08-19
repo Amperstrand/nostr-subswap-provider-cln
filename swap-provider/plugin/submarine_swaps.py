@@ -676,16 +676,19 @@ class SwapManager:
         if swap.spending_txid is not None:
             raise RequestFieldError('swap already in flight')
         # re-derive the redeem script: their_pubkey must reproduce
-        # phase-1's script or the refund path silently mis-binds
-        # SwapData.privkey is HEX in this port (see sign_tx's
-        # hex_to_bytes(swap.privkey)) — ECPrivkey asserts raw bytes and
-        # crashed every addswapinvoice (earned live; electrum stores
-        # bytes, do not copy that shape blindly)
+        # phase-1's script or the refund path silently mis-binds.
+        # Role order for d2 (create_reverse_swap): slot 7 = CLAIM key =
+        # OURS (server claims with preimage), slot 13 = REFUND key =
+        # THEIRS. The d1 order (create_normal_swap) is the inverse —
+        # copying it here rejected every legit bind (earned live; the
+        # direction-inversion trap the AGENTS terminology table warns of).
+        # SwapData.privkey is HEX in this port (see sign_tx) — ECPrivkey
+        # asserts raw bytes.
         our_pubkey = ECPrivkey(hex_to_bytes(swap.privkey)).get_public_key_bytes(compressed=True)
         redeem_script = construct_script(
             WITNESS_TEMPLATE_REVERSE_SWAP,
-            {1: 32, 5: ripemd(payment_hash), 7: their_pubkey,
-             10: swap.locktime, 13: our_pubkey}
+            {1: 32, 5: ripemd(payment_hash), 7: our_pubkey,
+             10: swap.locktime, 13: their_pubkey}
         )
         if swap.redeem_script != redeem_script:
             raise RequestFieldError('refundPublicKey does not match phase-1')
