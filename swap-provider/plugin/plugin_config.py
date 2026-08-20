@@ -74,6 +74,18 @@ class PluginConfig:
                             f"../nostr-pow-bench for pubkey "
                             f"{config.nostr_keypair.pubkey.hex()[2:]})")
         config.net_name = config.network.NET_NAME
+        # ANN_NET_NAME decouples the nostr announcement tag from CLN's network:
+        # mutinynet nodes run network=signet (shared genesis) yet MUST announce
+        # net:mutinynet — the tag is the only wrong-network discriminator
+        # electrum clients and the bridge worker have.
+        if ann_net := os.getenv("ANN_NET_NAME", "").strip():
+            from .constants import NETS_LIST
+            if not any(net.NET_NAME == ann_net for net in NETS_LIST):
+                raise Exception(
+                    f"ANN_NET_NAME={ann_net} is not a known network "
+                    f"({', '.join(n.NET_NAME for n in NETS_LIST)}) — refusing "
+                    f"to announce an ambiguous network tag")
+            config.net_name = ann_net
 
         if relays := os.getenv("NOSTR_RELAYS"):
             config.nostr_relays.extend(url.strip() for url in relays.split(","))

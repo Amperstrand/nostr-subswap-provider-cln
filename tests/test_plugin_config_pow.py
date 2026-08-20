@@ -81,3 +81,48 @@ def test_low_target_mines_in_process(monkeypatch):
     cfg = pc.PluginConfig.from_cln_and_env(cln_plugin_handler=_StubCLN("ab" * 32), logger=_Log())
     assert cfg.ann_pow_nonce > 0
     assert offer.nostr_ann_pow_bits("ab" * 32, cfg.ann_pow_nonce) >= 8
+
+
+def test_net_name_defaults_to_cln_network(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setenv("ANN_POW_TARGET_BITS", "8")
+    monkeypatch.delenv("ANN_POW_NONCE", raising=False)
+    monkeypatch.delenv("ANN_NET_NAME", raising=False)
+    from plugin import plugin_config as pc
+    monkeypatch.setattr(pc, "load_dotenv", lambda: None)
+    monkeypatch.setattr(pc.Keypair, "from_private_key", classmethod(
+        lambda cls, k: type("K", (), {"privkey": k, "pubkey": bytes.fromhex("02" + "ab" * 32)})()))
+    cfg = pc.PluginConfig.from_cln_and_env(cln_plugin_handler=_StubCLN("ab" * 32), logger=_Log())
+    assert cfg.net_name == "regtest"
+
+
+def test_ann_net_name_overrides_cln_network(monkeypatch):
+    # mutinynet runs CLN with network=signet (shared genesis) but must
+    # announce net:mutinynet — the announcement tag is the only wrong-
+    # network discriminator clients have.
+    _env(monkeypatch)
+    monkeypatch.setenv("ANN_POW_TARGET_BITS", "8")
+    monkeypatch.delenv("ANN_POW_NONCE", raising=False)
+    monkeypatch.setenv("ANN_NET_NAME", "mutinynet")
+    from plugin import plugin_config as pc
+    monkeypatch.setattr(pc, "load_dotenv", lambda: None)
+    monkeypatch.setattr(pc.Keypair, "from_private_key", classmethod(
+        lambda cls, k: type("K", (), {"privkey": k, "pubkey": bytes.fromhex("02" + "ab" * 32)})()))
+    cfg = pc.PluginConfig.from_cln_and_env(cln_plugin_handler=_StubCLN("ab" * 32), logger=_Log())
+    assert cfg.net_name == "mutinynet"
+    # chain-side network class stays CLN's (scripts/invoices are signet-shaped)
+    assert cfg.network.NET_NAME == "regtest"
+    assert offer.build_offer_tags(cfg.net_name)[1] == ["r", "net:mutinynet"]
+
+
+def test_ann_net_name_unknown_fails_loud(monkeypatch):
+    _env(monkeypatch)
+    monkeypatch.setenv("ANN_POW_TARGET_BITS", "8")
+    monkeypatch.delenv("ANN_POW_NONCE", raising=False)
+    monkeypatch.setenv("ANN_NET_NAME", "garbage")
+    from plugin import plugin_config as pc
+    monkeypatch.setattr(pc, "load_dotenv", lambda: None)
+    monkeypatch.setattr(pc.Keypair, "from_private_key", classmethod(
+        lambda cls, k: type("K", (), {"privkey": k, "pubkey": bytes.fromhex("02" + "ab" * 32)})()))
+    with pytest.raises(Exception, match="ANN_NET_NAME"):
+        pc.PluginConfig.from_cln_and_env(cln_plugin_handler=_StubCLN("ab" * 32), logger=_Log())
