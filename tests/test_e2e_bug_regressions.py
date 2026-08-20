@@ -193,3 +193,90 @@ class TestFundingTxShape:
         assert len(pt.outputs()) == n_before + 1
         # the new output must be present (add_outputs inserts before change)
         assert any(o.value == 19280 for o in pt.outputs())
+
+
+# ================================================================ 7. preimage-reveal / claim-gate invariants
+# LIVE BUGS / INCIDENTS these guard against:
+#   - sweeping an UNCONFIRMED lockup: preimage public while the payer can
+#     still double-spend the funding tx (funds loss, whole-amount)
+#   - sitting on a CONFIRMED lockup: payer's hold-invoice HTLCs park until
+#     CLTL deadlines tick down (swap dies though fully funded)
+#   - hints computed but never appended to the invoice (NoPathFound class,
+#     commit 35cab8c)
+
+class TestClaimGatingAndHints:
+    def test_broadcast_gated_on_one_confirmation(self):
+        """The claim/sweep broadcast must sit behind `funding_height.conf
+        > 0` — the witness reveals the preimage, so an unconfirmed lockup
+        must never be spent by us."""
+        code = _code_only(PLUGIN_DIR / "submarine_swaps.py")
+        gate = code.find("if funding_height.conf > 0")
+        broadcast = code.find("broadcast_raw_transaction")
+        assert gate != -1, "1-confirmation gate (`funding_height.conf > 0`) missing"
+        assert broadcast != -1, "claim broadcast call missing"
+        assert gate < broadcast, "claim broadcast must come after the 1-conf gate"
+
+    def test_underfunded_reverse_lockup_never_claimed(self):
+        """Reverse swaps: a lockup below onchain_amount must be skipped —
+        claiming it would reveal the preimage for less than the agreed
+        amount."""
+        code = _code_only(PLUGIN_DIR / "submarine_swaps.py")
+        assert "txin.value_sats() < swap.onchain_amount" in code
+        # the guard must be inside the reverse branch's scan loop
+        assert code.find("swap.is_reverse and txin.value_sats()") < \
+            code.find("break"), "underfund guard must precede the claim break"
+
+    def test_routing_hints_appended_to_invoice_tags(self):
+        """b11invoice_from_hash must append `_get_route_hints()` output to
+        the LnAddr tags — hints computed but dropped strand payers without
+        gossip maps (NoPathFound, live 2026-08-20)."""
+        code = _code_only(PLUGIN_DIR / "cln_lightning.py")
+        assert "routing_hints = self._get_route_hints(amount_msat)" in code
+        assert "] + routing_hints" in code, \
+            "routing_hints must be concatenated into the LnAddr tags list"
+
+    def test_hint_serialization_round_trip(self):
+        """A hint built like _get_route_hints does must survive
+        lnencode_unsigned → bech32 decode → pull_tagged byte-for-byte
+        (BOLT #11 `r` entry layout: pubkey 33B || scid 8B || feebase 4B ||
+        feeprop 4B || cltv 2B)."""
+        import importlib
+        from decimal import Decimal
+        from plugin import constants as plugin_constants
+        from plugin.constants import BitcoinSignet
+        old_net = plugin_constants.net
+        plugin_constants.net = BitcoinSignet()
+        try:
+            from plugin.lnaddr import (LnAddr, lnencode_unsigned,
+                                       bech32_decode, convertbits, pull_tagged, COIN)
+            from plugin.utils import ShortID
+            pubkey = bytes(range(33))          # stand-in node id
+            scid = ShortID.from_str("318431x28x0")
+            feebase, feeprop, cltv = 0, 1, 6   # the live hub->plugin policy
+            addr = LnAddr(
+                paymenthash=bytes(32),
+                amount=Decimal(20000000) / Decimal(COIN * 1000),
+                tags=[('d', 'swap'), ('r', [(pubkey, scid, feebase, feeprop, cltv)])],
+                date=1700000000,
+                payment_secret=bytes(32),
+            )
+            invoice = lnencode_unsigned(addr)
+            decoded_bech32 = bech32_decode(invoice, ignore_long_length=True)
+            hrp, data5 = decoded_bech32.hrp, decoded_bech32.data
+            assert hrp.startswith("lntbs"), f"wrong HRP: {hrp}"
+            # walk tags in the 5-bit domain, exactly like lndecode does
+            buf5 = bytearray(data5[7:])  # skip 35-bit timestamp
+            found_r = None
+            while len(buf5) >= 3:
+                try:
+                    tag, tagdata = pull_tagged(buf5)
+                except ValueError:
+                    break  # trailing bech32 padding, not a real field
+                if tag == 'r':
+                    found_r = bytes(convertbits(bytearray(tagdata), 5, 8, False))
+            assert found_r is not None, "r tag missing from encoded invoice"
+            assert found_r == pubkey + bytes(scid) + \
+                feebase.to_bytes(4, "big") + feeprop.to_bytes(4, "big") + \
+                cltv.to_bytes(2, "big"), "r tag payload corrupted"
+        finally:
+            plugin_constants.net = old_net

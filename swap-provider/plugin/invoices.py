@@ -250,6 +250,14 @@ class HoldInvoice:
 
     def is_fully_funded(self):
         """Returns True if the stored incoming htlcs sum up to the invoice amount or more."""
+        # BOLT #2: A receiving node:
+        #  ...
+        #  - MUST allow multiple HTLCs with the same `payment_hash`.
+        # Impl-note: this is why MPP works: a payer may split one invoice
+        # Impl-note: across several HTLCs (separate channels/paths) that all
+        # Impl-note: arrive with the same hash; each parks here until the set
+        # Impl-note: sums to the full amount, then settle() fulfills them
+        # Impl-note: together.
         return (sum(stored_htlc.amount_msat for stored_htlc in self.incoming_htlcs if stored_htlc.state in
                     [HtlcState.ACCEPTED, HtlcState.SETTLED])
                 >= self.amount_msat)

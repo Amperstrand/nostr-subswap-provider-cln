@@ -432,6 +432,20 @@ class CLNLightning:
             raise DuplicateInvoiceCreationError("b11invoice_from_hash: "
                                                 "invoice already exists in cln: " + payment_hash.hex())
 
+        # Quotes below verified against lightning/bolts by greatspectations
+        # (specquotes.toml; tests/test_spec_quotes.py gates this in pytest).
+        # BOLT #11: A writer:
+        #  - MUST include exactly one `p` field.
+        #  - MUST include exactly one `s` field.
+        #  - MUST set `payment_hash` to the SHA2 256-bit hash of the `payment_preimage`
+        #  that will be given in return for payment.
+        # Impl-note: the preimage lives with the CLIENT for normal swaps (they
+        # Impl-note: reveal it by spending the onchain HTLC); we only ever see
+        # Impl-note: the hash, so the hold invoice settles from the claim tx's
+        # Impl-note: witness, never here.
+        # BOLT #11: SHOULD include one `c` field (`min_final_cltv_expiry_delta`).
+        #  - MUST set `c` to the minimum `cltv_expiry` it will accept for the last
+        #  HTLC in the route.
         invoice_features = LnFeatures(0) | LnFeatures.VAR_ONION_REQ | LnFeatures.PAYMENT_SECRET_REQ | LnFeatures.BASIC_MPP_OPT
         routing_hints = self._get_route_hints(amount_msat)
         lnaddr = LnAddr(
@@ -467,6 +481,16 @@ class CLNLightning:
         return invoice
 
     def _get_route_hints(self, amount_msat: int) -> List[Tuple[str, List[Tuple[bytes, ShortID, int, int, int]]]]:
+        # BOLT #11: if there is NOT a public channel associated with its public key:
+        #  - MUST include at least one `r` field.
+        #  - `r` field MUST contain one or more ordered entries, indicating the forward route from
+        #  a public node to the final destination.
+        # Impl-note: we deliberately hint PUBLIC channels too. The BOLT only
+        # Impl-note: mandates hints for private routes, but payers with
+        # Impl-note: lagging/partial gossip maps (fresh channels sit ~20-40
+        # Impl-note: blocks behind gossip) raise NoPathFound when the invoice
+        # Impl-note: carries zero hints — observed live on signet 2026-08-20
+        # Impl-note: (commit 35cab8c).
         if amount_msat is None or amount_msat == 0:
             raise NotImplementedError  # swaps always have the amount defined
         try:

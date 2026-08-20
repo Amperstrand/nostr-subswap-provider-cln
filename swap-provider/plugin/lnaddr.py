@@ -22,10 +22,13 @@ class LnDecodeException(LnInvoiceException): pass
 class LnEncodeException(LnInvoiceException): pass
 
 
-# BOLT #11:
-#
-# A writer MUST encode `amount` as a positive decimal integer with no
-# leading zeroes, SHOULD use the shortest representation possible.
+# BOLT #11: - MUST encode `amount` as a positive decimal integer with no leading 0s.
+#  - If the `p` multiplier is used the last decimal of `amount` MUST be `0`.
+#  - SHOULD use the shortest representation possible, by using the largest
+#  multiplier or omitting the multiplier.
+# Impl-note: (quote refreshed 2026-08-20: the old vendored quote said "no
+# Impl-note: leading zeroes" — spec wording changed and greatspectations
+# Impl-note: flagged the drift.)
 def shorten_amount(amount):
     """ Given an amount in bitcoin, shorten it
     """
@@ -58,9 +61,10 @@ def unshorten_amount(amount) -> Decimal:
         'm': 10**3,
     }
     unit = str(amount)[-1]
-    # BOLT #11:
-    # A reader SHOULD fail if `amount` contains a non-digit, or is followed by
-    # anything except a `multiplier` in the table above.
+    # BOLT #11: - if `amount` contains a non-digit OR is followed by anything except
+    #  a `multiplier` (see table above):
+# Impl-note: (quote refreshed 2026-08-20 — was "A reader SHOULD fail",
+# Impl-note: the spec tightened this to a MUST.)
     if not re.fullmatch("\\d+[pnum]?", str(amount)):
         raise LnDecodeException("Invalid amount '{}'".format(amount))
 
@@ -174,14 +178,23 @@ def lnencode_unsigned(addr: 'LnAddr') -> str:
 
     for k, v in addr.tags:
 
-        # BOLT #11:
-        #
-        # A writer MUST NOT include more than one `d`, `h`, `n` or `x` fields,
+        # BOLT #11: - if a writer offers more than one of any field type, it:
+        #  - MUST specify the most-preferred field first, followed by less-preferred fields, in order.
+# Impl-note: (quote refreshed 2026-08-20: the old vendored quote cited a
+# Impl-note: "MUST NOT include more than one `d`, `h`, `n` or `x` fields"
+# Impl-note: rule that no longer exists in the spec — single-instance
+# Impl-note: constraints are now stated per-tag ("MUST include exactly one
+# Impl-note: `p` field", "MAY include one `x` field", ...). This duplicate
+# Impl-note: guard remains correct behavior for those tags.)
         if k in ('d', 'h', 'n', 'x', 'p', 's', '9'):
             if k in tags_set:
                 raise LnEncodeException("Duplicate '{}' tag".format(k))
 
         if k == 'r':
+            # BOLT #11: Note: for each entry, the `pubkey` is the node ID of the start of the channel;
+            # `short_channel_id` is the short channel ID field to identify the channel; and
+            # `fee_base_msat`, `fee_proportional_millionths`, and `cltv_expiry_delta` are as
+            # specified in [BOLT #7](07-routing-gossip.md#the-channel_update-message).
             route = bytearray()
             for step in v:
                 pubkey, scid, feebase, feerate, cltv = step
@@ -226,10 +239,7 @@ def lnencode_unsigned(addr: 'LnAddr') -> str:
 
         tags_set.add(k)
 
-    # BOLT #11:
-    #
-    # A writer MUST include either a `d` or `h` field, and MUST NOT include
-    # both.
+    # BOLT #11: - MUST include either exactly one `d` or exactly one `h` field.
     if 'd' in tags_set and 'h' in tags_set:
         raise ValueError("Cannot include both 'd' and 'h'")
     if 'd' not in tags_set and 'h' not in tags_set:
@@ -344,8 +354,8 @@ class LnAddr(object):
 
     def is_expired(self) -> bool:
         now = time.time()
-        # BOLT-11 does not specify what expiration of '0' means.
-        # we treat it as 0 seconds here (instead of never)
+        # (vendored electrum note, reworded: the bolt11 spec does not define
+        # what an 'x' expiry of '0' means; we treat it as 0 seconds here)
         return now > self.get_expiry() + self.date
 
     def to_debug_json(self) -> Dict[str, Any]:
@@ -389,9 +399,8 @@ def lndecode(invoice: str, *, verbose=False, net=None) -> LnAddr:
     if decoded_bech32.encoding != segwit_addr.Encoding.BECH32:
         raise LnDecodeException("Bad bech32 encoding: must be using vanilla BECH32")
 
-    # BOLT #11:
-    #
-    # A reader MUST fail if it does not understand the `prefix`.
+    # BOLT #11: - if it does NOT understand the `prefix`:
+    #  - MUST fail the payment.
     if not hrp.startswith('ln'):
         raise LnDecodeException("Does not start with ln")
 
@@ -410,11 +419,13 @@ def lndecode(invoice: str, *, verbose=False, net=None) -> LnAddr:
     addr.net = net
 
     amountstr = hrp[2+len(net.BOLT11_HRP):]
-    # BOLT #11:
-    #
-    # A reader SHOULD indicate if amount is unspecified, otherwise it MUST
-    # multiply `amount` by the `multiplier` value (if any) to derive the
-    # amount required for payment.
+    # BOLT #11: - if the `amount` is empty:
+    #  - SHOULD indicate to the payer that amount is unspecified.
+    # BOLT #11: - otherwise:
+    #  - if `amount` contains a non-digit OR is followed by anything except
+    #  a `multiplier` (see table above):
+    #  - MUST fail the payment.
+# Impl-note: (quotes refreshed 2026-08-20 to current spec wording.)
     if amountstr != '':
         addr.amount = unshorten_amount(amountstr)
 
@@ -424,24 +435,23 @@ def lndecode(invoice: str, *, verbose=False, net=None) -> LnAddr:
     while data5_remaining:
         tag, tagdata = pull_tagged(data5_remaining)  # mutates arg
 
-        # BOLT #11:
-        #
-        # A reader MUST skip over unknown fields, an `f` field with unknown
-        # `version`, or a `p`, `h`, or `n` field which does not have
-        # `data_length` 52, 52, or 53 respectively.
+        # BOLT #11: - MUST skip over `f` fields that use an unknown `version`.
+        #  - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`) does not have the correct length (52, 52, 52, 53).
+# Impl-note: (quote refreshed 2026-08-20: old vendored text said a reader
+# Impl-note: "MUST skip" wrong-length p/h/n — the spec now mandates failing
+# Impl-note: the payment, and includes `s` in the fixed-length set.)
         data_length = len(tagdata)
 
         if tag == 'r':
-            # BOLT #11:
-            #
-            # * `r` (3): `data_length` variable.  One or more entries
-            # containing extra routing information for a private route;
-            # there may be more than one `r` field, too.
-            #    * `pubkey` (264 bits)
-            #    * `short_channel_id` (64 bits)
-            #    * `feebase` (32 bits, big-endian)
-            #    * `feerate` (32 bits, big-endian)
-            #    * `cltv_expiry_delta` (16 bits, big-endian)
+            # BOLT #11: * `r` (3): `data_length` variable. One or more entries containing extra routing information for a private route; there may be more than one `r` field
+            #  * `pubkey` (264 bits)
+            #  * `short_channel_id` (64 bits)
+            #  * `fee_base_msat` (32 bits, big-endian)
+            #  * `fee_proportional_millionths` (32 bits, big-endian)
+            #  * `cltv_expiry_delta` (16 bits, big-endian)
+# Impl-note: (quote refreshed 2026-08-20: field names `feebase`/`feerate`
+# Impl-note: are now `fee_base_msat`/`fee_proportional_millionths` in the
+# Impl-note: spec — same wire layout, 4+4+2 bytes big-endian per entry.)
             tagdata = convertbits(tagdata, 5, 8, False)
             if not tagdata:
                 continue
@@ -540,17 +550,13 @@ def lndecode(invoice: str, *, verbose=False, net=None) -> LnAddr:
               .format(hexlify(hrp.encode("ascii") + data8)))
         print('SHA256 of above: {}'.format(sha256(hrp.encode("ascii") + data8).hexdigest()))
 
-    # BOLT #11:
-    #
-    # A reader MUST check that the `signature` is valid (see the `n` tagged
-    # field specified below).
+    # BOLT #11: A reader:
+    #  - MUST check that the `signature` is valid (see the `n` tagged field specified below).
     addr.signature = sigdecoded[:65]
     hrp_hash = sha256(hrp.encode("ascii") + bytes(convertbits(data5, 5, 8, True))).digest()
     if addr.pubkey: # Specified by `n`
-        # BOLT #11:
-        #
-        # A reader MUST use the `n` field to validate the signature instead of
-        # performing signature recovery if a valid `n` field is provided.
+        # BOLT #11: - if a valid `n` field is provided:
+        #  - MUST use the `n` field to validate the signature instead of performing public-key recovery.
         if not ecc.ECPubkey(addr.pubkey).ecdsa_verify(sigdecoded[:64], hrp_hash):
             raise LnDecodeException("bad signature")
         pubkey_copy = addr.pubkey

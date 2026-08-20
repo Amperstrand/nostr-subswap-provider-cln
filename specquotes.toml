@@ -1,0 +1,18 @@
+# Spec-quote checking via greatspectations (rustyrussell/greatspectations).
+#
+# Verifies that every "BOLT #N: ..." quote in our source comments matches the
+# actual spec text (modulo whitespace), so the authoritative comments next to
+# the money-path code cannot silently drift from the BOLTs.
+#
+# Requires (sibling checkouts, zero pip deps on python >= 3.11):
+#   git clone https://github.com/rustyrussell/greatspectations ../greatspectations
+#   git clone https://github.com/lightning/bolts ../bolts
+#
+# Run from the repo root (also wired into tests/test_spec_quotes.py):
+#   PYTHONPATH=../greatspectations/src python3 -m greatspectations \
+#       check --config specquotes.toml swap-provider/plugin/*.py
+
+[sources.bolt]
+format = "markdown"
+dir = "../bolts"
+pattern = "{id:02d}-*.md"

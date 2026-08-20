@@ -437,6 +437,23 @@ class SwapManager:
                 return
             swap.spending_txid = tx.txid()
             if funding_height.conf > 0: # or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
+                # Impl-note: HARD REQUIREMENT (swap protocol, not BOLT): only
+                # Impl-note: broadcast the claim once the lockup has >= 1 confirmation.
+                # Impl-note: The claim's witness REVEALS THE PREIMAGE, which settles
+                # Impl-note: the lightning hold invoice irreversibly. Claiming an
+                # Impl-note: unconfirmed lockup lets the payer double-spend the
+                # Impl-note: funding while the preimage is already public: they keep
+                # Impl-note: the onchain funds AND settle the invoice — we lose the
+                # Impl-note: full swap amount.
+                # Impl-note: The converse also holds: do NOT sit on a confirmed
+                # Impl-note: lockup. Until the preimage is revealed, the payer's
+                # Impl-note: HTLCs are parked (and their own BOLT #2 timeout
+                # Impl-note: deadlines keep ticking), so delaying the claim risks
+                # Impl-note: the payer's HTLCs failing and the swap dying even
+                # Impl-note: though it was fully funded. Verified live
+                # Impl-note: 2026-08-20: claim e3c670aa of lockup 4ecb1e4d
+                # Impl-note: confirmed in the next block; invoice settled in
+                # Impl-note: the same window.
                 try:
                     self.logger.debug(f'spending claim tx {tx.txid()}: '
                                      f'\nTX_RAW: {Transaction.serialize(tx)}')
