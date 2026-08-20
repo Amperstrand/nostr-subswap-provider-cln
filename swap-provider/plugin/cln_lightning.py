@@ -87,6 +87,21 @@ class CLNLightning:
                 with self._invoice_lock:
                     for payment_hash in list(self._hold_invoices.keys()):
                         invoice = self.get_hold_invoice(payment_hash)
+                        # db round-trip hazard: after a restart the JsonDB
+                        # may hold non-HoldInvoice values (bools from the
+                        # flat tombstone store, plain dicts from stale
+                        # serializations) — skip and purge them instead
+                        # of crashing the monitor loop forever (earned:
+                        # 'bool' object has no attribute 'cancel_all_htlcs'
+                        # spun every 10s, blocking ALL expiry handling)
+                        if not isinstance(invoice, HoldInvoice):
+                            if invoice is not None:
+                                self._logger.warning(
+                                    f"monitor_expiries: purging corrupt "
+                                    f"hold_invoices entry {payment_hash[:12]}… "
+                                    f"(type {type(invoice).__name__})")
+                                self._hold_invoices.pop(payment_hash, None)
+                            continue
                         if self.check_invoice_expiry(invoice):
                             self._logger.warning(f"monitor_expiries: "
                                                  f"cancelled expired invoice {invoice.payment_hash.hex()}")
