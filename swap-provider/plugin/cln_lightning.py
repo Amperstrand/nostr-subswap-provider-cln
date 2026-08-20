@@ -57,6 +57,12 @@ class CLNLightning:
         self._preimages = db.get_dict('lightning_preimages')  # RHASH -> preimage
         self._invoices = db.get_dict('invoices')  # type: Dict[str, Invoice]
         self._hold_invoices = db.get_dict('hold_invoices')  # type: Dict[str, HoldInvoice]  # HASH[hex] -> bolt11
+        # issue #25 (A5 sibling): persisted tombstones of deleted/expired
+        # holds — replayed/late HTLCs for these FAIL (electrum reference:
+        # lnpeer.py:3178 "payment info has been deleted" → 400F), never
+        # "continue" (which parks payer funds until CLTV). Init here so the
+        # hook is tombstone-safe before run() completes.
+        self._tombstones = db.get_dict('hold_tombstones')
         self._decoded_invoices = {}  # bolt11 -> decoded dict (see handle_htlc)
         self._payment_secret_key = plugin_instance.derive_secret("payment_secret")
         self.monitoring_tasks = [] # type: List[asyncio.Task]
@@ -166,8 +172,16 @@ class CLNLightning:
             return request.set_result({"result": "continue"})
 
         with self._invoice_lock:
-            invoice = self.get_hold_invoice(bytes.fromhex(htlc["payment_hash"]))
+            payment_hash_hex = htlc["payment_hash"]
+            invoice = self.get_hold_invoice(bytes.fromhex(payment_hash_hex))
             if invoice is None:  # htlc doesn't belong to a hold invoice we know about
+                if payment_hash_hex in self._tombstones:
+                    # hold deleted/expired (issue #25): fail immediately —
+                    # mirrors invoices.Htlc.fail()'s 400F shape
+                    self._logger.info(f"plugin_htlc_accepted_hook: failing htlc for "
+                                      f"tombstoned hold {payment_hash_hex[:12]}…")
+                    return request.set_result({"result": "fail",
+                                               "failure_message": "400F"})
                 self._logger.debug(f"plugin_htlc_accepted_hook: htlc for unknown invoice")
                 return request.set_result({"result": "continue"})
 
@@ -376,6 +390,9 @@ class CLNLightning:
         res = self._hold_invoices.pop(payment_hash, None)
         if res is None:
             return
+        # issue #25: tombstone the hash so replayed/late HTLCs for this
+        # deleted hold fail instead of parking (persisted via db dict)
+        self._tombstones[payment_hash] = True
         if write_db:
             self._db.write()
 
