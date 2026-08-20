@@ -135,14 +135,21 @@ class CLNLightning:
                             prepay_invoice_hash = invoice.get_prepay_invoice()
                             if prepay_invoice_hash is not None:  # check if there is a prepay invoice attached
                                 prepay_invoice = self.get_hold_invoice(prepay_invoice_hash)
-                                if prepay_invoice.funding_status is InvoiceState.FUNDED:
+                                # settled-then-deleted prepay returns None here
+                                # (the sweeper removes hold invoices on
+                                # settle) — treat as already redeemed, else
+                                # AttributeError spins the callback loop
+                                # forever and the main invoice never fires
+                                # (earned live: d1 swaps hung in
+                                # 'swap.created' for 30+ min)
+                                if prepay_invoice is not None and prepay_invoice.funding_status is InvoiceState.FUNDED:
                                     # redeem the prepay invoice first
                                     prepay_invoice.settle(self.get_preimage(prepay_invoice_hash))
                                     self.update_invoice(prepay_invoice)
                                     self._logger.debug(f"callback_handler: prepay invoice "
                                                         f"{prepay_invoice.payment_hash.hex()} redeemed")
-                                else:  # prepay invoice not yet funded, so we wait for it to be funded
-                                    continue
+                                elif prepay_invoice is not None:
+                                    continue  # prepay invoice not yet funded, so we wait for it to be funded
                             self._logger.debug(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
                                                 f"calling callback")
 
