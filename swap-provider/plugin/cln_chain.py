@@ -27,7 +27,11 @@ class CLNChainWallet:
                                                             feerate=self.config.cln_feerate_str,
                                                             startweight=startweight,
                                                             minconf=None,
-                                                            reserve=6,
+                                                            # reserve=0: signpsbt follows immediately, so the
+                                                            # 6-block reservation bought nothing while pinning
+                                                            # ~20k per failed attempt for 30+ min on signet
+                                                            # (earned: wallet starved to 'tx needs 1 output')
+                                                            reserve=0,
                                                             excess_as_change=True)
             raw_inputs_only_psbt = fundpsbt_response['psbt']
         except Exception as e:
