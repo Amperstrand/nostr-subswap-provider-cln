@@ -35,7 +35,9 @@ class CLNChainWallet:
                                                             excess_as_change=True)
             raw_inputs_only_psbt = fundpsbt_response['psbt']
         except Exception as e:
-            self.logger.error("create_transaction failed to call fundpsbt rpc: %s", e)
+            # PluginLogger.error takes ONE arg (printf-style args crash it
+            # — earned: the crash message replaced the real fundpsbt error)
+            self.logger.error(f"create_transaction failed to call fundpsbt rpc: {e}")
             return None
 
         # add outputs to inputs_only_psbt
@@ -48,7 +50,7 @@ class CLNChainWallet:
         try:
            signed_psbt = self.rpc.signpsbt(complete_psbt_b64)["signed_psbt"]
         except Exception as e:
-            self.logger.error("create_transaction failed to call signpsbt rpc: %s", e)
+            self.logger.error(f"create_transaction failed to call signpsbt rpc: {e}")
             return None
 
         signed_psbt = PartialTransaction().from_raw_psbt(signed_psbt)

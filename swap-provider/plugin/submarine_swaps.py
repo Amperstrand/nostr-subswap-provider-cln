@@ -729,6 +729,14 @@ class SwapManager:
             outputs_without_change=[funding_output],
             rbf=True,
         )
+        # fundpsbt failure (starved wallet / no live utxos) returns None —
+        # raise a descriptive error so hold_invoice_callback's handler
+        # fails the swap cleanly instead of the ChainMonitor crashing on
+        # 'NoneType has no attribute inputs' (earned live)
+        if tx is None:
+            raise Exception('create_funding_tx: wallet could not fund the '
+                            'lockup (fundpsbt failed — check onchain '
+                            'balance and reservations)')
         return tx
 
     # upstream bug (port find #2): @log_exceptions asserts its target is
