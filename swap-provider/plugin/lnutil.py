@@ -30,9 +30,15 @@ json_to_keypair = lambda v: v if isinstance(v, OnlyPubkeyKeypair) else Keypair(*
 
 def filter_suitable_recv_chans(inv_amount_msat: int, channels):
     suitable_channels = []
-    # filter out channels that aren't private or available
+    # Hint BOTH private and public channels: private ones have no gossip
+    # edge (hint is the only route); public ones normally gossip-route,
+    # BUT payers with lagging/partial gossip maps (fresh channels are
+    # ~20-40 blocks behind) fail NoPathFound with zero hints — a hint
+    # costs nothing and makes invoices payer-gossip-independent
+    # (earned live: fresh public channel, invoice hintless, payer
+    # NoPathFound despite healthy balance).
     for channel in channels:
-        if channel["private"] and channel["state"] == "CHANNELD_NORMAL":
+        if channel["state"] == "CHANNELD_NORMAL":
             suitable_channels.append(channel)
 
     # sort by inbound capacity
