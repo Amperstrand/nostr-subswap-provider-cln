@@ -22,16 +22,24 @@ class CLNChainWallet:
         spk_weights: int = sum([(len(o.scriptpubkey) + 9) * 4 for o in outputs_without_change])
         startweight: int = tx_core_weight + spk_weights  # weight of the tx without any inputs (required for CLN)
         # get inpts from CLN wallet using fundpsbt rpc call
+        # CHANGE-SLACK (+1000 sat over the output sum): with
+        # excess_as_change=true and an exact-satoshi ask, CLN selects
+        # inputs so excess lands at dust and DROPS the change output ->
+        # 'tx needs to have at least 1 output' on a HEALTHY wallet
+        # (earned: 277k free, excess_msat=0, every d1 funding failed)
         try:
-            fundpsbt_response = self.rpc.fundpsbt(satoshi=output_sum_sat,
+            fundpsbt_response = self.rpc.fundpsbt(satoshi=output_sum_sat + 1000,
                                                             feerate=self.config.cln_feerate_str,
                                                             startweight=startweight,
                                                             minconf=None,
-                                                            # reserve=0: signpsbt follows immediately, so the
-                                                            # 6-block reservation bought nothing while pinning
-                                                            # ~20k per failed attempt for 30+ min on signet
-                                                            # (earned: wallet starved to 'tx needs 1 output')
-                                                            reserve=0,
+                                                            # reserve: DEFAULT (dropped param) — signpsbt REFUSES
+                                                            # unreserved inputs ('UTXO ... is not reserved', the
+                                                            # live d1 failure). reserve=0 was my mistake: it made
+                                                            # fundpsbt succeed but signpsbt reject. The default
+                                                            # reserves until spent; we sign+broadcast in this same
+                                                            # call so the reservation lives ~milliseconds. The
+                                                            # earlier starvation was the dust-excess selection
+                                                            # (fixed by the +1000 slack), not the reservation.
                                                             excess_as_change=True)
             raw_inputs_only_psbt = fundpsbt_response['psbt']
         except Exception as e:
