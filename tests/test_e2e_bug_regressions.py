@@ -140,6 +140,25 @@ class TestDbRoundTrip:
         assert re.search(r"_tombstones\[.*\]\s*=\s*True", code)
         # and it must NOT write to _hold_invoices in the same path
 
+    def test_walrus_precedence_in_check_invoice_expiry(self):
+        """The ':=' in check_invoice_expiry must be parenthesized — without
+        parens, ':=' binds looser than 'is not None' and prepay_invoice
+        becomes a bool (the live 'bool has no cancel_all_htlcs' bug).
+        Detects the unparenthesized pattern: 'name := expr is not None'
+        (no opening paren wrapping the walrus)."""
+        code = _code_only(PLUGIN_DIR / "cln_lightning.py")
+        # find walrus assignments followed by 'is not None' that are NOT
+        # wrapped in parens (i.e. no '(' immediately before the name)
+        for m in re.finditer(r"(\w+)\s*:=\s*(.+?)\s+is not None", code):
+            # look backwards from the match for an opening paren
+            start = m.start(1)
+            before = code[max(0, start - 1)] if start > 0 else ""
+            if before != "(":
+                pytest.fail(
+                    f"unparenthesized walrus + 'is not None' at "
+                    f"'{m.group(0)[:60]}…' — ':=' binds looser than 'is not', "
+                    f"assigning the boolean instead of the value")
+
 
 # ================================================================ 3. funding-tx shape tests
 # LIVE BUG: fundpsbt excess-as-change at dust → PSBT with no room →

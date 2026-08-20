@@ -125,7 +125,10 @@ class CLNLightning:
 
             if invoice.associated_invoice is not None:
                 self._logger.debug(f"deleting associated invoice: {invoice.associated_invoice}")
-                if prepay_invoice := self.get_hold_invoice(invoice.associated_invoice) is not None:
+                # WALRUS PRECEDENCE (earned live): ':=' binds looser than
+                # 'is not None' — without the parens, prepay_invoice got
+                # the BOOLEAN (True), crashing cancel_all_htlcs every 10s
+                if (prepay_invoice := self.get_hold_invoice(invoice.associated_invoice)) is not None:
                     self._logger.debug(f"prepay_invoice: {prepay_invoice}")
                     prepay_invoice.cancel_all_htlcs()
                     self.delete_hold_invoice(prepay_invoice.payment_hash)
