@@ -147,8 +147,12 @@ def jit_liquidity_factor(rpc=None) -> float:
 # the payer side, so the channel needs invoice + routing margin)
 JIT_FEE_BUFFER_SAT = 1_000
 
-# CLN minimum channel size (dust limit — fundchannel rejects below this)
-JIT_MIN_CHANNEL_SAT = 50_000
+# Receiver-side floor dominates: electrum payees enforce
+# MIN_FUNDING_SAT = 200_000 (lnutil.py) and kill openingd below it
+# (live-earned in the regtest JIT live-fire — a 50k open died with
+# "openingd died" and the peer dropped). CLN's own floor is lower,
+# but the opener must clear the strictest common receiver.
+JIT_MIN_CHANNEL_SAT = 200_000
 
 # wallet-drain guard: never open a channel more than 10x the invoice
 JIT_MAX_PER_INVOICE = 10
@@ -170,6 +174,10 @@ NO_ROUTE_SIGNATURES = [
     "no route",
     "There is no connection",
     "Could not find a usable set of paths",
+    # xpay 205 when the payee is entirely absent from the gossip map
+    # (zero-channel fresh node — live-captured in the regtest JIT
+    # live-fire; the classic phrasings don't cover it)
+    "Unknown destination node",
     "insufficient capacity for direct",
 ]
 
@@ -223,11 +231,15 @@ def sufficient_onchain(amount_sat: int, rpc) -> bool:
 
 
 def has_channel_to(node_id: str, rpc) -> bool:
-    """True if we already have any channel (any state) to this node."""
+    """True if we already have any channel (any state) to this node.
+
+    CLN v26 moved channels out of listpeers' per-peer nesting into
+    listpeerchannels — read BOTH shapes (live-earned: the nested-only
+    read double-opened a JIT channel while the first awaited lockin).
+    """
     try:
-        peers = rpc.listpeers(node_id)
-        for peer in peers.get("peers", []):
-            if peer.get("id") == node_id and peer.get("channels"):
+        for chan in rpc.listpeerchannels().get("channels", []):
+            if chan.get("peer_id") == node_id:
                 return True
     except Exception:
         pass
@@ -289,24 +301,25 @@ def wait_channel_lockin(node_id: str, rpc,
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            peers = rpc.listpeers(node_id)
-            for peer in peers.get("peers", []):
-                if peer.get("id") != node_id:
+            # CLN v26: channels are NOT under listpeers peers — poll the
+            # flat listpeerchannels shape (nested-only read polled blind
+            # for 600s while the channel was already NORMAL)
+            for chan in rpc.listpeerchannels().get("channels", []):
+                if chan.get("peer_id") != node_id:
                     continue
-                for chan in peer.get("channels") or []:
-                    state = chan.get("state")
-                    if state == "CHANNELD_NORMAL":
-                        scid = chan.get("short_channel_id", "?")
-                        logger.info(
-                            f"jit: channel to {node_id[:12]}… is "
-                            f"OPEN (scid {scid})"
-                        )
-                        return True
-                    if state in ("CHANNELD_AWAITING_LOCKIN",):
-                        logger.debug(
-                            f"jit: lockin pending "
-                            f"(scid {chan.get('short_channel_id', '?')})"
-                        )
+                state = chan.get("state")
+                if state == "CHANNELD_NORMAL":
+                    scid = chan.get("short_channel_id", "?")
+                    logger.info(
+                        f"jit: channel to {node_id[:12]}… is "
+                        f"OPEN (scid {scid})"
+                    )
+                    return True
+                if state in ("CHANNELD_AWAITING_LOCKIN",):
+                    logger.debug(
+                        f"jit: lockin pending "
+                        f"(scid {chan.get('short_channel_id', '?')})"
+                    )
         except Exception as e:
             logger.debug(f"jit: poll error: {e}")
         time.sleep(10)

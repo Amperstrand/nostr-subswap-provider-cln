@@ -97,6 +97,25 @@ class TestNoRouteDetection:
         assert is_no_route_failure(
             {"code": 205, "message": "There is no connection between source and destination at all"})
 
+    def test_cln_205_unknown_destination_node(self):
+        # LIVE-captured 2026-08-21 regtest JIT live-fire: xpay emits this
+        # variant when the payee is absent from the gossip map entirely
+        # (zero-channel fresh node). The original signature list missed
+        # it and JIT silently never fired.
+        assert is_no_route_failure(
+            {"code": 205, "message": "Failed: Unknown destination node "
+             "0321a1cf8ee76f3fa182a3190e852b7030dbd363a0f59578c6f4a0f63528bf9dcc"})
+
+    def test_cln_205_unknown_destination_full_rpc_log_string(self):
+        # the exact string the plugin's pay_invoice returns as `log` on
+        # the RPC-failure path (live-captured, jit live-fire session)
+        assert is_no_route_failure(
+            "pay_invoice call to CLN failed: RPC call failed: method: pay, "
+            "payload: {'bolt11': 'lnbcrt250u1...', 'retry_for': 225}, "
+            "error: {'code': 205, 'message': 'Failed: Unknown destination "
+            "node 0321a1cf8ee76f3fa182a3190e852b7030dbd363a0f59578c6f4a0f63528bf9dcc'}")
+
+
     def test_raw_string_variant(self):
         assert is_no_route_failure("Failed: We could not find a usable set of paths")
 
@@ -130,8 +149,9 @@ class TestChannelSizingWithLiquidity:
         assert size >= 100_000 + JIT_FEE_BUFFER_SAT + 20_000
 
     def test_generous_factor_retains_more(self):
-        conservative = jit_channel_size(100_000, liquidity_factor=0.20)
-        generous = jit_channel_size(100_000, liquidity_factor=0.50)
+        # above the 200k floor — small invoices all floor to the same size
+        conservative = jit_channel_size(400_000, liquidity_factor=0.20)
+        generous = jit_channel_size(400_000, liquidity_factor=0.50)
         assert generous > conservative
 
     def test_capped_at_max_per_invoice(self):
@@ -179,19 +199,42 @@ class TestSufficientOnchain:
 class TestHasChannelTo:
     def test_existing_channel(self):
         rpc = MagicMock()
-        rpc.listpeers.return_value = {
-            "peers": [{"id": "abc123", "channels": [{"state": "CHANNELD_NORMAL"}]}]
+        rpc.listpeerchannels.return_value = {
+            "channels": [{"peer_id": "abc123", "state": "CHANNELD_NORMAL"}]
         }
         assert has_channel_to("abc123", rpc)
 
     def test_no_channel(self):
         rpc = MagicMock()
-        rpc.listpeers.return_value = {"peers": [{"id": "abc123", "channels": None}]}
+        rpc.listpeerchannels.return_value = {"channels": []}
         assert not has_channel_to("abc123", rpc)
 
     def test_rpc_error(self):
         rpc = MagicMock()
         rpc.listpeers.side_effect = Exception("boom")
+        assert not has_channel_to("abc123", rpc)
+
+    def test_flat_listpeerchannels_shape(self):
+        # CLN v26: channels are NOT under listpeers peers — a
+        # pending-or-normal channel must be visible via
+        # listpeerchannels (live-earned: the blind check double-opened
+        # a second JIT channel while the first awaited lockin)
+        rpc = MagicMock()
+        rpc.listpeers.return_value = {"peers": [{"id": "abc123", "connected": True}]}
+        rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"peer_id": "other", "state": "CHANNELD_NORMAL"},
+                {"peer_id": "abc123", "state": "CHANNELD_AWAITING_LOCKIN"},
+            ]
+        }
+        assert has_channel_to("abc123", rpc)
+
+    def test_flat_shape_no_channel(self):
+        rpc = MagicMock()
+        rpc.listpeers.return_value = {"peers": [{"id": "abc123", "connected": True}]}
+        rpc.listpeerchannels.return_value = {
+            "channels": [{"peer_id": "other", "state": "CHANNELD_NORMAL"}]
+        }
         assert not has_channel_to("abc123", rpc)
 
 
@@ -222,7 +265,7 @@ class TestOpenJitChannel:
         result = open_jit_channel("03abc", 20_000, rpc, liquidity_factor=0.20)
         assert result is not None
         call_args = rpc.fundchannel.call_args
-        assert "50000sat" in str(call_args)  # floored at JIT_MIN
+        assert "200000sat" in str(call_args)  # floored at JIT_MIN (electrum MIN_FUNDING_SAT)
 
     def test_insufficient_funds_returns_none(self):
         rpc = MagicMock()
@@ -241,17 +284,40 @@ class TestOpenJitChannel:
 class TestWaitChannelLockin:
     def test_open_channel_returns_true(self):
         rpc = MagicMock()
-        rpc.listpeers.return_value = {
-            "peers": [{
-                "id": "abc",
-                "channels": [{"state": "CHANNELD_NORMAL", "short_channel_id": "123x4x5"}]
+        rpc.listpeerchannels.return_value = {
+            "channels": [{
+                "peer_id": "abc", "state": "CHANNELD_NORMAL",
+                "short_channel_id": "123x4x5",
             }]
         }
         assert wait_channel_lockin("abc", rpc, timeout_s=1)
 
     def test_no_channel_times_out(self):
         rpc = MagicMock()
-        rpc.listpeers.return_value = {"peers": []}
+        rpc.listpeerchannels.return_value = {"channels": []}
+        assert not wait_channel_lockin("abc", rpc, timeout_s=1)
+
+    def test_flat_listpeerchannels_shape(self):
+        # CLN v26 removed the per-peer channel nesting: listpeers carries
+        # NO channels key, channels live in listpeerchannels only
+        # (live-earned: a nested-only read polled blind for 600s while
+        # the channel was already NORMAL).
+        rpc = MagicMock()
+        rpc.listpeers.return_value = {"peers": [{"id": "abc", "connected": True}]}
+        rpc.listpeerchannels.return_value = {
+            "channels": [
+                {"peer_id": "abc", "state": "CHANNELD_AWAITING_LOCKIN"},
+                {"peer_id": "abc", "state": "CHANNELD_NORMAL", "short_channel_id": "700x1x0"},
+            ]
+        }
+        assert wait_channel_lockin("abc", rpc, timeout_s=1)
+
+    def test_flat_shape_other_peer_channels_ignored(self):
+        rpc = MagicMock()
+        rpc.listpeers.return_value = {"peers": [{"id": "abc", "connected": True}]}
+        rpc.listpeerchannels.return_value = {
+            "channels": [{"peer_id": "other", "state": "CHANNELD_NORMAL"}]
+        }
         assert not wait_channel_lockin("abc", rpc, timeout_s=1)
 
 
