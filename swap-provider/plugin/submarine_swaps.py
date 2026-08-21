@@ -19,6 +19,56 @@ from electrum_ecc import ECPrivkey
 class RequestFieldError(Exception):
     """Client sent a malformed field; maps to a clean error REPLY."""
 
+
+# Issue #4 / BOLT #11 reader MUSTs, enforced at the ACTION BOUNDARY —
+# electrum's architecture (bolt11 decode is deliberately lenient so old
+# stored invoices stay parseable; lnworker._check_bolt11_invoice +
+# validate_features enforce before paying). Even bits an invoice may
+# REQUIRE of us as payer; unknown even bits → reject (electrum
+# validate_features semantics). Odd/optional bits are ignorable per spec.
+INVOICE_SUPPORTED_EVEN_BITS = {8, 14, 16, 18}  # var_onion, payment_secret, basic_mpp, large_channel
+
+
+def check_invoice_before_payment(bolt11_invoice: str):
+    """BOLT #11 reader MUSTs before we accept a client invoice (issue #4).
+
+    Fails at the API boundary with RequestFieldError — never after the
+    client's onchain lockup. Returns the decoded LnAddr."""
+    from .lnaddr import lndecode, LnDecodeException
+    try:
+        addr = lndecode(bolt11_invoice)
+    except LnDecodeException as e:
+        raise RequestFieldError(f'invoice is not valid bolt11: {e}')
+    # BOLT #11: - MUST fail the payment if any field with fixed `data_length` (`p`, `h`, `s`, `n`) does not have the correct length (52, 52, 52, 53).
+# Impl-note: (lenient decode routes malformed tags to unknown_tags /
+# Impl-note: leaves the field unset — we check the unset field)
+    if addr.paymenthash is None:
+        raise RequestFieldError('invoice has no valid payment hash (p tag)')
+    # BOLT #11: - MUST fail the payment if neither a `d` field nor a `h`
+    #  field is present, or if both are present.
+    has_d, has_h = addr.get_tag('d') is not None, addr.get_tag('h') is not None
+    if has_d and has_h:
+        raise RequestFieldError('invoice has both d and h tags')
+    if not has_d and not has_h:
+        raise RequestFieldError('invoice has neither d nor h tag')
+    # BOLT #11: - if a valid `s` field is not provided:
+    #  - MUST fail the payment.
+    if addr.payment_secret is None:
+        raise RequestFieldError('invoice has no payment secret (s tag)')
+    # BOLT #11: - if the `9` field contains unknown _even_ bits that are non-zero:
+    #  - MUST fail the payment.
+# Impl-note: (unknown odd bits are ignorable per the same section)
+    features = addr.get_tag('9') or 0
+    if features.bit_length() > 10_000:
+        raise RequestFieldError(f'invoice feature vector too large '
+                                f'({features.bit_length()} bits)')
+    for fbit in range(features.bit_length()):
+        if features >> fbit & 1 and fbit % 2 == 0 and fbit not in INVOICE_SUPPORTED_EVEN_BITS:
+            raise RequestFieldError(f'invoice requires unknown/unsupported '
+                                    f'feature bit {fbit}')
+    return addr
+
+
 from electrum_aionostr.util import to_nip19
 from collections import defaultdict
 
@@ -344,7 +394,12 @@ class SwapManager:
 
         self.logger.debug(f'_claim_swap lockup addr: {swap.lockup_address} found {len(txos)} txout spending to it')
         for txin in txos:
-            if swap.is_reverse and txin.value_sats() < swap.onchain_amount:
+            # Issue #7 (audit D-2, electrum parity): skip underfunded
+            # outputs in BOTH directions — for normal swaps anyone can
+            # pay dust decoys to the P2WSH lockup; a decoy that sorts
+            # first would raise BelowDustLimit forever and block our
+            # post-locktime refund.
+            if txin.value_sats() < swap.onchain_amount:
                 # amount too low, we must not reveal the preimage
                 continue
             break
@@ -708,6 +763,10 @@ class SwapManager:
             invoice = Invoice.from_bech32(request['invoice'])
         except Exception as e:
             raise RequestFieldError(f'invoice is not valid bolt11: {e!r}')
+        # Issue #4: BOLT #11 reader MUSTs at the boundary — malformed
+        # invoices (bad p/s length, d/h xor, missing secret, unknown even
+        # feature bits) reject HERE, before any state mutation.
+        check_invoice_before_payment(request['invoice'])
         key = invoice.rhash
         payment_hash = bytes.fromhex(key)
         their_pubkey = self._parse_client_key(

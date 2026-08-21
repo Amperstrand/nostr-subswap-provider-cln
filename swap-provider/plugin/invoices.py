@@ -157,27 +157,33 @@ class Htlc:
         """Fail HTLC with incorrect_or_unknown_payment_details"""
         if not self.state == HtlcState.ACCEPTED:
             raise InvalidHtlcState("fail(): Htlc is not in ACCEPTED state, is: {}".format(self.state))
-        assert(self.request_callback is not None), "Htlc has no callback set on fail"
+        # Issue #6 (PD-3): after a restart, HTLCs resolved while we were
+        # down are never replayed by CLN and keep request_callback=None —
+        # the old assert here crashed the whole expiry sweep on them,
+        # starving every later invoice (be5a97e class). Transition state
+        # only; CLN fails such HTLCs on-chain via its own timeout.
         self.state = HtlcState.CANCELLED
-        self.request_callback.set_result({"result": "fail", "failure_message": "400F"})
+        if self.request_callback is not None:
+            self.request_callback.set_result({"result": "fail", "failure_message": "400F"})
 
     def fail_timeout(self) -> None:
         """Fail HTLC with incorrect_or_unknown_payment_details"""
         if not self.state == HtlcState.ACCEPTED:
             raise InvalidHtlcState("fail(): Htlc is not in ACCEPTED state, is: {}".format(self.state))
-        assert(self.request_callback is not None), "Htlc has no callback set on timeout"
         self.state = HtlcState.CANCELLED
-        self.request_callback.set_result({"result": "fail", "failure_message": "0017"})  # mpp timeout
+        if self.request_callback is not None:
+            self.request_callback.set_result({"result": "fail", "failure_message": "0017"})  # mpp timeout
 
     def settle(self, preimage: bytes) -> None:
         """Settle HTLC with correct payment details"""
         if not self.state == HtlcState.ACCEPTED:
             raise InvalidHtlcState("Htlc is not in ACCEPTED state, is: {}".format(self.state))
-        assert(self.request_callback is not None), (f"Htlc has no callback set on settle. "
-                                                    f"Fix this or you lose your htlc.")
+        # Issue #6: callback-less HTLCs (resolved while we were down) —
+        # state transition only; never crash the sweep (see fail()).
         self.state = HtlcState.SETTLED
-        self.request_callback.set_result({"result": "resolve",
-                                          "payment_key": preimage.hex()})
+        if self.request_callback is not None:
+            self.request_callback.set_result({"result": "resolve",
+                                              "payment_key": preimage.hex()})
 
 class InvalidHtlcState(Exception):
     pass

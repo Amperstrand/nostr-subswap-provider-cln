@@ -93,33 +93,42 @@ class CLNLightning:
         """Iterate through the hold invoices and cancel expired htlcs"""
         while True:
             try:
-                with self._invoice_lock:
-                    for payment_hash in list(self._hold_invoices.keys()):
-                        invoice = self.get_hold_invoice(payment_hash)
-                        # db round-trip hazard: after a restart the JsonDB
-                        # may hold non-HoldInvoice values (bools from the
-                        # flat tombstone store, plain dicts from stale
-                        # serializations) — skip and purge them instead
-                        # of crashing the monitor loop forever (earned:
-                        # 'bool' object has no attribute 'cancel_all_htlcs'
-                        # spun every 10s, blocking ALL expiry handling)
-                        if not isinstance(invoice, HoldInvoice):
-                            if invoice is not None:
-                                self._logger.warning(
-                                    f"monitor_expiries: purging corrupt "
-                                    f"hold_invoices entry {payment_hash[:12]}… "
-                                    f"(type {type(invoice).__name__})")
-                                self._hold_invoices.pop(payment_hash, None)
-                            continue
-                        if self.check_invoice_expiry(invoice):
-                            self._logger.warning(f"monitor_expiries: "
-                                                 f"cancelled expired invoice {invoice.payment_hash.hex()}")
-                            raise RestartLoop()
-            except RestartLoop:
-                continue
+                self._expire_pass()
             except Exception:
                 self._logger.error(f"monitor_expiries loop encountered an error:\n{traceback.format_exc()}")
             time.sleep(10)
+
+    def _expire_pass(self):
+        """One expiry sweep. Issue #6 (PD-3): failures are isolated
+        PER-INVOICE — one poisoned entry must not starve the rest of
+        the sweep (the old whole-loop try/except restarted from the top
+        every 10s and died on the same entry forever)."""
+        with self._invoice_lock:
+            for payment_hash in list(self._hold_invoices.keys()):
+                try:
+                    invoice = self.get_hold_invoice(payment_hash)
+                    # db round-trip hazard: after a restart the JsonDB
+                    # may hold non-HoldInvoice values (bools from the
+                    # flat tombstone store, plain dicts from stale
+                    # serializations) — skip and purge them instead
+                    # of crashing the monitor loop forever (earned:
+                    # 'bool' object has no attribute 'cancel_all_htlcs'
+                    # spun every 10s, blocking ALL expiry handling)
+                    if not isinstance(invoice, HoldInvoice):
+                        if invoice is not None:
+                            self._logger.warning(
+                                f"monitor_expiries: purging corrupt "
+                                f"hold_invoices entry {payment_hash[:12]}… "
+                                f"(type {type(invoice).__name__})")
+                            self._hold_invoices.pop(payment_hash, None)
+                        continue
+                    if self.check_invoice_expiry(invoice):
+                        self._logger.warning(f"monitor_expiries: "
+                                             f"cancelled expired invoice {invoice.payment_hash.hex()}")
+                except Exception:
+                    self._logger.error(f"monitor_expiries: skipping invoice "
+                                       f"{payment_hash[:12]}… after error:\n"
+                                       f"{traceback.format_exc()}")
 
     def check_invoice_expiry(self, invoice: HoldInvoice) -> bool:
         """Check if the invoice is expired and cancel it if it is, also checks associated prepay invoice"""
@@ -637,7 +646,4 @@ class Bolt11InvoiceCreationError(Exception):
     pass
 
 class InvoiceNotFoundError(Exception):
-    pass
-
-class RestartLoop(Exception):
     pass

@@ -6,3 +6,5 @@ jsonpatch>=1.33,<2.0
 python-dotenv>=1.0.1,<2.0
 pycryptodome>=3.20
 bitcoinrpc>=0.7.0,<0.8.0
+aiorpcx>=0.25,<0.26
+httpx>=0.25,<1.0
