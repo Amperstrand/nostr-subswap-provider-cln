@@ -55,10 +55,18 @@ def mine_ann_pow_nonce(pubkey_xonly_hex: str, target_bits: int,
 def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
                         min_amount_sat: int, max_forward_sat: int,
                         max_reverse_sat: int, relays_csv: str,
-                        pow_nonce: int) -> str:
+                        pow_nonce: int,
+                        jit_channel_pct: float = 0.0) -> str:
     """Content JSON exactly as electrum 4.8.1 publishes it (percentage_fee
     is kept as float for <=4.7.1 client compat — same reasoning upstream).
-    pow_nonce is hex-encoded, matching electrum's hex(sm.config.…)."""
+    pow_nonce is hex-encoded, matching electrum's hex(sm.config.…).
+
+    jit_channel_pct: optional LSP capability advertisement (the
+    SWAPSERVER_JIT_CHANNEL liquidity percentage). Emitted ONLY when > 0
+    so non-JIT providers keep byte-identical offers. Safe on the wire:
+    electrum's announcement parser reads only its known keys and
+    ignores extras (verified in 4.8.1 source, submarine_swaps.py
+    _offers parsing)."""
     offer = {
         "percentage_fee": float(percentage_fee),
         "mining_fee": int(mining_fee_sat),
@@ -68,6 +76,8 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
         "relays": relays_csv,
         "pow_nonce": hex(int(pow_nonce)),
     }
+    if jit_channel_pct and jit_channel_pct > 0:
+        offer["jit_channel_pct"] = float(jit_channel_pct)
     return json.dumps(offer)
 
 

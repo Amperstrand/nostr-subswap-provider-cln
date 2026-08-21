@@ -80,6 +80,19 @@ def test_m2_offer_builder_emits_current_keys():
         max_forward_sat=7500000, max_reverse_sat=310000,
         relays_csv="wss://nos.lol", pow_nonce=12345))
     assert set(content.keys()) == CURRENT_ELECTRUM_OFFER_KEYS
+
+    # JIT advertisement: opt-in extra key, ONLY when the provider runs
+    # the JIT opener. electrum 4.8.1's client parser (submarine_swaps.py
+    # ~2135) reads only its known keys and IGNORES extras — verified in
+    # source; unknown keys cannot break any current client. Non-JIT
+    # providers must keep byte-identical offers (this test pins that).
+    jit_content = _json.loads(offer.build_offer_content(
+        percentage_fee=0.5, mining_fee_sat=22500, min_amount_sat=20000,
+        max_forward_sat=7500000, max_reverse_sat=310000,
+        relays_csv="wss://nos.lol", pow_nonce=12345,
+        jit_channel_pct=25.0))
+    assert set(jit_content.keys()) == CURRENT_ELECTRUM_OFFER_KEYS | {"jit_channel_pct"}
+    assert jit_content["jit_channel_pct"] == 25.0
     assert content["pow_nonce"] == hex(12345)
     assert isinstance(content["percentage_fee"], float)
     assert content["max_forward_amount"] == 7500000

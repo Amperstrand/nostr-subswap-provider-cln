@@ -1194,7 +1194,10 @@ class NostrTransport:  # (Logger):
             max_forward_sat=self.sm._max_amount,
             max_reverse_sat=self.sm._max_amount,
             relays_csv=self.sm.config.nostr_relays_csv,
-            pow_nonce=self.config.ann_pow_nonce)
+            pow_nonce=self.config.ann_pow_nonce,
+            # percent units, matching percentage_fee semantics; 0 hides
+            # the key entirely (non-JIT providers keep identical offers)
+            jit_channel_pct=jit_liquidity_factor(self.sm.lnworker._rpc) * 100)
         tags = build_offer_tags(net_name=self.config.net_name)
         event_id = await aionostr._add_event(
             self.relay_manager,
