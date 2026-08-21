@@ -151,6 +151,20 @@ class PluginConfig:
         else:
             config.logger.warning(f"No FALLBACK_FEE_SATSVB set in env. Using default of {config.fallback_fee_sat_per_vb}")
 
+        # O4 feerate oracle (mempool-style /v1/fees/recommended): used
+        # when CLN has no estimate (signet/mutinynet). FEE_ORACLE_URL
+        # pins an endpoint (self-hosted esplora/mempool); default derives
+        # from the network. "off" disables; regtest has no default.
+        from . import fee_oracle
+        if (oracle := os.getenv("FEE_ORACLE_URL", "").strip()):
+            config.fee_oracle_url = None if oracle.lower() == "off" else oracle
+        else:
+            config.fee_oracle_url = fee_oracle.default_oracle_url(config.network)
+        if config.fee_oracle_url:
+            config.logger.info(f"fee oracle: {config.fee_oracle_url}")
+        else:
+            config.logger.info("fee oracle: disabled (CLN estimates + static fallback only)")
+
         if log_level := os.getenv("PLUGIN_LOG_LEVEL"):
             config.logger.change_level(log_level.strip())
 

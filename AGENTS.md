@@ -216,14 +216,16 @@ requirements above stay intact.
   propagation + RBF-punishing scoring). Tradeoff: R1 exists because
   0-conf claim = free doublespend option for the payer; any cap is a
   direct funds-risk budget. Almost never worth it outside regtest demos.
-- **O4 — Fee policy pinned to a live oracle.** Signet's native estimates
-  are garbage → the old static fallback priced 222-vB claims at ~4400
-  sats when the median block paid 0-6 sat/vB. The playground pinned
-  `fee_policy.swaps` to mempool.space halfHourFee via on-box cron
-  (ffb4687). This repo should read a feerate oracle (mempool.space API)
-  with the static rate as fallback-only. Tradeoff: external dependency in
-  the fee path — needs timeout + fallback so a down oracle degrades to
-  FALLBACK_FEE_SATVB instead of hanging R3 sweeps.
+- **O4 — Fee policy pinned to a live oracle.** ✅ DONE 2026-08-21
+  (`fee_oracle.py`, commit history): signet's native estimates are garbage
+  → the old static fallback priced 222-vB claims at 60 sat/vB (4400 sats)
+  when median blocks paid 0-6 sat/vB. `get_chain_fee` order is now CLN
+  estimate → mempool-style oracle (`FEE_ORACLE_URL` env or per-net
+  default; 5-min cache; 5s timeout; out-of-range = broken = fail-open)
+  → `FALLBACK_FEE_SATVB`. The oracle must never block a claim (R3) —
+  every error path falls through. Tradeoff (accepted): a third party
+  (mempool.space / mutinynet.com) learns our claim-timing pattern;
+  self-host with `FEE_ORACLE_URL` to avoid.
 - **O5 — Parallel invoice payment for parked invoices.** `pay_pending_ln_
   invoices` retries serially with a 15-attempt cap; MPP-aware concurrent
   attempts would settle the client's invoice faster once we claim.
@@ -237,6 +239,15 @@ requirements above stay intact.
 
 ## Gotchas
 
+0. **Port electrum's architecture, not just its code** (earned 2026-08-21,
+   issues #2-#7): both audit P0s and all four reader-MUST gaps were places
+   where the port dropped a guard or invented a policy electrum had already
+   solved. Canonical example: making the bolt11 decoder strict would have
+   been WRONG — electrum keeps decode lenient (old invoices must stay
+   parseable) and enforces MUSTs at the pay boundary
+   (`lnworker._check_bolt11_invoice`); we now mirror that in
+   `check_invoice_before_payment`. When adding validation, first ask "what
+   does electrum do at this seam", then port that.
 1. Swap direction naming (see above) — the #1 source of wrong "fixes".
 2. `privkey`/`preimage`/`redeem_script` are stored HEX on SwapData in this
    port (bytes in upstream electrum) — `hex_to_bytes` before ECPrivkey

@@ -116,9 +116,21 @@ class CLNChainWallet:
                 prev_blockcount = feerate['blockcount']
                 feerate_pervb = feerate['smoothed_feerate'] / 1000
         if feerate_pervb is None:
-            feerate_pervb = self.config.fallback_fee_sat_per_vb
-            self.logger.warning(f"get_chain_fee using fallback fee rate of {feerate_pervb} sat/vbyte because result"
-                                f" from cln rpc call was {feerates}")
+            # O4: CLN had no estimate (signet/mutinynet garbage estimates)
+            # — try the mempool-style oracle before the static fallback.
+            # Fail-open: oracle errors fall through, claims never block (R3).
+            from . import fee_oracle
+            oracle_url = getattr(self.config, "fee_oracle_url", None)
+            oracle_fee = (fee_oracle.fetch_fee_sat_vb(oracle_url)
+                          if oracle_url else None)
+            if oracle_fee is not None:
+                feerate_pervb = oracle_fee
+                self.logger.info(f"get_chain_fee using oracle feerate "
+                                 f"{oracle_fee} sat/vB (cln estimates empty)")
+            else:
+                feerate_pervb = self.config.fallback_fee_sat_per_vb
+                self.logger.warning(f"get_chain_fee using fallback fee rate of {feerate_pervb} sat/vbyte because result"
+                                    f" from cln rpc call was {feerates}")
         return math.ceil(feerate_pervb * size_vbyte)
 
     def get_receiving_address(self) -> str:
