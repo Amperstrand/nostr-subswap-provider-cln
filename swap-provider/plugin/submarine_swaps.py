@@ -1,11 +1,12 @@
 # annotations stay unevaluated so CLN-bound types (TYPE_CHECKING-only
 # imports below) can appear in signatures without pyln at import time
+from __future__ import annotations
+import asyncio
+
 from .jit_channel import (
     is_no_route_failure, decode_payee_node, has_channel_to,
     open_jit_channel, wait_channel_lockin,
 )
-from __future__ import annotations
-import asyncio
 import traceback
 
 import attr
