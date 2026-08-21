@@ -36,15 +36,25 @@ class TestFeatureGating:
     def test_disabled_by_default(self):
         assert not jit_enabled()
 
-    def test_env_level_1(self, monkeypatch):
-        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "1")
+    def test_env_pct_20(self, monkeypatch):
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "20")
         assert jit_enabled()
-        assert jit_liquidity_factor() == 0.20
+        assert jit_liquidity_factor() == pytest.approx(0.20)
 
-    def test_env_level_2(self, monkeypatch):
-        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "2")
+    def test_env_pct_35(self, monkeypatch):
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "35")
         assert jit_enabled()
-        assert jit_liquidity_factor() == 0.50
+        assert jit_liquidity_factor() == pytest.approx(0.35)
+
+    def test_env_pct_50(self, monkeypatch):
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "50")
+        assert jit_enabled()
+        assert jit_liquidity_factor() == pytest.approx(0.50)
+
+    def test_env_decimal_pct(self, monkeypatch):
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "12.5")
+        assert jit_enabled()
+        assert jit_liquidity_factor() == pytest.approx(0.125)
 
     def test_env_invalid_falls_to_disabled(self, monkeypatch):
         monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "yes")
@@ -54,21 +64,32 @@ class TestFeatureGating:
         monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "0")
         assert not jit_enabled()
 
+    def test_env_negative_treated_as_disabled(self, monkeypatch):
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "-5")
+        assert not jit_enabled()
+
     def test_rpc_option_checked(self):
         rpc = MagicMock()
         rpc.listconfigs.return_value = {
-            "#swapserver.jit_channel#": {"value_str": "1"}
+            "#swapserver.jit_channel#": {"value_str": "25"}
         }
         assert jit_enabled(rpc)
+        assert jit_liquidity_factor(rpc) == pytest.approx(0.25)
 
     def test_env_overrides_rpc_when_higher(self, monkeypatch):
-        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "2")
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "40")
         rpc = MagicMock()
         rpc.listconfigs.return_value = {
-            "#swapserver.jit_channel#": {"value_str": "0"}
+            "#swapserver.jit_channel#": {"value_str": "10"}
         }
         assert jit_enabled(rpc)
-        assert jit_liquidity_factor(rpc) == 0.50
+        assert jit_liquidity_factor(rpc) == pytest.approx(0.40)
+
+    def test_pct_100_means_double(self, monkeypatch):
+        """100% extra = channel twice the invoice."""
+        monkeypatch.setenv("SWAPSERVER_JIT_CHANNEL", "100")
+        size = jit_channel_size(100_000, liquidity_factor=jit_liquidity_factor())
+        assert size >= 100_000 + JIT_FEE_BUFFER_SAT + 100_000
 
 
 class TestNoRouteDetection:

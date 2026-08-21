@@ -22,11 +22,17 @@ The 10-min lockin wait is well inside even the worst case.
 
 ## Feature gating
 
-Off by default. Enable with `SWAPSERVER_JIT_CHANNEL=1` env or the
-`swapserver.jit_channel` plugin option. Three levels:
-  0 / unset = disabled (current default — no behavior change)
-  1 = enabled, conservative sizing
-  2 = enabled, generous sizing (invoice + 50% buffer)
+Off by default. Enable with `SWAPSERVER_JIT_CHANNEL=<pct>` env or the
+`swapserver.jit_channel` plugin option. The value is the extra liquidity
+percentage retained on our side after routing the payment:
+  unset / 0 = disabled (no behavior change)
+  20 = 20% extra retained (a 100k invoice opens a 120k+fee channel)
+  50 = 50% extra (more retained for future swaps to the same node)
+
+FUTURE: payer-controlled sizing — the client's swap request may carry
+`jit_channel_pct` to request more retained liquidity in exchange for
+a higher swap fee (mirroring liquidity-ads negotiation, but reactive
+and folded into the swap fee rather than a separate lease payment).
 
 ## Channel sizing (the liquidity question)
 
@@ -83,34 +89,55 @@ logger = logging.getLogger(__name__)
 # Plugin option: swapserver.jit_channel=<same values>
 
 
-def _jit_level_from_env() -> int:
+def _jit_pct_from_env() -> float:
+    """Parse SWAPSERVER_JIT_CHANNEL as a percentage (e.g. "20" = 20%).
+
+    Valid values: 0 (disabled), or any positive number interpreted as
+    the extra liquidity percentage retained on our side after routing
+    the payment. "20" means a 100k invoice opens a channel with 20k
+    extra retained. Invalid values disable.
+    """
     raw = os.environ.get("SWAPSERVER_JIT_CHANNEL", "0")
     try:
-        return int(raw)
-    except ValueError:
-        return 0
+        pct = float(raw)
+        return pct if pct >= 0 else 0.0
+    except (ValueError, TypeError):
+        return 0.0
 
 
-def _jit_level_from_option(rpc, option_name: str = "swapserver.jit_channel") -> int:
-    """Read the plugin option; falls back to 0 if not set or rpc unavailable."""
+def _jit_pct_from_option(rpc, option_name: str = "swapserver.jit_channel") -> float:
+    """Read the plugin option as a percentage. Falls back to 0."""
     try:
         result = rpc.listconfigs(config=option_name)
         config = result.get("#{}#".format(option_name), {})
         raw = config.get("value_str", config.get("value_int", "0"))
-        return int(raw) if raw is not None else 0
+        pct = float(raw)
+        return pct if pct >= 0 else 0.0
     except Exception:
-        return 0
+        return 0.0
 
 
 def jit_enabled(rpc=None) -> bool:
-    """True if JIT channel opening is enabled (env or plugin option)."""
-    return max(_jit_level_from_env(), _jit_level_from_option(rpc) if rpc else 0) > 0
+    """True if JIT channel opening is enabled (pct > 0 from env or option)."""
+    return jit_liquidity_factor(rpc) > 0
 
 
 def jit_liquidity_factor(rpc=None) -> float:
-    """0.20 for level 1 (conservative), 0.50 for level 2 (generous)."""
-    level = max(_jit_level_from_env(), _jit_level_from_option(rpc) if rpc else 0)
-    return 0.50 if level >= 2 else 0.20
+    """The liquidity retention factor as a fraction (e.g. 0.20 for 20%).
+
+    Sources (highest wins):
+      - SWAPSERVER_JIT_CHANNEL env (percentage, e.g. "20" or "35.5")
+      - swapserver.jit_channel plugin option (same format)
+      - 0 = disabled
+
+    FUTURE (payer-controlled): allow the payment request to carry a
+    hint of how much extra they'd pay for more liquidity — the swap
+    request could include `jit_channel_pct` and the provider would use
+    max(operator_setting, client_requested) when sizing the open. This
+    mirrors liquidity-ads negotiation but reactive: the client pays via
+    the swap fee, not a separate lease.
+    """
+    return max(_jit_pct_from_env(), _jit_pct_from_option(rpc) if rpc else 0.0) / 100.0
 
 
 # ── constants ────────────────────────────────────────────────────────────
