@@ -36,7 +36,7 @@ jobs:
         run: |
           mv bolts ../bolts
           mv greatspectations ../greatspectations
-          python3 -m pip install pytest
+          python3 -m pip install -r swap-provider/requirements.txt pytest
           python3 -m pytest tests/ -q
       - name: Direct drift report (file:line output for quickfix)
         if: failure()
