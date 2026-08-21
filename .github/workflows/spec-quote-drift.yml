@@ -1,0 +1,46 @@
+name: spec-quote-drift
+
+on:
+  push:
+    paths:
+      - "swap-provider/plugin/**"
+      - "tests/test_spec_quotes.py"
+      - "specquotes.toml"
+      - ".github/workflows/spec-quote-drift.yml"
+  pull_request:
+    paths:
+      - "swap-provider/plugin/**"
+      - "tests/test_spec_quotes.py"
+      - "specquotes.toml"
+      - ".github/workflows/spec-quote-drift.yml"
+
+jobs:
+  spec-quotes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: lightning/bolts
+          path: bolts
+      - uses: actions/checkout@v4
+        with:
+          repository: rustyrussell/greatspectations
+          path: greatspectations
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # specquotes.toml resolves ../bolts relative to the repo root; the
+      # clones above land as siblings via ../ from nostr-subswap-provider-cln
+      - name: Run full unit suite incl. spec-quote drift gate
+        run: |
+          mv bolts ../bolts
+          mv greatspectations ../greatspectations
+          python3 -m pip install pytest
+          python3 -m pytest tests/ -q
+      - name: Direct drift report (file:line output for quickfix)
+        if: failure()
+        run: |
+          PYTHONPATH=../greatspectations/src python3 -m greatspectations \
+            check --config specquotes.toml --comment-aside="# Impl-note:" \
+            -k swap-provider/plugin/*.py || true
