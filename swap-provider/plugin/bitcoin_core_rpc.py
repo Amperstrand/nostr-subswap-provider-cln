@@ -145,7 +145,6 @@ class BitcoinCoreRPC:
         import_request = [{
             "desc": descriptor,
             "timestamp": "now",  # Use "now" to avoid rescanning
-            "label": "swapplugin",
             "internal": False,
             "active": False  # We only want to watch the address, not make it active
         }]
