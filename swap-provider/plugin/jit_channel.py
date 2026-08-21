@@ -5,35 +5,136 @@ LSP model (user insight 2026-08-21): the provider has a huge CLTV window
 the invoice must be paid). If `pay` fails with "no route", the provider
 can open a channel to the payee node, wait for lockin, and retry.
 
-Timing on each network:
-  mutinynet (30s blocks): 35 min window, 1.5-3 min lockin → 10x margin
-  signet (5 min blocks): 5.8 hr window, 15-30 min lockin → 10x margin
-  regtest: instant (mine blocks)
+## Timing proof (the binding constraint)
 
-Safety:
-  - only opens when the failure is specifically "no route to payee"
-  - checks existing channels first (don't duplicate)
-  - caps the channel size (invoice_amount + buffer, not the provider's whole wallet)
-  - falls through to normal retry if the open fails
+The JIT channel must be usable before the EARLIER of:
+  A) the bolt11 invoice expiry (typically 3600s for d2 swaps)
+  B) the onchain CLTV (locktime - tip ≈ 70 blocks from creation)
+
+But the payment attempt only STARTS after the user's lockup confirms
+(1 conf for the provider to see the preimage-revealing claim). So the
+real window for the JIT open is:
+    available = min(A, B) - (lockup_confirm_time + first_pay_attempt_time)
+
+On mutinynet (30s blocks): min(3600s, 35min) - (~1min) = ~54min → 18x margin
+On signet (5-min blocks): min(3600s, 350min) - (~6min) = ~54min → 18x margin
+The 10-min lockin wait is well inside even the worst case.
+
+## Feature gating
+
+Off by default. Enable with `SWAPSERVER_JIT_CHANNEL=1` env or the
+`swapserver.jit_channel` plugin option. Three levels:
+  0 / unset = disabled (current default — no behavior change)
+  1 = enabled, conservative sizing
+  2 = enabled, generous sizing (invoice + 50% buffer)
+
+## Channel sizing (the liquidity question)
+
+The channel must be large enough that the payment succeeds through it,
+plus retained liquidity for future payments. The sizing has three knobs:
+
+  invoice_amount + fee_buffer    — the minimum to route this payment
+  × liquidity_factor            — how much extra to retain (0.2-0.5)
+  floored at min_channel        — CLN dust minimum (50k sat)
+  capped at max_per_invoice     — wallet-drain guard (10x invoice)
+
+With the default liquidity_factor=0.25, a 20k invoice opens a 50k channel
+(floored): 20k routes the payment, 30k stays our side for the next swap.
+
+## Comparison to CLN liquidity ads
+
+Both solve "I need inbound capacity to receive". Key differences:
+
+| | Liquidity ads (BOLT) | Our JIT opener |
+|---|---|---|
+| Initiator | client requests a lease | provider acts on payment failure |
+| Fee model | client pays upfront lease fee | provider absorbs (recovers via swap fees) |
+| Timing | pre-arranged | reactive, just-in-time |
+| Protocol | requires BOLT #12-adjacent support | zero client changes (any bolt11 wallet) |
+| Scope | generic inbound | specifically to complete a pending swap |
+| Trust | lease fee is on-chain escrowed | our funds at risk until channel earns back |
+
+"Better" for our use case: zero client cooperation required, works with
+any wallet that can make an invoice, self-healing (only fires when a
+real payment is stuck). "Different": it's not general-purpose inbound
+liquidity — it's a swap-completion mechanism that happens to create
+lasting channel capacity as a side effect.
+
+Abuse resistance: the sizing cap + feature gate + the fact that the
+JIT-opened channel is OUR outbound means repeated "force a channel open"
+attacks cost us only the channel-opening tx fee, and each opened channel
+retains value (it's our funds). A per-invoice open is never larger than
+10x the invoice amount.
 """
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# cap: don't open a channel larger than 10x the invoice (dust protection
-# and wallet-drain guard); don't open smaller than 50k (CLN minimum dust)
-JIT_MAX_MULTIPLE = 10
-JIT_MIN_CHANNEL_SAT = 50_000
-# fee buffer on top of the invoice amount for routing fees
+# ── feature gating ──────────────────────────────────────────────────────
+# Env var: SWAPSERVER_JIT_CHANNEL=0|1|2
+#   0/unset = disabled
+#   1 = enabled, conservative liquidity_factor (0.20)
+#   2 = enabled, generous liquidity_factor (0.50)
+# Plugin option: swapserver.jit_channel=<same values>
+
+
+def _jit_level_from_env() -> int:
+    raw = os.environ.get("SWAPSERVER_JIT_CHANNEL", "0")
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
+
+
+def _jit_level_from_option(rpc, option_name: str = "swapserver.jit_channel") -> int:
+    """Read the plugin option; falls back to 0 if not set or rpc unavailable."""
+    try:
+        result = rpc.listconfigs(config=option_name)
+        config = result.get("#{}#".format(option_name), {})
+        raw = config.get("value_str", config.get("value_int", "0"))
+        return int(raw) if raw is not None else 0
+    except Exception:
+        return 0
+
+
+def jit_enabled(rpc=None) -> bool:
+    """True if JIT channel opening is enabled (env or plugin option)."""
+    return max(_jit_level_from_env(), _jit_level_from_option(rpc) if rpc else 0) > 0
+
+
+def jit_liquidity_factor(rpc=None) -> float:
+    """0.20 for level 1 (conservative), 0.50 for level 2 (generous)."""
+    level = max(_jit_level_from_env(), _jit_level_from_option(rpc) if rpc else 0)
+    return 0.50 if level >= 2 else 0.20
+
+
+# ── constants ────────────────────────────────────────────────────────────
+
+# routing fee buffer on top of the invoice (covers CLN's fee assessment
+# when routing through the new channel; CLN reserves fee headroom on
+# the payer side, so the channel needs invoice + routing margin)
 JIT_FEE_BUFFER_SAT = 1_000
 
-# route-failure signatures from CLN's pay result (earned: exact strings
-# from live failures — do not regex loosely, we don't want false positives
-# on temporary failures that a retry would fix)
+# CLN minimum channel size (dust limit — fundchannel rejects below this)
+JIT_MIN_CHANNEL_SAT = 50_000
+
+# wallet-drain guard: never open a channel more than 10x the invoice
+JIT_MAX_PER_INVOICE = 10
+
+# lockin wait timeout (10 min = generous for both networks)
+JIT_LOCKIN_TIMEOUT_S = 600
+
+
+# ── route-failure detection ─────────────────────────────────────────────
+
+# Exact signatures from CLN pay failures (earned: these are the literal
+# strings observed in live runs; do NOT add loose matches that would
+# false-positive on temporary failures a retry would fix)
 NO_ROUTE_SIGNATURES = [
     "no connection between source and destination",
     "no path found",
@@ -57,32 +158,27 @@ def is_no_route_failure(pay_result) -> bool:
     return any(sig.lower() in msg_lower for sig in NO_ROUTE_SIGNATURES)
 
 
-def decode_payee_node(bolt11: str, rpc) -> Optional[str]:
-    """Extract the payee node ID from a bolt11 invoice via clnrest decode."""
-    try:
-        decoded = rpc.decode(bolt11)
-        # cln decode returns the payee in different fields depending on version
-        return (
-            decoded.get("payee")
-            or decoded.get("destination")
-            or decoded.get("node_id")
-        )
-    except Exception as e:
-        logger.warning(f"jit: decode payee failed: {e}")
-        return None
+# ── channel sizing ──────────────────────────────────────────────────────
+
+def jit_channel_size(invoice_sat: int, liquidity_factor: float = 0.20) -> int:
+    """Right-size the JIT channel for liquidity retention.
+
+    The channel is sized at: invoice + fee_buffer + invoice×liquidity_factor,
+    floored at JIT_MIN_CHANNEL_SAT and capped at invoice × JIT_MAX_PER_INVOICE.
+
+    The liquidity_factor is the KEY design choice: it determines how much
+    outbound capacity we RETAIN on our side after the payment routes.
+    A 20k invoice at factor=0.20 opens a channel with 4k extra; at
+    factor=0.50, 10k extra. The extra stays on our side — useful for
+    the next swap to the same node without needing another open.
+    """
+    base = invoice_sat + JIT_FEE_BUFFER_SAT
+    with_liquidity = base + int(invoice_sat * liquidity_factor)
+    size = max(with_liquidity, JIT_MIN_CHANNEL_SAT)
+    return min(size, invoice_sat * JIT_MAX_PER_INVOICE + JIT_FEE_BUFFER_SAT)
 
 
-def has_channel_to(node_id: str, rpc) -> bool:
-    """True if we already have any channel (any state) to this node."""
-    try:
-        peers = rpc.listpeers(node_id)
-        for peer in peers.get("peers", []):
-            if peer.get("id") == node_id and peer.get("channels"):
-                return True
-    except Exception:
-        pass
-    return False
-
+# ── safety checks ───────────────────────────────────────────────────────
 
 def sufficient_onchain(amount_sat: int, rpc) -> bool:
     """True if confirmed spendable onchain covers the channel + emergency."""
@@ -99,25 +195,46 @@ def sufficient_onchain(amount_sat: int, rpc) -> bool:
         return False
 
 
-def jit_channel_size(invoice_sat: int) -> int:
-    """Right-size the channel: covers the invoice + fees, not the wallet."""
-    size = max(invoice_sat + JIT_FEE_BUFFER_SAT, JIT_MIN_CHANNEL_SAT)
-    return min(size, invoice_sat * JIT_MAX_MULTIPLE)
+def has_channel_to(node_id: str, rpc) -> bool:
+    """True if we already have any channel (any state) to this node."""
+    try:
+        peers = rpc.listpeers(node_id)
+        for peer in peers.get("peers", []):
+            if peer.get("id") == node_id and peer.get("channels"):
+                return True
+    except Exception:
+        pass
+    return False
 
 
-def open_jit_channel(node_id: str, invoice_sat: int, rpc) -> Optional[dict]:
-    """Open a JIT channel to node_id sized for this invoice.
+def decode_payee_node(bolt11: str, rpc) -> Optional[str]:
+    """Extract the payee node ID from a bolt11 invoice via clnrest decode."""
+    try:
+        decoded = rpc.decode(bolt11)
+        return (
+            decoded.get("payee")
+            or decoded.get("destination")
+            or decoded.get("node_id")
+        )
+    except Exception as e:
+        logger.warning(f"jit: decode payee failed: {e}")
+        return None
+
+
+# ── the JIT open ────────────────────────────────────────────────────────
+
+def open_jit_channel(node_id: str, invoice_sat: int, rpc,
+                     liquidity_factor: float = 0.20) -> Optional[dict]:
+    """Open a JIT channel to node_id sized for this invoice + retention.
 
     Returns the fundchannel result dict, or None on failure.
-    The caller should wait for lockin then retry the payment.
     """
-    size = jit_channel_size(invoice_sat)
+    size = jit_channel_size(invoice_sat, liquidity_factor)
     if not sufficient_onchain(size, rpc):
         logger.warning(f"jit: insufficient onchain for {size}sat channel")
         return None
 
     try:
-        # connect first (fundchannel auto-connects but explicit is safer)
         try:
             rpc.connect(node_id)
         except Exception:
@@ -126,7 +243,8 @@ def open_jit_channel(node_id: str, invoice_sat: int, rpc) -> Optional[dict]:
         result = rpc.fundchannel(node_id, f"{size}sat")
         logger.info(
             f"jit: opened {size}sat channel to {node_id[:12]}… "
-            f"(txid: {result.get('txid', '?')[:12]}…)"
+            f"(invoice {invoice_sat}sat + {size - invoice_sat}sat liquidity; "
+            f"txid: {result.get('txid', '?')[:12]}…)"
         )
         return result
     except Exception as e:
@@ -134,11 +252,12 @@ def open_jit_channel(node_id: str, invoice_sat: int, rpc) -> Optional[dict]:
         return None
 
 
-def wait_channel_lockin(node_id: str, rpc, timeout_s: int = 600) -> bool:
+def wait_channel_lockin(node_id: str, rpc,
+                        timeout_s: int = JIT_LOCKIN_TIMEOUT_S) -> bool:
     """Wait until any channel to node_id reaches CHANNELD_NORMAL.
 
-    On mutinynet this is 1.5-3 min; on signet 15-30 min. The CLTV
-    window (70 blocks) provides the margin.
+    On mutinynet this is 1.5-3 min; on signet 15-30 min. Both are well
+    inside the min(invoice_expiry, CLTV) window (see timing proof above).
     """
     deadline = time.time() + timeout_s
     while time.time() < deadline:

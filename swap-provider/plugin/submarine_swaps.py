@@ -5,7 +5,7 @@ import asyncio
 
 from .jit_channel import (
     is_no_route_failure, decode_payee_node, has_channel_to,
-    open_jit_channel, wait_channel_lockin,
+    open_jit_channel, wait_channel_lockin, jit_enabled, jit_liquidity_factor,
 )
 import traceback
 
@@ -327,16 +327,19 @@ class SwapManager:
             # 'no route to payee', open a channel to the payee and retry
             # through it — the CLTV window (70 blocks) provides plenty of
             # time. Falls through to normal retry if the JIT open fails.
-            if is_no_route_failure(log):
+            if is_no_route_failure(log) and jit_enabled(self.lnworker._rpc):
                 payee = decode_payee_node(
                     invoice.lightning_invoice, self.lnworker._rpc)
                 if payee and not has_channel_to(payee, self.lnworker._rpc):
                     amt_sat = int(getattr(invoice, 'amount_msat', 0)) // 1000 or 20_000
+                    factor = jit_liquidity_factor(self.lnworker._rpc)
                     self.logger.info(
                         f'jit: no route to {payee[:12]}… — opening '
-                        f'channel (invoice ~{amt_sat}sat)')
+                        f'channel (invoice ~{amt_sat}sat, liquidity '
+                        f'{factor:.0%})')
                     opened = open_jit_channel(
-                        payee, amt_sat, self.lnworker._rpc)
+                        payee, amt_sat, self.lnworker._rpc,
+                        liquidity_factor=factor)
                     if opened and wait_channel_lockin(
                             payee, self.lnworker._rpc):
                         self.invoices_to_pay[key] = now() + 5
