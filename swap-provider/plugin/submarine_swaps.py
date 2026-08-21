@@ -1,5 +1,9 @@
 # annotations stay unevaluated so CLN-bound types (TYPE_CHECKING-only
 # imports below) can appear in signatures without pyln at import time
+from .jit_channel import (
+    is_no_route_failure, decode_payee_node, has_channel_to,
+    open_jit_channel, wait_channel_lockin,
+)
 from __future__ import annotations
 import asyncio
 import traceback
@@ -318,6 +322,26 @@ class SwapManager:
                 self._fail_swap(self.swaps.get(key, None), f'reverse swap invoice expired, '
                                                            f'not trying to pay it again: {log}')
                 return
+            # JIT channel (LSP model): when the failure is specifically
+            # 'no route to payee', open a channel to the payee and retry
+            # through it — the CLTV window (70 blocks) provides plenty of
+            # time. Falls through to normal retry if the JIT open fails.
+            if is_no_route_failure(log):
+                payee = decode_payee_node(
+                    invoice.lightning_invoice, self.lnworker._rpc)
+                if payee and not has_channel_to(payee, self.lnworker._rpc):
+                    amt_sat = int(getattr(invoice, 'amount_msat', 0)) // 1000 or 20_000
+                    self.logger.info(
+                        f'jit: no route to {payee[:12]}… — opening '
+                        f'channel (invoice ~{amt_sat}sat)')
+                    opened = open_jit_channel(
+                        payee, amt_sat, self.lnworker._rpc)
+                    if opened and wait_channel_lockin(
+                            payee, self.lnworker._rpc):
+                        self.invoices_to_pay[key] = now() + 5
+                        self.logger.info(
+                            f'jit: retrying {key[:8]}… via new channel')
+                        return
             self.logger.warning(f'failed to pay pending invoice {key}: {log}, will retry in 1 minute')
             self.invoices_to_pay[key] = now() + 60
         else:
