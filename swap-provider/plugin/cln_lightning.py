@@ -4,7 +4,7 @@ import time
 import traceback
 from datetime import datetime
 from typing import NamedTuple, Optional, Callable, Dict, Tuple, Any, List, Union
-from enum import IntEnum
+from enum import IntEnum, Enum
 import threading
 from decimal import Decimal
 
@@ -39,6 +39,12 @@ SENT = Direction.SENT
 RECEIVED = Direction.RECEIVED
 
 
+class PrepayGate(Enum):
+    PROCEED = 1  # no prepay attached (single-set), or prepay FUNDED/SETTLED
+    WAIT = 2     # main missing, or prepay attached but not yet fully funded
+    ABORT = 3    # prepay attached but deleted (expired unfunded) — issue #3
+
+
 class CLNLightning:
     INBOUND_LIQUIDITY_FACTOR = 0.9  # Buffer factor for inbound liquidity calculation (use only 90% of inbound capacity)
 
@@ -63,6 +69,9 @@ class CLNLightning:
         # "continue" (which parks payer funds until CLTV). Init here so the
         # hook is tombstone-safe before run() completes.
         self._tombstones = db.get_dict('hold_tombstones')
+        # Issue #3: prepay-hash -> main-hash reverse index, so the expiry
+        # sweeper can tear a bundled main down when its prepay dies unpaid.
+        self._bundle_main_of = db.get_dict('bundle_main_of')
         self._decoded_invoices = {}  # bolt11 -> decoded dict (see handle_htlc)
         self._payment_secret_key = plugin_instance.derive_secret("payment_secret")
         self.monitoring_tasks = [] # type: List[asyncio.Task]
@@ -119,9 +128,16 @@ class CLNLightning:
 
         # cancel all htlcs and delete invoice if it's expired
         if (invoice.created_at + invoice.expiry < time.time()
-            and invoice.funding_status not in [InvoiceState.FUNDED, InvoiceState.SETTLED]):
+                and invoice.funding_status not in [InvoiceState.FUNDED, InvoiceState.SETTLED]):
             self._logger.warning(f"check_invoice_expiry: cancelling expired invoice {invoice.payment_hash.hex()}")
             invoice.cancel_all_htlcs()  # also cancel the prepay invoice!
+
+            # Issue #3: if THIS expired hold is a bundled prepay, tear its
+            # main down too — a funded main must never proceed without the
+            # prepay (the callback used to fall through on prepay-is-None
+            # and fund the onchain leg having received only main-minus-prepay).
+            # (captured before delete: delete_hold_invoice also cleans the index)
+            main_hash = self._bundle_main_of.get(invoice.payment_hash.hex())
 
             if invoice.associated_invoice is not None:
                 self._logger.debug(f"deleting associated invoice: {invoice.associated_invoice}")
@@ -134,8 +150,35 @@ class CLNLightning:
                     self.delete_hold_invoice(prepay_invoice.payment_hash)
 
             self.delete_hold_invoice(invoice.payment_hash)
+            if main_hash is not None:
+                main = self._hold_invoices.get(main_hash)
+                if main is not None:
+                    main.cancel_all_htlcs()
+                    self.unregister_hold_invoice_callback(main.payment_hash)
+                    self.delete_hold_invoice(main.payment_hash)
+                    self._logger.warning(
+                        f'check_invoice_expiry: prepay expired unfunded — cancelled '
+                        f'bundled main invoice {main_hash} (payer HTLCs returned)')
             return True
         return False
+
+    def _bundle_prepay_state(self, invoice: Optional[HoldInvoice],
+                             prepay_invoice: Optional[HoldInvoice]) -> PrepayGate:
+        """Gate for firing a bundled main's funding callback (issue #3).
+
+        The old code treated prepay-is-None as 'settled-then-deleted' and
+        fired anyway — but no code path deletes a settled prepay before the
+        main callback; the real producer of None was the expiry sweeper, so
+        swaps proceeded WITHOUT the prepay (R4/F8 broken, fee leak)."""
+        if invoice is None:
+            return PrepayGate.WAIT
+        if invoice.get_prepay_invoice() is None:
+            return PrepayGate.PROCEED  # not a bundled invoice
+        if prepay_invoice is None:
+            return PrepayGate.ABORT  # prepay vanished unfunded — never fund
+        if prepay_invoice.funding_status in (InvoiceState.FUNDED, InvoiceState.SETTLED):
+            return PrepayGate.PROCEED
+        return PrepayGate.WAIT
 
     def callback_handler(self):
         """Iterate through the hold invoices and call the callback if the invoice is fully funded"""
@@ -157,23 +200,30 @@ class CLNLightning:
                             continue
                         if invoice.funding_status is InvoiceState.FUNDED:
                             prepay_invoice_hash = invoice.get_prepay_invoice()
-                            if prepay_invoice_hash is not None:  # check if there is a prepay invoice attached
-                                prepay_invoice = self.get_hold_invoice(prepay_invoice_hash)
-                                # settled-then-deleted prepay returns None here
-                                # (the sweeper removes hold invoices on
-                                # settle) — treat as already redeemed, else
-                                # AttributeError spins the callback loop
-                                # forever and the main invoice never fires
-                                # (earned live: d1 swaps hung in
-                                # 'swap.created' for 30+ min)
-                                if prepay_invoice is not None and prepay_invoice.funding_status is InvoiceState.FUNDED:
-                                    # redeem the prepay invoice first
-                                    prepay_invoice.settle(self.get_preimage(prepay_invoice_hash))
-                                    self.update_invoice(prepay_invoice)
-                                    self._logger.debug(f"callback_handler: prepay invoice "
-                                                        f"{prepay_invoice.payment_hash.hex()} redeemed")
-                                elif prepay_invoice is not None:
-                                    continue  # prepay invoice not yet funded, so we wait for it to be funded
+                            prepay_invoice = self.get_hold_invoice(prepay_invoice_hash) \
+                                if prepay_invoice_hash is not None else None
+                            gate = self._bundle_prepay_state(invoice, prepay_invoice)
+                            if gate is PrepayGate.WAIT:
+                                continue
+                            if gate is PrepayGate.ABORT:
+                                # Issue #3: the sweeper should have torn this
+                                # main down with its expired prepay; if we
+                                # still see it, fail safe NOW — cancel the
+                                # payer's HTLCs, never fund on a broken bundle.
+                                self._logger.error(
+                                    f"callback_handler: bundled prepay "
+                                    f"{prepay_invoice_hash.hex()} of {invoice.payment_hash.hex()} "
+                                    f"vanished unfunded — cancelling main (issue #3)")
+                                invoice.cancel_all_htlcs()
+                                self.unregister_hold_invoice_callback(invoice.payment_hash)
+                                self.delete_hold_invoice(invoice.payment_hash)
+                                continue
+                            if prepay_invoice is not None:
+                                # redeem the prepay invoice first
+                                prepay_invoice.settle(self.get_preimage(prepay_invoice_hash))
+                                self.update_invoice(prepay_invoice)
+                                self._logger.debug(f"callback_handler: prepay invoice "
+                                                   f"{prepay_invoice.payment_hash.hex()} redeemed")
                             self._logger.debug(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
                                                 f"calling callback")
 
@@ -411,6 +461,8 @@ class CLNLightning:
         # issue #25: tombstone the hash so replayed/late HTLCs for this
         # deleted hold fail instead of parking (persisted via db dict)
         self._tombstones[payment_hash] = True
+        # Issue #3: if this was a bundled prepay, drop the reverse index
+        self._bundle_main_of.pop(payment_hash, None)
         if write_db:
             self._db.write()
 
@@ -524,6 +576,10 @@ class CLNLightning:
         # remove the old invoice so changes are tracked by the JsonDB StoredDict
         self._hold_invoices.pop(swap_invoice.payment_hash.hex())
         current_invoice.attach_prepay_invoice(prepay_invoice.payment_hash)
+        # Issue #3: remember which main this prepay belongs to (persisted),
+        # so expiring the prepay can cancel the main instead of letting the
+        # callback fire without the prepay (R4/F8 coupling).
+        self._bundle_main_of[prepay_invoice.payment_hash.hex()] = swap_invoice.payment_hash.hex()
         # then store the updated invoice with the prepay invoice attached
         self.save_hold_invoice(current_invoice)
 

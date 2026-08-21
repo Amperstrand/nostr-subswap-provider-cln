@@ -379,12 +379,11 @@ class SwapManager:
                 if swap.preimage is None and spent_height is not None:
                     # extract the preimage, add it to lnwatcher
                     claim_tx = await self.lnwatcher.get_transaction(txin.spent_txid)
-                    for txin in claim_tx.inputs():
-                        preimage = txin.witness_elements()[1]
-                        if sha256(preimage) == swap.payment_hash:
-                            self.logger.debug(f"claim swap extracted preimage: {preimage.hex()} for {swap.lockup_address}")
-                            swap.preimage = preimage.hex()
-                            return self._finish_normal_swap(swap)
+                    preimage = self.extract_preimage(swap, claim_tx)
+                    if preimage is not None:
+                        self.logger.debug(f"claim swap extracted preimage: {preimage.hex()} for {swap.lockup_address}")
+                        swap.preimage = preimage.hex()
+                        return self._finish_normal_swap(swap)
                     else:
                         # this is our refund tx
                         if spent_height >= 2:
@@ -472,6 +471,23 @@ class SwapManager:
     def add_lnwatcher_callback(self, swap: SwapData) -> None:
         callback = lambda: self._claim_swap(swap)
         self.lnwatcher.add_callback(swap.lockup_address, callback)
+
+    @classmethod
+    def extract_preimage(cls, swap: SwapData, claim_tx) -> Optional[bytes]:
+        # Issue #2 (audit D-1, electrum parity): the client's claim tx can
+        # contain legacy (non-witness) or unsigned inputs — indexing
+        # witness_elements()[1] unconditionally raised IndexError, wedging
+        # _claim_swap so the preimage was never registered and our parked
+        # hold HTLCs failed at CLTV while the client kept the onchain claim.
+        for claim_txin in claim_tx.inputs():
+            witness = claim_txin.witness_elements()
+            if not witness or len(witness) < 2:
+                # tx may be unsigned, or a legacy input
+                continue
+            preimage = witness[1]
+            if sha256(preimage) == swap.payment_hash:
+                return preimage
+        return None
 
     def hold_invoice_callback(self, payment_hash: bytes) -> None:
         # AUDIT A5: a provider must never park a payer's funds. Unknown
