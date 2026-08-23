@@ -636,7 +636,7 @@ class SwapManager:
         )
         return tx
 
-    @log_exceptions
+    # @log_exceptions only accepts coroutine targets; this method is sync
     def broadcast_funding_tx(self, swap: SwapData, tx: PartialTransaction) -> None:
         swap.funding_txid = tx.txid()
         self.wallet.broadcast_transaction(tx)
