@@ -259,6 +259,7 @@ class SwapManager:
             if swap.prepay_hash is not None:
                 self.prepayments[swap.prepay_hash] = bytes.fromhex(k)
         self.assert_constants()
+        self._load_integrity_scan()
         self.is_server = True  # this plugin is always a server
         self.use_nostr = True  # this plugin only uses nostr comm
         self.is_initialized = asyncio.Event()  # set once nostr is connected to relays
@@ -323,6 +324,42 @@ class SwapManager:
             f"processed")
         self.db.write()
 
+    def _load_integrity_scan(self) -> None:
+        """Issues #18/#22 (audit R3/F21): cheap consistency scan at db
+        load — every swap carries lockup_address + locktime (WARN only),
+        payment entries (invoices / lightning_preimages) reference known
+        payment hashes (orphans WARN — never deleted), counts logged at
+        INFO. The snapshot feeds swapprovider-health's last_load_integrity."""
+        swap_keys = set(self.swaps.keys())
+        structural_warns = []
+        for key, swap in self.swaps.items():
+            missing = [f for f in ('lockup_address', 'locktime')
+                       if not getattr(swap, f, None)]
+            if missing:
+                structural_warns.append(f"swap {key[:12]}… missing "
+                                        f"{','.join(missing)}")
+        orphans = []
+        for section in ('_invoices', '_preimages'):
+            entries = getattr(self.lnworker, section, None) or {}
+            orphans += [f"{k[:12]}… ({section})" for k in entries
+                        if k not in swap_keys]
+        for w in structural_warns:
+            self.logger.warning(f"load-integrity: {w}")
+        for o in orphans:
+            self.logger.warning(f"load-integrity: orphan payment entry {o} "
+                                f"(no matching swap record — kept, not deleted)")
+        self.load_integrity = {
+            'swaps': len(self.swaps),
+            'quarantined': len(self.quarantined_swaps),
+            'orphans': len(orphans),
+            'missing_lockup_or_locktime': len(structural_warns),
+        }
+        self.logger.info(f"datastore loaded: {self.load_integrity['swaps']} "
+                         f"swaps, {self.load_integrity['quarantined']} "
+                         f"quarantined, {self.load_integrity['orphans']} "
+                         f"orphan payments")
+
+    @log_exceptions
     async def run_nostr_server(self):
         while True:
             try:

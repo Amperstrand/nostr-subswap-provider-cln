@@ -288,6 +288,10 @@ def build_report(provider) -> dict:
         "nostr_mode": nostr_mode,
         "sweep_grace_blocks": getattr(config, "sweep_grace_blocks", None),
         "grace_held_swaps": _grace_held_count(sm) if sm is not None else None,
+        "quarantined_swaps": len(getattr(sm, "quarantined_swaps", None) or {})
+        if sm is not None else None,
+        "last_load_integrity": getattr(sm, "load_integrity", None)
+        if sm is not None else None,
         "inflight_payments": _inflight_payment_count(sm) if sm is not None else None,
         "expiring_soon_invoices": _expiring_soon_count(lnworker) if lnworker is not None else None,
         "datastore": datastore,
