@@ -1244,6 +1244,14 @@ class NostrTransport:  # (Logger):
                 content = json.loads(content)
             except Exception:
                 continue
+            # PORT FIND #13 escapee (live 2026-08-23 09:02): a payload that
+            # decrypts to a NON-DICT (a JSON list — malformed/malicious
+            # replay DMs) reached content['event_id'] below and raised
+            # TypeError('list indices must be integers or slices, not str')
+            # OUTSIDE any guard — killing the whole nostr taskgroup and
+            # leaving the plugin DM-deaf until restart. Skip junk shapes.
+            if not isinstance(content, dict):
+                continue
             if event.id in seen_event_ids:
                 continue
             seen_event_ids.add(event.id)
