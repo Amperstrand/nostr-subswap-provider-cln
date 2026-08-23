@@ -91,3 +91,46 @@ def test_lookup_mode_routing():
     assert m._chain_lookup_mode == "txindex" and m._esplora_urls == []
     m.set_lookup_mode("esplora", ["http://shim:8788/"])
     assert m._esplora_urls == ["http://shim:8788"]  # trailing slash stripped
+
+
+def test_create_transaction_retries_when_excess_below_dust(monkeypatch):
+    # live-earned 2026-08-23 (mutinynet GUI e2e): CLN's minimal coin
+    # selection returns excess_msat=0 despite a +1000 ask slack — excess
+    # depends on UTXO granularity, not the ask. A zero-value change
+    # output kills the funding tx ("tx needs to have at least 1 output").
+    # create_transaction must escalate the ask until excess >= dust.
+    calls = []
+
+    class FakeRPC:
+        def fundpsbt(self, **kw):
+            calls.append(kw["satoshi"])
+            # first two attempts: excess below dust; third: healthy
+            excess = 0 if len(calls) < 3 else 700_000
+            return {"psbt": "cHNidP8BAgQCAAAAAQ==", "excess_msat": excess}
+        def signpsbt(self, psbt):
+            return {"signed_psbt": psbt}
+
+    class FakePartial:
+        def __init__(self): self.outputs = []
+        @classmethod
+        def from_raw_psbt(cls, raw): return cls()
+        def add_outputs(self, outs): self.outputs += list(outs)
+        def set_rbf(self, b): pass
+        def _serialize_as_base64(self): return "cHNidP8BAgQCAAAAAQ=="
+        def finalize_psbt(self): pass
+
+    import plugin.cln_chain as cc
+    monkeypatch.setattr(cc, "PartialTransaction", FakePartial, raising=False)
+    holder = cc.CLNChainWallet
+    inst = object.__new__(holder)
+    inst.rpc = FakeRPC()
+    inst.logger = type("L", (), {"error": staticmethod(lambda *a, **k: None),
+                                 "info": staticmethod(lambda *a, **k: None)})()
+    class Cfg: cln_feerate_str = "urgent"
+    inst.config = Cfg()
+
+    out = type("O", (), {"value": 18995, "scriptpubkey": b"\x00" * 34})()
+    tx = inst.create_transaction(outputs_without_change=[out], rbf=True)
+    assert tx is not None, "should succeed after escalation"
+    assert len(calls) == 3, f"expected 3 escalating asks (0,0,700sat), got {len(calls)}"
+    assert calls[1] > calls[0] and calls[2] > calls[1], "asks must escalate"

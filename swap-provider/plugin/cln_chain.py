@@ -27,26 +27,41 @@ class CLNChainWallet:
         # inputs so excess lands at dust and DROPS the change output ->
         # 'tx needs to have at least 1 output' on a HEALTHY wallet
         # (earned: 277k free, excess_msat=0, every d1 funding failed)
-        try:
-            fundpsbt_response = self.rpc.fundpsbt(satoshi=output_sum_sat + 1000,
-                                                            feerate=self.config.cln_feerate_str,
-                                                            startweight=startweight,
-                                                            minconf=None,
-                                                            # reserve: DEFAULT (dropped param) — signpsbt REFUSES
-                                                            # unreserved inputs ('UTXO ... is not reserved', the
-                                                            # live d1 failure). reserve=0 was my mistake: it made
-                                                            # fundpsbt succeed but signpsbt reject. The default
-                                                            # reserves until spent; we sign+broadcast in this same
-                                                            # call so the reservation lives ~milliseconds. The
-                                                            # earlier starvation was the dust-excess selection
-                                                            # (fixed by the +1000 slack), not the reservation.
-                                                            excess_as_change=True)
-            raw_inputs_only_psbt = fundpsbt_response['psbt']
-        except Exception as e:
-            # PluginLogger.error takes ONE arg (printf-style args crash it
-            # — earned: the crash message replaced the real fundpsbt error)
-            self.logger.error(f"create_transaction failed to call fundpsbt rpc: {e}")
-            return None
+        # CHANGE-SLACK ESCALATION: CLN's minimal coin selection returns
+        # excess_msat as low as 0 REGARDLESS of the ask (excess depends on
+        # UTXO granularity, not the satoshi parameter) — a 0-value change
+        # output then kills the funding tx downstream ("tx needs to have
+        # at least 1 output", earned live 2026-08-23: wire proof passed
+        # at 06:47 by granularity luck, three GUI swaps failed at 07:43+).
+        # Escalate the ask until excess clears dust; each re-ask asks CLN
+        # to select for a larger target so excess grows with granularity.
+        DUST_SAT = 546
+        fundpsbt_response = None
+        for attempt in range(4):
+            ask_sat = output_sum_sat + 1000 + attempt * 2500
+            try:
+                resp = self.rpc.fundpsbt(satoshi=ask_sat,
+                                                feerate=self.config.cln_feerate_str,
+                                                startweight=startweight,
+                                                minconf=None,
+                                                # reserve: DEFAULT — signpsbt REFUSES
+                                                # unreserved inputs; we sign+broadcast
+                                                # in this same call, reservation lives
+                                                # ~milliseconds.
+                                                excess_as_change=True)
+            except Exception as e:
+                # PluginLogger.error takes ONE arg (printf-style args crash
+                # it — earned: the crash message replaced the real error)
+                self.logger.error(f"create_transaction failed to call fundpsbt rpc: {e}")
+                return None
+            excess_sat = int(resp.get("excess_msat", 0)) // 1000
+            if excess_sat >= DUST_SAT or attempt == 3:
+                fundpsbt_response = resp
+                break
+            self.logger.info(f"fundpsbt excess {excess_sat} sat < dust "
+                             f"({DUST_SAT}) — escalating ask ({ask_sat} -> "
+                             f"{ask_sat + 2500})")
+        raw_inputs_only_psbt = fundpsbt_response['psbt']
 
         # add outputs to inputs_only_psbt
         complete_psbt = PartialTransaction().from_raw_psbt(raw_inputs_only_psbt)
