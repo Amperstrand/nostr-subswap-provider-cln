@@ -103,6 +103,26 @@ class CLNStorage:  # (Logger):
         self.last_generation = res.get("generation", self.last_generation)
         self.last_write_monotonic = time.monotonic()
 
+    def write_quarantine(self, fragment: str, label: str = "jsondb") -> str:
+        """#19/#18 (audit R3): persist a damaged-but-forensic fragment
+        (discarded jsondb tail) NEXT TO the datastore itself, as a
+        sibling child key swap-provider/<label>-discarded-<ts>.frag.
+        Milliseconds in the name keep multi-amputation recursion from
+        colliding; failures raise (the caller stays loud but recovers)."""
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) \
+            + f"-{int(time.time() * 1000) % 1000:03d}"
+        key = ["swap-provider", f"{label}-discarded-{ts}.frag"]
+        try:
+            self.dbwriter(key=key, string=fragment, mode="create-or-replace")
+        except Exception as e:
+            raise StorageReadWriteError(f"Failed to write quarantine fragment: {e}")
+        name = "/".join(key)
+        # the fragment may itself contain key material (issue #13) —
+        # log the location + size only, never the content
+        self.logger.debug(f"quarantine fragment stored at datastore key "
+                          f"{name} ({len(fragment)} chars)")
+        return name
+
     def _test_db(self):
         """Test if we can read and write to the cln datastore."""
         try:
