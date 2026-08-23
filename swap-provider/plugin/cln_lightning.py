@@ -287,6 +287,17 @@ class CLNLightning:
     def get_invoice(self, key: str) -> Optional[Invoice]:
         return self._invoices.get(key)
 
+    def get_payment_statuses(self, payment_hash_hex: str) -> List[str]:
+        """Statuses of the CLN payment attempts for a payment hash.
+        Returns an empty list if no payment was ever attempted (note that
+        listpays returns {'pays': [...]}, there is no top-level 'status')."""
+        try:
+            pays = self._rpc.listpays(payment_hash=payment_hash_hex).get('pays', [])
+        except Exception as e:
+            self._logger.error(f"get_payment_statuses: listpays rpc failed: {e}")
+            return []
+        return [p.get('status') for p in pays]
+
     def get_hold_invoice(self, payment_hash: Union[str, bytes]) -> Optional[HoldInvoice]:
         if isinstance(payment_hash, bytes):
             payment_hash = payment_hash.hex()
