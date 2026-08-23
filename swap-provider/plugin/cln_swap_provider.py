@@ -8,6 +8,7 @@ from .cln_lightning import CLNLightning
 from .plugin_config import PluginConfig
 from .chain_monitor import ChainMonitor
 from .cln_storage import CLNStorage
+from .health import build_report
 from .json_db import JsonDB
 from .submarine_swaps import SwapManager
 
@@ -34,8 +35,12 @@ class CLNSwapProvider:
         self.swap_manager = swap_manager
 
     async def initialize(self):
-        # cln plugin handler
-        self.plugin_handler = await CLNPlugin()
+        # cln plugin handler — swapprovider-health is registered up front:
+        # the method must be in pyln's dispatch table before plugin.run()
+        # answers lightningd's getmanifest. The handler answers honestly
+        # at every stage (parts missing during init report as "starting")
+        self.plugin_handler = await CLNPlugin(
+            rpc_methods=[("swapprovider-health", self._swapprovider_health_rpc)])
 
         # logging to cln logs
         self.logger = PluginLogger("swap-provider", self.plugin_handler.plugin.log)
@@ -78,23 +83,16 @@ class CLNSwapProvider:
                                         plugin_config=self.config,
                                         logger=self.logger)
 
+    def _swapprovider_health_rpc(self, plugin=None, **kwargs) -> dict:
+        """`lightning-cli swapprovider-health`: read-only liveness
+        snapshot (audit R2) — no side effects, safe to poll every 30s.
+        Executed on the pyln dispatch thread; build_report touches only
+        in-memory state under the tracker lock."""
+        return build_report(self)
+
     async def run(self):
         if not self.is_initialized:
             await self.initialize()
         # await asyncio.sleep(100000000)
         await self.swap_manager.main_loop()
         raise Exception("CLNSwapProvider main loop exited unexpectedly")
-
-    @property
-    def is_initialized(self) -> bool:
-        if (self.plugin_handler
-            and self.logger
-            and self.config
-            and self.json_db
-            and self.cln_chain_wallet
-            and self.cln_lightning
-            and self.swap_manager
-            and self.chain_monitor):
-            return True
-        return False
-
