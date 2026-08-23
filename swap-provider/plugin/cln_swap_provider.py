@@ -8,9 +8,16 @@ from .cln_lightning import CLNLightning
 from .plugin_config import PluginConfig
 from .chain_monitor import ChainMonitor
 from .cln_storage import CLNStorage
-from .health import build_report
+from .health import build_report, tracker
 from .json_db import JsonDB
 from .submarine_swaps import SwapManager
+from .utils import supervise, fatal_exit
+
+# cadence of the pyln pipe late-death watchdog (#23): the dispatch
+# thread is probed on a 30s sleep loop — the same cadence monitoring
+# polls swapprovider-health, so a dead pipe is caught within one
+# monitoring period
+PYLN_WATCHDOG_INTERVAL_SEC = 30
 
 
 class CLNSwapProvider:
@@ -90,9 +97,47 @@ class CLNSwapProvider:
         in-memory state under the tracker lock."""
         return build_report(self)
 
+    async def _pyln_pipe_watchdog(self):
+        """#23 pyln pipe late-death detection: if the dispatch thread
+        dies (pipe closed / dispatcher crash) the asyncio side keeps
+        serving hold-invoice state in blissful silence — probe
+        thread_alive() every 30s and route to the r4 fatal policy.
+        lightningd's own shutdown SIGTERMs us first, so reaching the
+        fatal branch means the pipe died WITHOUT a signal."""
+        while True:
+            await asyncio.sleep(PYLN_WATCHDOG_INTERVAL_SEC)
+            tracker.beat("pyln-plugin-thread")
+            if not self.plugin_handler.thread_alive():
+                fatal_exit(
+                    "pyln plugin dispatch thread died — the RPC pipe is "
+                    "gone while the process lives (late-death mode); "
+                    "refusing the half-alive mode",
+                    logger=self.logger)
+
     async def run(self):
         if not self.is_initialized:
             await self.initialize()
+        # issue #17 supervision shape: an escaped watchdog death is
+        # FATAL — silent loss of the late-death probe is itself the
+        # half-alive mode it exists to catch
+        supervise(asyncio.create_task(self._pyln_pipe_watchdog()),
+                  logger=self.logger, name="pyln-pipe-watchdog",
+                  on_death=lambda exc: fatal_exit(
+                      f"pyln pipe watchdog died: {exc!r}",
+                      logger=self.logger))
         # await asyncio.sleep(100000000)
         await self.swap_manager.main_loop()
         raise Exception("CLNSwapProvider main loop exited unexpectedly")
+
+    @property
+    def is_initialized(self) -> bool:
+        if (self.plugin_handler
+            and self.logger
+            and self.config
+            and self.json_db
+            and self.cln_chain_wallet
+            and self.cln_lightning
+            and self.swap_manager
+            and self.chain_monitor):
+            return True
+        return False

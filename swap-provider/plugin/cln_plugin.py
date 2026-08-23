@@ -23,6 +23,14 @@ class CLNPlugin:
         # Create but don't start the thread yet
         self.__task = None
 
+    def thread_alive(self) -> bool:
+        """True while the pyln plugin.run dispatch thread is still
+        running — the pipe-late-death probe for the #17/#23 watchdog.
+        A done task after startup means lightningd closed the pipe (or
+        the dispatcher crashed) while the asyncio side keeps serving
+        hooks — exactly the half-alive mode the audit flagged."""
+        return self.__task is not None and not self.__task.done()
+
 
     def __await__(self):
         async def __run():
