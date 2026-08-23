@@ -158,6 +158,11 @@ class SwapData(StoredObject):
     funding_txid = attr.ib(type=Optional[str])
     spending_txid = attr.ib(type=Optional[str])
     is_redeemed = attr.ib(type=bool)
+    # issue #15: a d2 lockup may only be claimed after the client's
+    # addswapinvoice REGISTRATION — an abandoned swap (funded, never
+    # registered) must stay refundable to the client's key at CLTV.
+    # Persisted with the swap, so the gate survives restarts.
+    registered = attr.ib(type=bool, default=False)
 
     _funding_prevout = None  # type: Optional[TxOutpoint]  # for RBF
     _payment_hash = None
@@ -494,6 +499,17 @@ class SwapManager:
                     return
 
             else:
+                if not getattr(swap, 'registered', False):
+                    # issue #15 gate: claiming an unregistered lockup
+                    # harvests the client's funds (no invoice exists, so
+                    # no LN payment can ever balance it). Leave it
+                    # refundable to the client's key at CLTV.
+                    if funding_height.conf > 0:
+                        self.logger.info(
+                            f'claim gated: lockup funded but invoice never '
+                            f'registered {swap.lockup_address} (abandoned swap) '
+                            f'— staying refundable (issue #15)')
+                    return
                 if swap.preimage is None:
                     swap.preimage = self.lnworker.get_preimage(swap.payment_hash)
                 if swap.preimage is None:
@@ -833,6 +849,7 @@ class SwapManager:
             raise RequestFieldError('refundPublicKey does not match phase-1')
         if key in self.invoices_to_pay:
             raise RequestFieldError('invoice already bound')
+        swap.registered = True
         self.lnworker.save_invoice(invoice)
         self.invoices_to_pay[key] = 0
         return {}
@@ -1197,7 +1214,10 @@ class NostrTransport:  # (Logger):
             pow_nonce=self.config.ann_pow_nonce,
             # percent units, matching percentage_fee semantics; 0 hides
             # the key entirely (non-JIT providers keep identical offers)
-            jit_channel_pct=jit_liquidity_factor(self.sm.lnworker._rpc) * 100)
+            jit_channel_pct=jit_liquidity_factor(self.sm.lnworker._rpc) * 100,
+            # self-ID baked at image build (git describe); stock electrum
+            # and third parties do not send this key
+            server_version=os.environ.get('SWAP_PROVIDER_VERSION', 'cln-subswap/dev'))
         tags = build_offer_tags(net_name=self.config.net_name)
         event_id = await aionostr._add_event(
             self.relay_manager,

@@ -56,7 +56,8 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
                         min_amount_sat: int, max_forward_sat: int,
                         max_reverse_sat: int, relays_csv: str,
                         pow_nonce: int,
-                        jit_channel_pct: float = 0.0) -> str:
+                        jit_channel_pct: float = 0.0,
+                        server_version: str = '') -> str:
     """Content JSON exactly as electrum 4.8.1 publishes it (percentage_fee
     is kept as float for <=4.7.1 client compat — same reasoning upstream).
     pow_nonce is hex-encoded, matching electrum's hex(sm.config.…).
@@ -66,7 +67,12 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
     so non-JIT providers keep byte-identical offers. Safe on the wire:
     electrum's announcement parser reads only its known keys and
     ignores extras (verified in 4.8.1 source, submarine_swaps.py
-    _offers parsing)."""
+    _offers parsing).
+
+    server_version: self-identification for OUR deployments (e.g.
+    'cln-subswap/v0.3.0-12ab'); absent on stock electrum and third
+    parties, so bridge-side fingerprinting can tell ours from theirs
+    without a key registry."""
     offer = {
         "percentage_fee": float(percentage_fee),
         "mining_fee": int(mining_fee_sat),
@@ -76,6 +82,8 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
         "relays": relays_csv,
         "pow_nonce": hex(int(pow_nonce)),
     }
+    if server_version:
+        offer["server_version"] = server_version
     if jit_channel_pct and jit_channel_pct > 0:
         offer["jit_channel_pct"] = float(jit_channel_pct)
     return json.dumps(offer)

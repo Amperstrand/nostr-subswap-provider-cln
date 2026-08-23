@@ -98,6 +98,18 @@ def test_m2_offer_builder_emits_current_keys():
     assert content["max_forward_amount"] == 7500000
     assert content["max_reverse_amount"] == 310000
 
+    # self-ID: emitted ONLY when passed (deployed publishers always pass
+    # it — baked from git describe at image build); stock electrum and
+    # third parties never send the key, so bridge fingerprinting tells
+    # our providers from theirs without a key registry
+    id_content = _json.loads(offer.build_offer_content(
+        percentage_fee=0.5, mining_fee_sat=22500, min_amount_sat=20000,
+        max_forward_sat=7500000, max_reverse_sat=310000,
+        relays_csv="wss://nos.lol", pow_nonce=12345,
+        server_version="cln-subswap/v0.3.0-test"))
+    assert id_content["server_version"] == "cln-subswap/v0.3.0-test"
+    assert set(id_content.keys()) - CURRENT_ELECTRUM_OFFER_KEYS == {"server_version"}
+
     tags = offer.build_offer_tags("regtest", now=1_700_000_000)
     assert tags[0] == ["d", CURRENT_D_TAG]
     assert tags[1] == ["r", "net:regtest"]
