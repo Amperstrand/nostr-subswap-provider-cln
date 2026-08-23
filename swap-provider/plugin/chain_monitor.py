@@ -3,6 +3,7 @@ from typing import Callable, Optional, List
 
 from .cln_logger import PluginLogger
 from .bitcoin_core_rpc import BitcoinCoreRPC, BitcoinRPCCredentials
+from .health import tracker
 from .utils import supervise, fatal_exit
 
 
@@ -48,6 +49,10 @@ class ChainMonitor(BitcoinCoreRPC):
         while True:
             try:
                 blockheight = await self.get_local_height()
+                # heartbeat: one beat per pass — a beat that goes stale
+                # means the loop itself is wedged (a hanging RPC without
+                # timeout), which the fatal policy cannot catch
+                tracker.beat("chain-monitor", detail=f"height={blockheight}")
                 if last_height is None:
                     last_height = blockheight
                 elif blockheight > last_height:
@@ -56,8 +61,12 @@ class ChainMonitor(BitcoinCoreRPC):
                         self._logger.debug(f"{len(self.callbacks)} monitored submarine swaps.")
                     last_height = blockheight
                     await self.trigger_callbacks()
+                tracker.note_success("chain-monitor")
             except Exception as e:
                 self._logger.error(f"ChainMonitor: Error in monitoring loop: {e}")
+                # F12: bitcoind down = the r4 RETRY policy in action —
+                # surfaced as a degraded-driving error streak, not a death
+                tracker.note_error("chain-monitor", detail=f"rpc error: {e}")
             await asyncio.sleep(10)
 
     async def trigger_callbacks(self) -> None:

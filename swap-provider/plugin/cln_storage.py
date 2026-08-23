@@ -1,4 +1,5 @@
 import sys
+import time
 from collections.abc import Callable
 from .cln_logger import PluginLogger
 
@@ -18,6 +19,11 @@ class CLNStorage:  # (Logger):
         self.pos = None
         self.init_pos = None
         self.initialized = False
+        # swapprovider-health observability: the CLN datastore generation
+        # of the last successful write + when it happened (audit R2's
+        # "datastore last-successful-write" heartbeat)
+        self.last_generation = None
+        self.last_write_monotonic = None
         self.raw = self._fetch_db_content(key=self.read_key)
 
     def _fetch_db_content(self, *, key: str) -> str:
@@ -62,6 +68,7 @@ class CLNStorage:  # (Logger):
             raise StorageReadWriteError(f"Failed to write to CLN-DB: {e}")
         if "error" in res:
             raise StorageReadWriteError(f"CLN DB returned error on write: {res}")
+        self._note_write(res)
         self.init_pos = len(data)  # update initial position
         self.pos = self.init_pos
         self.raw = data  # update raw data to the new content
@@ -85,11 +92,16 @@ class CLNStorage:  # (Logger):
             raise StorageReadWriteError(f"Failed to append data to CLN DB: {e}")
         if "error" in res:
             raise StorageReadWriteError(f"CLN DB returned error on append: {res}")
+        self._note_write(res)
         self.pos += len(data)
         # content is secret-bearing (issue #13) — log size, not the data
         self.logger.debug(f"Appended to CLN db: \nkey:{res['key']} "
                       f"\ngeneration: {res['generation']} "
                       f"\nsize:{len(data)} characters")
+
+    def _note_write(self, res: dict) -> None:
+        self.last_generation = res.get("generation", self.last_generation)
+        self.last_write_monotonic = time.monotonic()
 
     def _test_db(self):
         """Test if we can read and write to the cln datastore."""

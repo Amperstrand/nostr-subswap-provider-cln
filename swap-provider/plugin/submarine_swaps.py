@@ -84,13 +84,15 @@ from .utils import (OldTaskGroup, now, BelowDustLimit, TxBroadcastError,
                     ignore_exceptions, log_exceptions, supervise)
 from .bitcoin import DummyAddress
 from .crypto import ripemd, sha256
+from .health import tracker
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
 from .invoices import Invoice, InvoiceState
 from .json_db import StoredObject, stored_in, JsonDB
 from . import constants
 from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_DELTA,
-                       MIN_FINAL_CLTV_DELTA_FOR_CLIENT, CLAIM_FEE_SIZE, LOCKUP_FEE_SIZE,
-                        MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE)
+                        MIN_FINAL_CLTV_DELTA_FOR_CLIENT, CLAIM_FEE_SIZE, LOCKUP_FEE_SIZE,
+                        MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE,
+                        PAYMENT_INFLIGHT_LOCK)
 # CLN-bound collaborators are import-time-free so the protocol/wire logic
 # (swap scripts, offers, fee math) stays testable without a node — the
 # cln_* classes only appear in annotations; InvoiceNotFoundError is
@@ -271,8 +273,10 @@ class SwapManager:
                         # refused) and let the outer loop rebuild after 15s
                         self.logger.error('nostr transport died before connecting — '
                                           'withdrawing offer, refusing new swap requests')
+                        tracker.note_nostr_down('died before connecting')
                     else:
                         self.logger.info(f'nostr is connected')
+                        tracker.note_nostr_up()
                     last_advertised_max = None
                     while transport.is_connected.is_set() and not transport.dead.is_set():
                         # todo: publish everytime fees have changed
@@ -286,11 +290,17 @@ class SwapManager:
                         # retry on the fast cadence below.
                         try:
                             await asyncio.wait_for(transport.publish_offer(), timeout=60)
+                            tracker.note_success('offer-publisher')
                         except Exception:
                             self.logger.error(f'publishing offer failed — withdrawing offer, '
                                               f'refusing new swap requests:\n'
                                               f'{traceback.format_exc()}')
                             self.is_initialized.clear()
+                            tracker.note_error('offer-publisher', detail='publish failed')
+                            tracker.note_nostr_down('publish failed')
+                        tracker.beat('offer-publisher',
+                                     detail='withdrawn, retrying' if not self.is_initialized.is_set()
+                                     else 'published')
                         if not self.is_initialized.is_set():  # if publish offer didn't set initialized we retry faster
                             await asyncio.sleep(10)
                             continue
@@ -316,6 +326,7 @@ class SwapManager:
                                               'refusing new swap requests until the '
                                               'transport restarts')
                             self.is_initialized.clear()
+                            tracker.note_nostr_down('DM consumer died')
                             break
             except asyncio.TimeoutError:
                 self.logger.warning(f"Nostr timeout, restarting Nostr module")
@@ -376,7 +387,7 @@ class SwapManager:
             self.invoices_to_pay.pop(key, None)
             return
         self._invoice_attempts[key] = n
-        self.invoices_to_pay[key] = 1000000000000 # lock
+        self.invoices_to_pay[key] = PAYMENT_INFLIGHT_LOCK  # marks the attempt in flight
         try:
             if (invoice := self.lnworker.get_invoice(key)) is None:
                 from .cln_lightning import InvoiceNotFoundError
@@ -418,6 +429,7 @@ class SwapManager:
             self.invoices_to_pay[key] = now() + 60
         else:
             self.logger.info(f'paid invoice {key}')
+            tracker.note_success('payment-loop')
             self._invoice_attempts.pop(key, None)
             self.lnworker.delete_invoice(key)
             self.invoices_to_pay.pop(key, None)
@@ -427,6 +439,8 @@ class SwapManager:
         self._invoice_attempts = {}
         while True:
             await asyncio.sleep(5)
+            tracker.beat('payment-loop',
+                         detail=f'{len(self.invoices_to_pay)} tracked')
             for key, not_before in list(self.invoices_to_pay.items()):
                 if now() < not_before:
                     continue
@@ -447,7 +461,8 @@ class SwapManager:
         except Exception:
             self.logger.error(f'payment task for {key} died unexpectedly:\n'
                               f'{traceback.format_exc()}')
-            if self.invoices_to_pay.get(key) == 1000000000000:
+            tracker.note_error('payment-loop', detail=f'task death {key[:8]}…')
+            if self.invoices_to_pay.get(key) == PAYMENT_INFLIGHT_LOCK:
                 self.invoices_to_pay[key] = now() + 60
 
     def _fail_swap(self, swap: SwapData, reason: str):
@@ -1436,6 +1451,10 @@ class NostrTransport:  # (Logger):
         # contained and logged at ERROR with the payload — the consumer
         # loop always survives.
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
+            # heartbeat: the generator woke — stale here means a quiet
+            # relay (not an error); consumer aliveness itself is the
+            # transport state (r4's dead flag mirrored in nostr_mode)
+            tracker.beat('nostr-consumer', detail=f'last event {event.id[:8]}…')
             if event.created_at < time.time() - self.NOSTR_EVENT_TIMEOUT:
                 continue
             if event.id in self.processed_event_ids:
@@ -1465,6 +1484,7 @@ class NostrTransport:  # (Logger):
                     self.dm_replies[content['reply_to']].set_result(content)
                 elif self.sm.is_server and 'method' in content:
                     await self.handle_request(content)
+                    tracker.note_success('nostr-consumer')
                 else:
                     print('unknown message', content)
             except asyncio.CancelledError:
@@ -1473,6 +1493,7 @@ class NostrTransport:  # (Logger):
                 self.logger.error(f'error handling nostr DM {event.id}, continuing with next DM. '
                                   f'payload (truncated): {str(content)[:256]}\n'
                                   f'{traceback.format_exc()}')
+                tracker.note_error('nostr-consumer', detail=f'DM dispatch failure {event.id[:8]}…')
 
     def _remember_event(self, event) -> None:
         """Persist the event id of a processed DM (value = created_at), so

@@ -36,6 +36,10 @@ LOCKTIME_DELTA_REFUND = 70
 MAX_LOCKTIME_DELTA = 100
 # blocks past locktime before a funded lockup with no LN commitment may be claimed (issue #10); SWEEP_GRACE_BLOCKS env var overrides
 SWEEP_GRACE_BLOCKS_DEFAULT = 288
+# pay_pending_ln_invoices parks invoices_to_pay[key] at this sentinel
+# while a payment attempt is in flight (the r4 requeue-backoff contract);
+# swapprovider-health counts these as inflight_payments
+PAYMENT_INFLIGHT_LOCK = 1000000000000
 MIN_FINAL_CLTV_DELTA_FOR_CLIENT = 3 * 144  # note: put in invoice, but is not enforced by receiver in lnpeer.py
 
 # the minimum cltv_expiry accepted for newly received HTLCs
