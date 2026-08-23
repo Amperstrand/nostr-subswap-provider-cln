@@ -240,6 +240,10 @@ class SwapManager:
         # onchain (issue #12); memory-only like invoices_to_pay — clients
         # re-send addswapinvoice after a restart
         self.invoices_awaiting_funding = set()
+        # issue #10: swap ids that already produced their grace-hold /
+        # grace-release log line (log-once discipline); memory-only
+        self._grace_hold_logged = set()
+        self._grace_release_logged = set()
 
     @log_exceptions
     async def run_nostr_server(self):
@@ -421,6 +425,25 @@ class SwapManager:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
 
+    def _has_ln_commitment(self, swap: SwapData) -> bool:
+        """True if the client committed to the LN leg of this reverse swap:
+        it registered an invoice and the payment is not permanently failed.
+
+        Settlement is deliberately NOT the criterion: a hold-invoice client
+        can only settle after our claim reveals the preimage, so gating the
+        claim on settlement would deadlock every honest swap."""
+        key = swap.payment_hash.hex()
+        if key in self.invoices_awaiting_funding:
+            return True
+        if key in self.invoices_to_pay:
+            return True
+        if self.lnworker.get_invoice(key) is not None:
+            return True
+        # covers completed payments (invoice deleted after success) and
+        # in-flight attempts; 'failed' is permanently failed before flight
+        statuses = self.lnworker.get_payment_statuses(key)
+        return any(s in ('pending', 'inflight', 'complete') for s in statuses)
+
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
         assert self.lnwatcher
@@ -542,6 +565,28 @@ class SwapManager:
                     self.invoices_awaiting_funding.discard(key)
                     self.logger.info(f'lockup funded for swap {key}, queueing invoice payment')
                     self.invoices_to_pay[key] = 0
+                # issue #10: a lockup whose LN leg was never committed to
+                # is not ours to claim on sight — hold the claim until a
+                # grace period past locktime expires, then fail open
+                if not self._has_ln_commitment(swap):
+                    grace_height = swap.locktime + self.config.sweep_grace_blocks
+                    details = (f'payment_hash={key} lockup={swap.lockup_address} '
+                               f'onchain_amount={swap.onchain_amount} '
+                               f'lightning_amount={swap.lightning_amount} '
+                               f'locktime={swap.locktime} height={current_height} '
+                               f'grace_until={grace_height}')
+                    if current_height < grace_height:
+                        if key not in self._grace_hold_logged:
+                            self._grace_hold_logged.add(key)
+                            self.logger.warning(f'no LN commitment for funded swap, holding claim '
+                                                f'until height {grace_height} '
+                                                f'(SWEEP_GRACE_BLOCKS={self.config.sweep_grace_blocks}): '
+                                                f'{details}')
+                        return
+                    if key not in self._grace_release_logged:
+                        self._grace_release_logged.add(key)
+                        self.logger.error(f'policy: sweeping uncommitted expired lockup: {details}')
+                    # grace expired: fail open and claim below
 
             if spent_height is not None and not should_bump_fee:
                 return

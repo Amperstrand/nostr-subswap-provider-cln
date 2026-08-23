@@ -10,7 +10,7 @@ from .lnutil import hex_to_bytes, bytes_to_hex
 from .json_db import StoredObject
 from .cln_logger import PluginLogger
 from . import constants
-from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest
+from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT
 
 
 class PluginConfig:
@@ -28,6 +28,7 @@ class PluginConfig:
         self.swapserver_fee_millionths: int = 10_000
         self.confirmation_speed_target_blocks: int = 10
         self.fallback_fee_sat_per_vb:int = 60
+        self.sweep_grace_blocks: int = SWEEP_GRACE_BLOCKS_DEFAULT
         self.logger = logger  # PluginLogger("swap-provider", plugin, level="DEBUG")
 
     @classmethod
@@ -165,6 +166,17 @@ class PluginConfig:
         else:
             config.logger.info("fee oracle: disabled (CLN estimates + static fallback only)")
 
+        # issue #10: blocks past locktime before a funded lockup with no
+        # LN commitment may be claimed; env-overridable
+        if grace_blocks := os.getenv("SWEEP_GRACE_BLOCKS"):
+            grace_blocks = int(grace_blocks.strip())
+            if not 0 <= grace_blocks <= 100_000:
+                raise Exception("SWEEP_GRACE_BLOCKS is out of allowed range [0;100000]")
+            config.sweep_grace_blocks = grace_blocks
+        else:
+            config.logger.warning(f"No SWEEP_GRACE_BLOCKS set in env. "
+                                  f"Using default of {config.sweep_grace_blocks}")
+
         if log_level := os.getenv("PLUGIN_LOG_LEVEL"):
             config.logger.change_level(log_level.strip())
 
@@ -203,7 +215,8 @@ class PluginConfig:
                f"nostr_relays={self.nostr_relays}, " \
                f"swapserver_fee_millionths={self.swapserver_fee_millionths}, " \
                f"confirmation_speed_target_blocks={self.confirmation_speed_target_blocks}, " \
-               f"fallback_fee_sat_per_vb={self.fallback_fee_sat_per_vb})"
+               f"fallback_fee_sat_per_vb={self.fallback_fee_sat_per_vb}, " \
+               f"sweep_grace_blocks={self.sweep_grace_blocks})"
 
 
 @attr.s

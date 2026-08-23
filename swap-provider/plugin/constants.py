@@ -34,6 +34,8 @@ LOCKUP_FEE_SIZE = 153 # assuming 1 output, 2 outputs
 MIN_LOCKTIME_DELTA = 60
 LOCKTIME_DELTA_REFUND = 70
 MAX_LOCKTIME_DELTA = 100
+# blocks past locktime before a funded lockup with no LN commitment may be claimed (issue #10); SWEEP_GRACE_BLOCKS env var overrides
+SWEEP_GRACE_BLOCKS_DEFAULT = 288
 MIN_FINAL_CLTV_DELTA_FOR_CLIENT = 3 * 144  # note: put in invoice, but is not enforced by receiver in lnpeer.py
 
 # the minimum cltv_expiry accepted for newly received HTLCs
