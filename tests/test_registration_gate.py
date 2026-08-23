@@ -1,12 +1,18 @@
-"""Issue #15: registration-blind claims — abandoned normal-swap lockups
-must stay refundable.
+"""Issue #15/#10 reconciled claim gate on the production lineage: an
+unregistered (abandoned) funded lockup is HELD refundable until
+locktime + SWEEP_GRACE_BLOCKS, then swept under an ERROR policy log
+(issue #10 option B); a registered lockup with an LN commitment claims
+immediately.
 
-Live evidence (2026-08-23, both provider classes, both networks): a
-phase-1-only swap (hold NEVER registered) whose lockup got funded was
-CLAIMED by the provider one block after confirmation — preimage branch,
-hash-verified, no LN payment ever made or registrable. fund-before-
-register is a funds-loss class; the claim must be gated on the client's
-addswapinvoice registration (persisted flag — survives restarts).
+The `registered` field itself is production schema (lineage ebed8ff):
+records carrying it crashed older builds on load, so it MUST remain on
+SwapData and be stamped by server_add_swap_invoice.
+
+Live evidence behind the gate (2026-08-23, both provider classes, both
+networks): a phase-1-only swap (hold NEVER registered) whose lockup got
+funded was CLAIMED by the provider one block after confirmation — no LN
+payment ever made or registrable. fund-before-register is a funds-loss
+class; the claim must be gated on the client's LN commitment.
 
 Run: python3 -m pytest tests/test_registration_gate.py -v
 """
@@ -28,7 +34,8 @@ from plugin.submarine_swaps import SwapManager, SwapData  # noqa: E402
 
 def _d2_swap(registered: bool = False) -> SwapData:
     # d2 on the server = "reverse for server" = is_reverse=True
-    # (server_create_normal_swap → create_reverse_swap)
+    # (server_create_normal_swap → create_reverse_swap); the preimage is
+    # generated server-side at creation, so it is always known here.
     swap = SwapData(
         is_reverse=True, locktime=5000, onchain_amount=21181,
         lightning_amount=20000, redeem_script=b"\x51" * 10,
@@ -39,18 +46,22 @@ def _d2_swap(registered: bool = False) -> SwapData:
     return swap
 
 
-def _manager(swap: SwapData) -> SwapManager:
+def _manager(swap: SwapData, height: int = 4900,
+             has_invoice: bool = False) -> SwapManager:
     sm = SwapManager.__new__(SwapManager)
     sm.logger = MagicMock()
     sm.swaps = {swap._payment_hash: swap}
     sm.invoices_to_pay = {}
     sm.invoices_awaiting_funding = set()
+    sm._grace_hold_logged = set()
+    sm._grace_release_logged = set()
+    sm.config = SimpleNamespace(sweep_grace_blocks=288)
     sm._swaps_by_funding_outpoint = {}
     sm._swaps_by_lockup_address = {}
     sm._create_and_sign_claim_tx = MagicMock(
         return_value=MagicMock(txid=lambda: "f" * 64))
     sm.wallet = MagicMock()
-    sm.wallet.get_local_height = AsyncMock(return_value=4900)
+    sm.wallet.get_local_height = AsyncMock(return_value=height)
 
     class _Prevout:
         def __init__(self):
@@ -66,7 +77,7 @@ def _manager(swap: SwapData) -> SwapManager:
     funded_txin = SimpleNamespace(
         prevout=_Prevout(),
         value_sats=lambda: 21181,
-        block_height=4900, spent_height=None, spent_txid=None)
+        block_height=height, spent_height=None, spent_txid=None)
     sm.lnwatcher = MagicMock()
     sm.lnwatcher.is_up_to_date = AsyncMock(return_value=True)
     sm.lnwatcher.broadcast_raw_transaction = AsyncMock(return_value="f" * 64)
@@ -74,46 +85,83 @@ def _manager(swap: SwapData) -> SwapManager:
     sm.lnwatcher.get_tx_height = AsyncMock(
         return_value=SimpleNamespace(conf=1))          # lockup CONFIRMED
     sm.lnworker = MagicMock()
+    # deterministic LN-commitment state (MagicMock auto-returns are truthy)
+    sm.lnworker.get_invoice = MagicMock(
+        return_value=object() if has_invoice else None)
+    sm.lnworker.get_payment_statuses = MagicMock(return_value=[])
+    sm.lnworker.get_preimage = MagicMock(return_value=swap.preimage)
     return sm
 
 
 class TestRegistrationGate:
-    def test_unregistered_funded_swap_is_never_claimed(self):
+    def test_unregistered_funded_swap_is_held_within_grace(self):
+        # height 4900 < locktime 5000 + 288: refundable to the client,
+        # no claim, exactly one hold WARNING (log-once discipline)
         swap = _d2_swap(registered=False)
-        sm = _manager(swap)
+        sm = _manager(swap, height=4900)
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_not_called()
+        assert sm.logger.warning.call_count == 1
+        assert 'no LN commitment for funded swap, holding claim' \
+            in sm.logger.warning.call_args.args[0]
+
+    def test_unregistered_funded_swap_is_swept_past_grace(self):
+        # reconciled contract (issue #10 option B supersedes the #15
+        # indefinite hold): at height >= locktime + SWEEP_GRACE_BLOCKS
+        # the uncommitted lockup is claimed under one ERROR policy log
+        swap = _d2_swap(registered=False)
+        sm = _manager(swap, height=5000 + 288)
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_called_once()
+        assert sm.logger.error.call_count == 1
+        assert 'policy: sweeping uncommitted expired lockup' \
+            in sm.logger.error.call_args.args[0]
+        # release log is once-only across repeat callbacks
+        asyncio.run(sm._claim_swap(swap))
+        assert sm.logger.error.call_count == 1
 
     def test_registered_funded_swap_claims(self):
         swap = _d2_swap()
         swap.registered = True                    # addswapinvoice ran
-        sm = _manager(swap)
+        sm = _manager(swap, has_invoice=True)
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_called_once()
+        sm.logger.warning.assert_not_called()     # no grace hold
+        sm.logger.error.assert_not_called()       # no policy sweep
 
     def test_addswapinvoice_sets_the_persisted_flag(self):
         # source contract: server_add_swap_invoice must stamp
-        # swap.registered = True (the persisted marker the gate reads)
+        # swap.registered = True (the production-schema marker)
         src = (_plugin / "submarine_swaps.py").read_text()
         assert re.search(r"swap\.registered\s*=\s*True", src), (
             "server_add_swap_invoice must set swap.registered = True")
 
-    def test_gate_reads_the_registered_flag(self):
-        # source contract: _claim_swap's reverse (d2) branch must gate
-        # on swap.registered before the claim fall-through
+    def test_registered_field_stays_in_the_schema(self):
+        # production jsondb records carry `registered` — dropping the
+        # attr re-introduces the DOA crash of fixed-r2 (TypeError in
+        # StoredDict._convert_dict -> SwapData.__init__)
         src = (_plugin / "submarine_swaps.py").read_text()
-        assert re.search(r"if not .*registered", src), (
-            "_claim_swap must gate the d2 claim on swap.registered")
+        assert re.search(r"registered\s*=\s*attr\.ib\(type=bool, default=False\)", src), (
+            "SwapData must keep the `registered` attribute (production "
+            "records persist it)")
+
+    def test_claim_path_gates_on_ln_commitment(self):
+        # source contract: _claim_swap's reverse (d2) branch must gate
+        # the claim on _has_ln_commitment within the grace window
+        src = (_plugin / "submarine_swaps.py").read_text()
+        assert re.search(r"if not self\._has_ln_commitment\(swap\):", src), (
+            "_claim_swap must gate the d2 claim on _has_ln_commitment")
 
 
 class TestNostrLoopRobustness:
     def test_non_dict_dm_payloads_cannot_kill_the_listener(self):
         # live 2026-08-23 09:02: replayed junk DMs decrypting to a JSON
         # LIST crashed check_direct_messages (content['event_id'] on a
-        # list) OUTSIDE the guarded block — nostr taskgroup died, plugin
-        # DM-deaf until restart. The guard must precede the dict access.
+        # list) — nostr taskgroup died, plugin DM-deaf until restart.
+        # The guard must reject junk INSIDE the contained decrypt/parse
+        # block, before any content['…'] access.
         src = (_plugin / "submarine_swaps.py").read_text()
         assert re.search(
-            r"isinstance\(content, dict\)[^\n]*\n\s*continue", src), (
+            r"isinstance\(content, dict\)[^\n]*\n\s*(continue|raise ValueError)", src), (
             "check_direct_messages must skip non-dict payloads before "
             "any content['…'] access")

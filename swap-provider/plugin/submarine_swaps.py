@@ -158,10 +158,14 @@ class SwapData(StoredObject):
     funding_txid = attr.ib(type=Optional[str])
     spending_txid = attr.ib(type=Optional[str])
     is_redeemed = attr.ib(type=bool)
-    # issue #15: a d2 lockup may only be claimed after the client's
-    # addswapinvoice REGISTRATION — an abandoned swap (funded, never
-    # registered) must stay refundable to the client's key at CLTV.
-    # Persisted with the swap, so the gate survives restarts.
+    # issue #15 (production lineage ebed8ff): persisted marker that the
+    # client completed addswapinvoice REGISTRATION. Production jsondb
+    # records carry this field — it MUST stay in the schema (records with
+    # `registered` crashed older builds on load). In this lineage the
+    # claim gate itself is the sweep-grace window (issue #10 option B):
+    # an unregistered funded lockup stays refundable to the client's key
+    # until locktime + SWEEP_GRACE_BLOCKS, after which it is swept under
+    # the ERROR-level policy log.
     registered = attr.ib(type=bool, default=False)
 
     _funding_prevout = None  # type: Optional[TxOutpoint]  # for RBF
@@ -531,17 +535,6 @@ class SwapManager:
                     return
 
             else:
-                if not getattr(swap, 'registered', False):
-                    # issue #15 gate: claiming an unregistered lockup
-                    # harvests the client's funds (no invoice exists, so
-                    # no LN payment can ever balance it). Leave it
-                    # refundable to the client's key at CLTV.
-                    if funding_height.conf > 0:
-                        self.logger.info(
-                            f'claim gated: lockup funded but invoice never '
-                            f'registered {swap.lockup_address} (abandoned swap) '
-                            f'— staying refundable (issue #15)')
-                    return
                 if swap.preimage is None:
                     swap.preimage = self.lnworker.get_preimage(swap.payment_hash)
                 if swap.preimage is None:
