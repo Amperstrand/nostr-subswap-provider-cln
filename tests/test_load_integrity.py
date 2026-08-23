@@ -245,6 +245,20 @@ class TestTailAmputation:
                    for m in errs), sink.joined()
         assert isinstance(db.data, dict)  # prefix still recovered
 
+    def test_compact_dump_truncation_is_loud_not_assert(self):
+        """A truncation inside a CONSOLIDATED compact dump (no ',\n'
+        boundaries) is not amputatable — it must route to the loud
+        WalletFileException, never a bare AssertionError crash."""
+        from plugin.utils import WalletFileException
+        sink = Sink()
+        compact = json.dumps({"submarine_swaps":
+                              {"aa" * 32: _swap_rec("aa" * 32)}},
+                             sort_keys=True)
+        truncated = compact[:-40]  # mid-record: unbalanced, no boundary
+        with pytest.raises(WalletFileException):
+            JsonDB(s=truncated, storage=MemStorage(),
+                   logger=make_logger(sink))
+
 
 # ---------------------------------------------------------------------------
 # #18 / F04 — no silent startup deletion

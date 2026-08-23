@@ -304,7 +304,14 @@ class JsonDB:  # (Logger):
                 n = n + 1
             if n == 0:
                 prefix = s[0:i]
-                assert prefix[-2:] == ',\n'
+                # the append format separates entries with ',\n' — the
+                # only boundary this recovery can amputate at. A
+                # balanced prefix ending anywhere else (e.g. truncated
+                # inside a consolidated compact dump) is not
+                # recoverable here: fall through to the loud
+                # WalletFileException instead of a bare assert crash.
+                if prefix[-2:] != ',\n':
+                    return None
                 # issue #19 (audit F05): recovering by amputating the
                 # unparsable tail used to be SILENT — the old log line
                 # even lacked its f-prefix, so the discarded bytes (the
