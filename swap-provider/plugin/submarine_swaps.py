@@ -162,6 +162,10 @@ class SwapManager:
         self.is_server = True  # this plugin is always a server
         self.use_nostr = True  # this plugin only uses nostr comm
         self.is_initialized = asyncio.Event()  # set once nostr is connected to relays
+        # d2 invoices parked at addswapinvoice until the lockup is seen
+        # onchain (issue #12); memory-only like invoices_to_pay — clients
+        # re-send addswapinvoice after a restart
+        self.invoices_awaiting_funding = set()
 
     @log_exceptions
     async def run_nostr_server(self):
@@ -264,6 +268,7 @@ class SwapManager:
             self.lnworker.delete_invoice(swap.payment_hash, False)
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.lnwatcher.remove_callback(swap.lockup_address)
+        self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex())
         self.db.write()
@@ -289,6 +294,7 @@ class SwapManager:
         self.lnworker.delete_invoice(swap.payment_hash, False)
         self.lnwatcher.remove_callback(swap.lockup_address)
         self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
+        self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
@@ -388,6 +394,14 @@ class SwapManager:
                     if key not in self.invoices_to_pay:
                         self.invoices_to_pay[key] = 0
                     return
+                # the lockup is funded (we only get here with a txin that
+                # paid at least onchain_amount): only now start paying the
+                # client's invoice (issue #12)
+                key = swap.payment_hash.hex()
+                if key in self.invoices_awaiting_funding:
+                    self.invoices_awaiting_funding.discard(key)
+                    self.logger.info(f'lockup funded for swap {key}, queueing invoice payment')
+                    self.invoices_to_pay[key] = 0
 
             if spent_height is not None and not should_bump_fee:
                 return
@@ -595,7 +609,13 @@ class SwapManager:
         # check that we have the preimage
         assert sha256(hex_to_bytes(swap.preimage)) == payment_hash
         assert swap.spending_txid is None
-        self.invoices_to_pay[key] = 0
+        # issue #12: never start paying on the invoice alone — the client
+        # may not have funded the lockup at all. Park the invoice; the
+        # payment is only queued by _claim_swap once an adequately sized
+        # output for the lockup has been observed onchain (mempool or
+        # confirmed). This waits for honest clients that send the invoice
+        # before funding, instead of rejecting them.
+        self.invoices_awaiting_funding.add(key)
         return {}
 
     def create_funding_tx(
