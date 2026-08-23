@@ -50,6 +50,7 @@ def _manager(swap: SwapData, height: int = 4900,
              has_invoice: bool = False) -> SwapManager:
     sm = SwapManager.__new__(SwapManager)
     sm.logger = MagicMock()
+    sm.db = MagicMock()  # issue #22: _claim_swap flushes on-chain mutations
     sm.swaps = {swap._payment_hash: swap}
     sm.invoices_to_pay = {}
     sm.invoices_awaiting_funding = set()
