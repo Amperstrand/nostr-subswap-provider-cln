@@ -80,7 +80,8 @@ from collections import defaultdict
 from .bitcoin import opcodes, dust_threshold, construct_script, script_to_p2wsh, construct_witness
 from .transaction import (PartialTxOutput, PartialTransaction, TxOutpoint, Transaction,
                           OPPushDataGeneric, OPPushDataPubkey, PartialTxInput)
-from .utils import OldTaskGroup, now, BelowDustLimit, TxBroadcastError, ignore_exceptions, log_exceptions
+from .utils import (OldTaskGroup, now, BelowDustLimit, TxBroadcastError,
+                    ignore_exceptions, log_exceptions, supervise)
 from .bitcoin import DummyAddress
 from .crypto import ripemd, sha256
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
@@ -254,13 +255,42 @@ class SwapManager:
         while True:
             try:
                 with NostrTransport(config=self.config, sm=self) as transport:
-                    await transport.is_connected.wait()
-                    self.logger.info(f'nostr is connected')
+                    # issue #17: a transport that dies BEFORE connecting
+                    # (relay_manager.connect raising) used to wedge the
+                    # is_connected wait forever — race the handshake
+                    # against the dead flag
+                    conn = asyncio.create_task(transport.is_connected.wait())
+                    death = asyncio.create_task(transport.dead.wait())
+                    await asyncio.wait({conn, death},
+                                       return_when=asyncio.FIRST_COMPLETED)
+                    for t in (conn, death):
+                        t.cancel()
+                    if not transport.is_connected.is_set():
+                        # issue #20: dead on arrival — withdraw (no offer,
+                        # is_initialized stays clear so requests are
+                        # refused) and let the outer loop rebuild after 15s
+                        self.logger.error('nostr transport died before connecting — '
+                                          'withdrawing offer, refusing new swap requests')
+                    else:
+                        self.logger.info(f'nostr is connected')
                     last_advertised_max = None
-                    while True:
+                    while transport.is_connected.is_set() and not transport.dead.is_set():
                         # todo: publish everytime fees have changed
                         self.server_update_pairs()
-                        await transport.publish_offer()
+                        # issue #20 (audit F06): bound the announce. A relay
+                        # that went away makes aionostr's send/reconnect
+                        # block for its full quadratic retry schedule —
+                        # without the bound this loop (and the offer) would
+                        # freeze silently instead of withdrawing. On
+                        # failure: withdraw the offer, refuse new swaps,
+                        # retry on the fast cadence below.
+                        try:
+                            await asyncio.wait_for(transport.publish_offer(), timeout=60)
+                        except Exception:
+                            self.logger.error(f'publishing offer failed — withdrawing offer, '
+                                              f'refusing new swap requests:\n'
+                                              f'{traceback.format_exc()}')
+                            self.is_initialized.clear()
                         if not self.is_initialized.is_set():  # if publish offer didn't set initialized we retry faster
                             await asyncio.sleep(10)
                             continue
@@ -270,9 +300,23 @@ class SwapManager:
                         # cadence until the advertised cap stabilizes
                         if last_advertised_max != self._max_amount:
                             last_advertised_max = self._max_amount
-                            await asyncio.sleep(30)
+                            cadence = 30
                         else:
-                            await asyncio.sleep(600)
+                            cadence = 600
+                        # issue #20: wake early if the DM consumer dies —
+                        # withdraw immediately instead of announcing into a
+                        # dead request pipeline for the rest of the cadence
+                        try:
+                            await asyncio.wait_for(transport.dead.wait(), timeout=cadence)
+                        except asyncio.TimeoutError:
+                            pass  # normal cadence expiry
+                        if transport.dead.is_set():
+                            self.logger.error('nostr DM consumer died — withdrawing offer '
+                                              '(no further kind-30315 republishes) and '
+                                              'refusing new swap requests until the '
+                                              'transport restarts')
+                            self.is_initialized.clear()
+                            break
             except asyncio.TimeoutError:
                 self.logger.warning(f"Nostr timeout, restarting Nostr module")
             await asyncio.sleep(15)
@@ -294,7 +338,14 @@ class SwapManager:
 
         async with self.taskgroup as group:
             for task in tasks:
-                await group.spawn(task)
+                t = await group.spawn(task)
+                # issue #17: log unobserved deaths at ERROR. Death policy
+                # for these core loops: FATAL by escalation — the
+                # OldTaskGroup propagates a child death through join,
+                # which ends run() and hits the #16 crash policy (log +
+                # hard exit). Visible death beats an invisible half-life;
+                # lightningd's restart is the recovery.
+                supervise(t, logger=self.logger, name=task.__name__)
 
     async def stop(self):
         self.logger.debug("SwapManager stop() called")
@@ -379,7 +430,25 @@ class SwapManager:
             for key, not_before in list(self.invoices_to_pay.items()):
                 if now() < not_before:
                     continue
-                await self.taskgroup.spawn(self.pay_pending_ln_invoice(key))
+                await self.taskgroup.spawn(self._supervised_pay_invoice(key))
+
+    async def _supervised_pay_invoice(self, key):
+        """Issue #17 payment-loop death policy: RECOVERABLE. A bug in ONE
+        payment attempt must not kill the taskgroup (and with it every
+        subsystem — the OldTaskGroup escalates child deaths fatally).
+        pay_pending_ln_invoice handles its own failure paths; whatever
+        escapes it is logged at ERROR here and the invoice lock is
+        re-queued with backoff — the 15-attempt cap in
+        pay_pending_ln_invoice still bounds total retries."""
+        try:
+            await self.pay_pending_ln_invoice(key)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.error(f'payment task for {key} died unexpectedly:\n'
+                              f'{traceback.format_exc()}')
+            if self.invoices_to_pay.get(key) == 1000000000000:
+                self.invoices_to_pay[key] = now() + 60
 
     def _fail_swap(self, swap: SwapData, reason: str):
         if swap is None:
@@ -397,9 +466,15 @@ class SwapManager:
         else:
             self.lnworker.delete_invoice(swap.payment_hash, False)
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
-        self.lnwatcher.remove_callback(swap.lockup_address)
         self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         if swap.funding_txid is None or swap.is_redeemed:
+            # issue #22 (audit F23): only a swap that leaves the record
+            # store drops its chain watch. While our funding is live
+            # on-chain the watcher MUST stay registered — the grace/refund
+            # branch of _claim_swap is the only thing that recovers the
+            # lockup after locktime; removing the callback here left the
+            # UTXO unwatched until the next restart re-added it.
+            self.lnwatcher.remove_callback(swap.lockup_address)
             self.swaps.pop(swap.payment_hash.hex())
         self.db.write()
 
@@ -484,6 +559,10 @@ class SwapManager:
             swap.funding_txid = txin.prevout.txid.hex()
             swap._funding_prevout = txin.prevout
             self._add_or_reindex_swap(swap)  # to update _swaps_by_funding_outpoint
+            # issue #22 (audit F10): funding_txid is a swap-state mutation
+            # with an on-chain meaning — flush now, not whenever some later
+            # path happens to write
+            self.db.write()
             funding_height = await self.lnwatcher.get_tx_height(txin.prevout.txid.hex())
             spent_height = txin.spent_height
             should_bump_fee = False
@@ -491,9 +570,16 @@ class SwapManager:
                               f"{spent_height} in tx {txin.spent_txid}")
             if spent_height is not None:
                 swap.spending_txid = txin.spent_txid
+                # issue #22 (audit F10): persist the observed spend before
+                # any early-return branch below can skip a later write
+                self.db.write()
                 if spent_height > 0 and current_height - spent_height > REDEEM_AFTER_DOUBLE_SPENT_DELAY:
                     self.logger.info(f'stop watching finished reverse swap {swap.lockup_address}')
                     swap.is_redeemed = True
+                    # issue #22 (audit F10): flush is_redeemed before the
+                    # delete path runs (which writes again) so a failure in
+                    # between cannot lose the finished state
+                    self.db.write()
                     return self.delete_finished_reverse_swap(swap)
 
             if not swap.is_reverse:
@@ -507,6 +593,10 @@ class SwapManager:
                         self.logger.debug(f"claim swap extracted preimage for "
                                           f"{swap.payment_hash.hex()} ({swap.lockup_address})")
                         swap.preimage = preimage.hex()
+                        # issue #22 (audit F10): the extracted preimage is
+                        # what settles the hold invoice — flush before the
+                        # finish path runs (which writes again)
+                        self.db.write()
                         return self._finish_normal_swap(swap)
                     else:
                         # this is our refund tx
@@ -514,6 +604,8 @@ class SwapManager:
                             self.logger.info(f'failed normal swap refund tx confirmed: '
                                              f'{txin.spent_txid} @ {spent_height}')
                             swap.is_redeemed = True
+                            # issue #22 (audit F10): flush before _fail_swap
+                            self.db.write()
                             return self._fail_swap(swap, 'refund tx confirmed')
                         elif spent_height == 0:  # still unconfirmed, we check if bumping is neccessary
                             claim_tx_fee = claim_tx.get_fee()
@@ -589,6 +681,11 @@ class SwapManager:
                 self.logger.error('_claim_tx: utxo value below dust threshold')
                 return
             swap.spending_txid = tx.txid()
+            # issue #22 (audit F10, extends #14 item 6 to this sibling
+            # site): the claim intent must be on disk BEFORE the
+            # broadcast — a crash after broadcast but before any later
+            # write left no persisted trace of the spend
+            self.db.write()
             if funding_height.conf > 0: # or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
                 # Impl-note: HARD REQUIREMENT (swap protocol, not BOLT): only
                 # Impl-note: broadcast the claim once the lockup has >= 1 confirmation.
@@ -944,6 +1041,13 @@ class SwapManager:
     def broadcast_funding_tx(self, swap: SwapData, tx: PartialTransaction) -> None:
         swap.funding_txid = tx.txid()
         self.wallet.broadcast_transaction(tx)
+        # issue #22 (audit F10): flush AFTER the broadcast — writing
+        # before it would persist funding_txid for a tx that never went
+        # out, and hold_invoice_callback (one-shot per funding) would
+        # then skip the re-broadcast on restart. A crash between
+        # broadcast and this write self-heals: the chain rescan
+        # re-derives the txid.
+        self.db.write()
 
     def _add_or_reindex_swap(self, swap: SwapData) -> None:
         if swap.payment_hash.hex() not in self.swaps:
@@ -1212,6 +1316,12 @@ class NostrTransport:  # (Logger):
         self.nostr_private_key = to_nip19('nsec', keypair.privkey.hex())
         self.nostr_pubkey = keypair.pubkey.hex()[2:]
         self.dm_replies = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future]
+        # issue #17/#20 (audit F03/F06): set when the transport's main_loop
+        # is gone (consumer taskgroup death, pre-connect death, or the
+        # get_events generator ending on a permanently gone relay).
+        # run_nostr_server watches it to withdraw the offer and refuse new
+        # swap requests instead of publishing into a dead pipeline.
+        self.dead = asyncio.Event()
         # ids of nostr DMs we already executed, persisted in the jsondb so a
         # restart never re-executes them (issue #11); value = event.created_at
         self.processed_event_ids = sm.db.get_dict('nostr_processed_events')
@@ -1220,11 +1330,23 @@ class NostrTransport:  # (Logger):
         self.taskgroup = OldTaskGroup()
 
     def __enter__(self):
-        asyncio.create_task(self.main_loop())  # , self.network.asyncio_loop)
+        # issue #17 (audit F03): main_loop was fire-and-forget — a death
+        # before the consumer even started vanished unobserved. The DM
+        # consumer's own deaths set the same flag from inside main_loop.
+        # POLICY for the nostr subsystem: RECOVERABLE-with-restart —
+        # run_nostr_server observes `dead`, withdraws the offer (#20) and
+        # rebuilds the transport on its existing outer loop (15s backoff);
+        # a nostr death must not take down hold-invoice serving.
+        supervise(asyncio.create_task(self.main_loop()),
+                  logger=self.logger, name="nostr-transport",
+                  on_death=lambda exc: self.dead.set())
         return self
 
     def __exit__(self, ex_type, ex, tb):
-        asyncio.create_task(self.stop())  # , self.network.asyncio_loop)
+        # issue #17: even best-effort teardown gets observed (stop()
+        # swallows internally, so this fires only if the task itself dies)
+        supervise(asyncio.create_task(self.stop()),
+                  logger=self.logger, name="nostr-stop")
 
     @log_exceptions
     async def main_loop(self):
@@ -1250,7 +1372,12 @@ class NostrTransport:  # (Logger):
                 await group.spawn(self.check_direct_messages())
         except Exception:
             self.logger.error(f"Nostr taskgroup died. {traceback.format_exc()}")
+            self.dead.set()
         finally:
+            # a consumer that ENDS without raising (the get_events
+            # generator finishing on a permanently gone relay) is just as
+            # dead as one that raised — flag both (#20)
+            self.dead.set()
             self.logger.warning("Nostr taskgroup stopped.")
 
     async def stop(self):
@@ -1374,6 +1501,14 @@ class NostrTransport:  # (Logger):
         else:
             handler = None
             r = {'error': f'unknown swap method: {method}'}
+        if handler is not None and not self.sm.is_initialized.is_set():
+            # issue #20 (audit F06): while the transport is dead/restarting
+            # the offer is withdrawn; accepting swap work into a pipeline
+            # that cannot serve it is the black-hole the audit flagged
+            # (is_initialized used to stay set forever after consumer
+            # death). A clean error reply the client can retry on.
+            handler = None
+            r = {'error': 'swap server unavailable (transport down), try again shortly'}
         if handler is not None:
             try:
                 r = await handler(request) if asyncio.iscoroutinefunction(handler) else handler(request)
