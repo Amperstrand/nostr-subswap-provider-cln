@@ -21,7 +21,7 @@ from .utils import OldTaskGroup, now, BelowDustLimit, TxBroadcastError, ignore_e
 from .bitcoin import DummyAddress
 from .crypto import ripemd, sha256
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
-from .invoices import Invoice, InvoiceState
+from .invoices import Invoice, InvoiceState, DuplicateInvoiceCreationError
 from .json_db import StoredObject, stored_in, JsonDB
 from . import constants
 from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_DELTA,
@@ -836,6 +836,9 @@ class NostrTransport:  # (Logger):
         self.nostr_private_key = to_nip19('nsec', keypair.privkey.hex())
         self.nostr_pubkey = keypair.pubkey.hex()[2:]
         self.dm_replies = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future]
+        # ids of nostr DMs we already executed, persisted in the jsondb so a
+        # restart never re-executes them (issue #11); value = event.created_at
+        self.processed_event_ids = sm.db.get_dict('nostr_processed_events')
         self.relay_manager = aionostr.Manager(self.relays, private_key=self.nostr_private_key)
         self.is_connected = asyncio.Event()
         self.taskgroup = OldTaskGroup()
@@ -899,36 +902,75 @@ class NostrTransport:  # (Logger):
         privkey = aionostr.key.PrivateKey(self.private_key)
         query = {"kinds": [self.NOSTR_DM], "limit":0, "#p": [self.nostr_pubkey]}
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
+            # relays replay all stored DMs on every (re)connect: ignore
+            # stale ones and never execute an event id twice (issue #11)
+            if event.created_at < time.time() - self.NOSTR_EVENT_TIMEOUT:
+                continue
+            if event.id in self.processed_event_ids:
+                continue
+            # quarantine the event id BEFORE handling it, so a poisoned
+            # request can not crash the handlers again on every restart
+            self._remember_event(event)
             try:
                 content = privkey.decrypt_message(event.content, event.pubkey)
                 content = json.loads(content)
+                if not isinstance(content, dict):
+                    raise ValueError('decrypted message is not a json object')
             except Exception:
+                # unparseable DM: already quarantined above
+                self.logger.warning(f'failed to decrypt/parse nostr DM {event.id}, ignoring it')
                 continue
             content['event_id'] = event.id
             content['event_pubkey'] = event.pubkey
-            if 'reply_to' in content:
-                self.dm_replies[content['reply_to']].set_result(content)
-            elif self.sm.is_server and 'method' in content:
-                await self.handle_request(content)
-            else:
-                print('unknown message', content)
+            # regression guard (issue #11): whatever a malformed or
+            # malicious DM raises is contained per event — an exception
+            # in one handler can never propagate to this loop again
+            try:
+                if 'reply_to' in content:
+                    self.dm_replies[content['reply_to']].set_result(content)
+                elif self.sm.is_server and 'method' in content:
+                    await self.handle_request(content)
+                else:
+                    print('unknown message', content)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.error(f'error handling nostr DM {event.id}, continuing with next DM. '
+                                  f'payload (truncated): {str(content)[:256]}\n'
+                                  f'{traceback.format_exc()}')
+
+    def _remember_event(self, event) -> None:
+        """Persist the event id of a processed DM (value = created_at), so
+        replays after a restart are skipped instead of re-executed."""
+        cutoff = time.time() - self.NOSTR_EVENT_TIMEOUT
+        for stale_id, created_at in list(self.processed_event_ids.items()):
+            if created_at < cutoff:
+                self.processed_event_ids.pop(stale_id)
+        self.processed_event_ids[event.id] = event.created_at
+        self.sm.db.write()
 
     @log_exceptions
     async def handle_request(self, request):
         assert self.sm.is_server
-        # todo: remember event_id of already processed requests
         method = request.pop('method')
         event_id = request.pop('event_id')
         event_pubkey = request.pop('event_pubkey')
         self.logger.info(f'received swap request: id={event_id} {method} {request}')
-        if method == 'addswapinvoice':
-            r = self.sm.server_add_swap_invoice(request)
-        elif method == 'createswap':
-            r = await self.sm.server_create_swap(request)
-        elif method == 'createnormalswap':
-            r = await self.sm.server_create_normal_swap(request)
-        else:
-            r = {'error': f'unknown swap method: {method}'}
+        try:
+            if method == 'addswapinvoice':
+                r = self.sm.server_add_swap_invoice(request)
+            elif method == 'createswap':
+                r = await self.sm.server_create_swap(request)
+            elif method == 'createnormalswap':
+                r = await self.sm.server_create_normal_swap(request)
+            else:
+                r = {'error': f'unknown swap method: {method}'}
+        except (ValueError, KeyError, TypeError, AssertionError, DuplicateInvoiceCreationError) as e:
+            # malformed request fields must produce a protocol-level error
+            # reply instead of an exception raising through (issue #11);
+            # JSONDecodeError is a ValueError and is already contained at
+            # the decrypt/parse boundary in check_direct_messages
+            r = {'error': f'invalid swap request: {e!r}'}
         r['reply_to'] = event_id
         self.logger.debug(f'sending response id={event_id}')
         await self.send_direct_message(event_pubkey, json.dumps(r))
