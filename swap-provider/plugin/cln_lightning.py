@@ -78,6 +78,15 @@ class CLNLightning:
         self._logger.debug("CLNLightning initialized")
 
     async def run(self):
+        # These loops are immortal BY DESIGN and must stay NON-DAEMON
+        # threads: JsonDB.write refuses writes from daemon threads
+        # ('daemon thread cannot write db' — an electrum-inherited
+        # invariant), and monitor_expiries/callback_handler/the pyln hook
+        # all persist invoices. Issue #16 therefore fixes the zombie at
+        # the TOP level instead (swap-provider.py hard-exits on every
+        # crash path, so asyncio.run's executor join — which would block
+        # forever on these threads — is structurally unreachable). Do NOT
+        # convert these to daemon threads.
         # put the htlc expiry monitoring in a separate thread to avoid blocking the async event loop
         htlc_expiry_watcher = asyncio.to_thread(self.monitor_expiries)
         self.monitoring_tasks.append(asyncio.create_task(htlc_expiry_watcher))

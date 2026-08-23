@@ -27,7 +27,10 @@ import aiorpcx
 import decimal
 from decimal import Decimal
 import asyncio
+import os
+import sys
 import time
+import traceback
 from typing import Optional, Sequence
 import functools
 
@@ -375,6 +378,54 @@ def log_exceptions(func):
                 print(f"logging exception raised: {repr(e2)}... orig exc: {repr(e)} in {func.__name__}")
             raise
     return wrapper
+
+
+def supervise(task: 'asyncio.Future', *, logger, name: str, on_death=None) -> 'asyncio.Future':
+    """Issue #17 (audit F02/F03): a background task must never die
+    unobserved. The done-callback logs any task exception at ERROR with
+    its traceback — an unobserved fire-and-forget death is exactly the
+    half-alive mode the audit flagged (chain watch died with no log line
+    at all) — and optionally hands the death to a subsystem policy via
+    on_death(exc). Cancellation is normal teardown and stays silent."""
+    def _on_done(t: 'asyncio.Future') -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is None:
+            return
+        tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        logger.error(f"supervised task '{name}' died: {exc!r}\n{tb}")
+        if on_death is not None:
+            try:
+                on_death(exc)
+            except Exception:
+                logger.error(f"on_death policy hook of '{name}' failed:\n"
+                             f"{traceback.format_exc()}")
+    task.add_done_callback(_on_done)
+    return task
+
+
+def fatal_exit(msg: str, logger=None) -> None:
+    """Issue #16 fail-loud crash policy: log at ERROR (plugin.log, i.e.
+    the CLN log — stderr is not wired there in containerized runs) and
+    terminate IMMEDIATELY with a nonzero status.
+
+    os._exit is deliberate: returning instead hands control back to
+    asyncio.run, whose cleanup joins the immortal monitoring threads
+    (loop.shutdown_default_executor) forever — the verified zombie mode
+    where a half-alive plugin keeps serving the htlc hook while every
+    async subsystem is dead. Those threads must STAY non-daemon (the
+    JsonDB refuses writes from daemon threads), so dying loudly here —
+    letting lightningd / the container restart policy see the exit — is
+    the only correct termination path."""
+    if logger is not None:
+        try:
+            logger.error(msg)
+        except Exception:
+            print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    else:
+        print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    os._exit(1)
 
 
 class TxMinedInfo(NamedTuple):
