@@ -349,7 +349,10 @@ class SwapManager:
                     for txin in claim_tx.inputs():
                         preimage = txin.witness_elements()[1]
                         if sha256(preimage) == swap.payment_hash:
-                            self.logger.debug(f"claim swap extracted preimage: {preimage.hex()} for {swap.lockup_address}")
+                            # the preimage is key material — log the hash it
+                            # settles instead of the preimage itself (issue #13)
+                            self.logger.debug(f"claim swap extracted preimage for "
+                                              f"{swap.payment_hash.hex()} ({swap.lockup_address})")
                             swap.preimage = preimage.hex()
                             return self._finish_normal_swap(swap)
                     else:
@@ -413,8 +416,9 @@ class SwapManager:
             swap.spending_txid = tx.txid()
             if funding_height.conf > 0: # or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
                 try:
-                    self.logger.debug(f'spending claim tx {tx.txid()}: '
-                                     f'\nTX_RAW: {Transaction.serialize(tx)}')
+                    # the raw tx embeds the preimage in its witness — never
+                    # log it (issue #13), the txid identifies it
+                    self.logger.debug(f'spending claim tx {tx.txid()}')
                     txid = await self.lnwatcher.broadcast_raw_transaction(Transaction.serialize(tx))
                     self.logger.info(f'broadcasted claim tx {txid}')
                 except TxBroadcastError:
