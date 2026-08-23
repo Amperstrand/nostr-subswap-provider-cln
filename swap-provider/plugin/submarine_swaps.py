@@ -236,6 +236,10 @@ class SwapManager:
         self.is_server = True  # this plugin is always a server
         self.use_nostr = True  # this plugin only uses nostr comm
         self.is_initialized = asyncio.Event()  # set once nostr is connected to relays
+        # d2 invoices parked at addswapinvoice until the lockup is seen
+        # onchain (issue #12); memory-only like invoices_to_pay — clients
+        # re-send addswapinvoice after a restart
+        self.invoices_awaiting_funding = set()
 
     @log_exceptions
     async def run_nostr_server(self):
@@ -386,6 +390,7 @@ class SwapManager:
             self.lnworker.delete_invoice(swap.payment_hash, False)
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.lnwatcher.remove_callback(swap.lockup_address)
+        self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex())
         self.db.write()
@@ -411,6 +416,7 @@ class SwapManager:
         self.lnworker.delete_invoice(swap.payment_hash, False)
         self.lnwatcher.remove_callback(swap.lockup_address)
         self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
+        self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
@@ -469,7 +475,10 @@ class SwapManager:
                     claim_tx = await self.lnwatcher.get_transaction(txin.spent_txid)
                     preimage = self.extract_preimage(swap, claim_tx)
                     if preimage is not None:
-                        self.logger.debug(f"claim swap extracted preimage: {preimage.hex()} for {swap.lockup_address}")
+                        # the preimage is key material — log the hash it
+                        # settles instead of the preimage itself (issue #13)
+                        self.logger.debug(f"claim swap extracted preimage for "
+                                          f"{swap.payment_hash.hex()} ({swap.lockup_address})")
                         swap.preimage = preimage.hex()
                         return self._finish_normal_swap(swap)
                     else:
@@ -525,6 +534,14 @@ class SwapManager:
                     if key not in self.invoices_to_pay:
                         self.invoices_to_pay[key] = 0
                     return
+                # the lockup is funded (we only get here with a txin that
+                # paid at least onchain_amount): only now start paying the
+                # client's invoice (issue #12)
+                key = swap.payment_hash.hex()
+                if key in self.invoices_awaiting_funding:
+                    self.invoices_awaiting_funding.discard(key)
+                    self.logger.info(f'lockup funded for swap {key}, queueing invoice payment')
+                    self.invoices_to_pay[key] = 0
 
             if spent_height is not None and not should_bump_fee:
                 return
@@ -553,8 +570,9 @@ class SwapManager:
                 # Impl-note: confirmed in the next block; invoice settled in
                 # Impl-note: the same window.
                 try:
-                    self.logger.debug(f'spending claim tx {tx.txid()}: '
-                                     f'\nTX_RAW: {Transaction.serialize(tx)}')
+                    # the raw tx embeds the preimage in its witness — never
+                    # log it (issue #13), the txid identifies it
+                    self.logger.debug(f'spending claim tx {tx.txid()}')
                     txid = await self.lnwatcher.broadcast_raw_transaction(Transaction.serialize(tx))
                     self.logger.info(f'broadcasted claim tx {txid}')
                 except TxBroadcastError:
@@ -851,7 +869,13 @@ class SwapManager:
             raise RequestFieldError('invoice already bound')
         swap.registered = True
         self.lnworker.save_invoice(invoice)
-        self.invoices_to_pay[key] = 0
+        # issue #12: never start paying on the invoice alone — the client
+        # may not have funded the lockup at all. Park the invoice; the
+        # payment is only queued by _claim_swap once an adequately sized
+        # output for the lockup has been observed onchain (mempool or
+        # confirmed). This waits for honest clients that send the invoice
+        # before funding, instead of rejecting them.
+        self.invoices_awaiting_funding.add(key)
         return {}
 
     def create_funding_tx(
@@ -1150,6 +1174,9 @@ class NostrTransport:  # (Logger):
         self.nostr_private_key = to_nip19('nsec', keypair.privkey.hex())
         self.nostr_pubkey = keypair.pubkey.hex()[2:]
         self.dm_replies = defaultdict(asyncio.Future)  # type: Dict[bytes, asyncio.Future]
+        # ids of nostr DMs we already executed, persisted in the jsondb so a
+        # restart never re-executes them (issue #11); value = event.created_at
+        self.processed_event_ids = sm.db.get_dict('nostr_processed_events')
         self.relay_manager = aionostr.Manager(self.relays, private_key=self.nostr_private_key)
         self.is_connected = asyncio.Event()
         self.taskgroup = OldTaskGroup()
@@ -1237,42 +1264,60 @@ class NostrTransport:  # (Logger):
         # 'assert spending_txid is None' on an already-spent swap and the
         # AssertionError killed the entire nostr taskgroup — one old DM
         # murdered the transport. Per-event isolation: log, skip, survive.
-        seen_event_ids = set()
+        # Audit round 1 (#11): event ids are now persisted in the jsondb
+        # (marked BEFORE dispatch, so poisoned requests are quarantined
+        # across restarts, not just within a session) and stale events are
+        # dropped by age; any exception raised while handling one DM is
+        # contained and logged at ERROR with the payload — the consumer
+        # loop always survives.
         async for event in self.relay_manager.get_events(query, single_event=False, only_stored=False):
+            if event.created_at < time.time() - self.NOSTR_EVENT_TIMEOUT:
+                continue
+            if event.id in self.processed_event_ids:
+                continue
+            self._remember_event(event)
             try:
                 content = privkey.decrypt_message(event.content, event.pubkey)
                 content = json.loads(content)
+                # PORT FIND #13 escapee (live 2026-08-23 09:02): a payload that
+                # decrypts to a NON-DICT (a JSON list — malformed/malicious
+                # replay DMs) reached content['event_id'] below and raised
+                # TypeError('list indices must be integers or slices, not str')
+                # OUTSIDE any guard — killing the whole nostr taskgroup and
+                # leaving the plugin DM-deaf until restart. Skip junk shapes.
+                if not isinstance(content, dict):
+                    raise ValueError('decrypted message is not a json object')
             except Exception:
+                # unparseable DM: already quarantined above
+                self.logger.warning(f'failed to decrypt/parse nostr DM {event.id}, ignoring it')
                 continue
-            # PORT FIND #13 escapee (live 2026-08-23 09:02): a payload that
-            # decrypts to a NON-DICT (a JSON list — malformed/malicious
-            # replay DMs) reached content['event_id'] below and raised
-            # TypeError('list indices must be integers or slices, not str')
-            # OUTSIDE any guard — killing the whole nostr taskgroup and
-            # leaving the plugin DM-deaf until restart. Skip junk shapes.
-            if not isinstance(content, dict):
-                continue
-            if event.id in seen_event_ids:
-                continue
-            seen_event_ids.add(event.id)
             content['event_id'] = event.id
             content['event_pubkey'] = event.pubkey
-            if 'reply_to' in content:
-                self.dm_replies[content['reply_to']].set_result(content)
-            elif self.sm.is_server and 'method' in content:
-                # handle_request POPS event_id/event_pubkey from the dict —
-                # capture first or the failure log below KeyErrors (the
-                # exact second-order crash the first #13 fix produced)
-                req_event_id = content['event_id']
-                try:
+            # regression guard (issue #11): an exception raised by any one
+            # DM can never propagate to this loop
+            try:
+                if 'reply_to' in content:
+                    self.dm_replies[content['reply_to']].set_result(content)
+                elif self.sm.is_server and 'method' in content:
                     await self.handle_request(content)
-                except Exception:
-                    self.logger.warning(
-                        f"swap request {req_event_id[:10]} failed (likely "
-                        f"replay of an already-executed request) — skipped:\n"
-                        f"{traceback.format_exc()}")
-            else:
-                print('unknown message', content)
+                else:
+                    print('unknown message', content)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.error(f'error handling nostr DM {event.id}, continuing with next DM. '
+                                  f'payload (truncated): {str(content)[:256]}\n'
+                                  f'{traceback.format_exc()}')
+
+    def _remember_event(self, event) -> None:
+        """Persist the event id of a processed DM (value = created_at), so
+        replays after a restart are skipped instead of re-executed."""
+        cutoff = time.time() - self.NOSTR_EVENT_TIMEOUT
+        for stale_id, created_at in list(self.processed_event_ids.items()):
+            if created_at < cutoff:
+                self.processed_event_ids.pop(stale_id)
+        self.processed_event_ids[event.id] = event.created_at
+        self.sm.db.write()
 
     @log_exceptions
     async def handle_request(self, request):

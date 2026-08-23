@@ -241,7 +241,9 @@ class JsonDB:  # (Logger):
         #     await self.write_and_force_consolidation()
 
     def load_data(self, s: str) -> dict:
-        self.logger.debug(f"JsonDB: loading data: {s}")
+        # never log the db content: it contains claim privkeys and
+        # preimages in plaintext (issue #13) — size only
+        self.logger.debug(f"JsonDB: loading {len(s)} characters of data")
         if s == '':
             self.logger.debug('JsonDB: empty input string')
             return {}
