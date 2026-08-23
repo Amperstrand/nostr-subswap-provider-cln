@@ -44,10 +44,15 @@ class CLNChainWallet:
                                                 feerate=self.config.cln_feerate_str,
                                                 startweight=startweight,
                                                 minconf=None,
-                                                # reserve: DEFAULT — signpsbt REFUSES
-                                                # unreserved inputs; we sign+broadcast
-                                                # in this same call, reservation lives
-                                                # ~milliseconds.
+                                                # reserve=12 blocks (~6 min on mutinynet):
+                                                # signpsbt REFUSES unreserved inputs,
+                                                # but the DEFAULT 253-block reservation
+                                                # LEAKS on every abandoned ask — four
+                                                # dusty retries once froze 737k sat in
+                                                # reservations ("all 1 available UTXOs",
+                                                # earned live 2026-08-23). Short expiry
+                                                # self-heals; spend releases immediately.
+                                                reserve=12,
                                                 excess_as_change=True)
             except Exception as e:
                 # PluginLogger.error takes ONE arg (printf-style args crash
@@ -58,9 +63,15 @@ class CLNChainWallet:
             if excess_sat >= DUST_SAT or attempt == 3:
                 fundpsbt_response = resp
                 break
+            # release the dusty ask's reservation before re-asking, or the
+            # escalation starves the wallet one UTXO-granule per attempt
+            try:
+                self.rpc.unreserveinputs(resp['psbt'])
+            except Exception:
+                pass  # best-effort; reserve=12 bounds any leak
             self.logger.info(f"fundpsbt excess {excess_sat} sat < dust "
-                             f"({DUST_SAT}) — escalating ask ({ask_sat} -> "
-                             f"{ask_sat + 2500})")
+                             f"({DUST_SAT}) — unreserved + escalating ask "
+                             f"({ask_sat} -> {ask_sat + 2500})")
         raw_inputs_only_psbt = fundpsbt_response['psbt']
 
         # add outputs to inputs_only_psbt
