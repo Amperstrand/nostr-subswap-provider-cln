@@ -221,19 +221,38 @@ class SwapManager:
         self.taskgroup = OldTaskGroup()
 
         self.swaps = self.db.get_dict('submarine_swaps')  # type: Dict[str, SwapData]
+        # issues #18/#22 (audit F04/F21): damaged swap state is never
+        # silently deleted at startup — it is MOVED here (reason + full
+        # record persisted, ERROR-logged) and left unprocessed
+        self.quarantined_swaps = self.db.get_dict('quarantined_swaps')
         self._swaps_by_funding_outpoint = {}  # type: Dict[TxOutpoint, SwapData]
         self._swaps_by_lockup_address = {}  # type: Dict[str, SwapData]
         for payment_hash_hex in list(self.swaps.keys()):
             swap = self.swaps[payment_hash_hex]
-            payment_hash = bytes.fromhex(payment_hash_hex)
             swap._payment_hash = payment_hash_hex
+            # issue #22 (audit F21): refuse-loudly load integrity — a
+            # record missing the key material for its direction can
+            # never be refunded or claimed; quarantine, never process
+            reasons = self._swap_integrity_errors(payment_hash_hex, swap)
+            if not reasons and not swap.is_reverse and not swap.is_redeemed:
+                if self.lnworker.get_hold_invoice(payment_hash_hex) is None:
+                    # issue #18 (audit F04): used to be a SILENT
+                    # self.swaps.pop() — persistent state deleted on an
+                    # inference, with a funded lockup losing both its
+                    # record and (via main_loop's re-add) its chain
+                    # watcher. Quarantine + ERROR instead; the payer
+                    # keeps CLN's HTLC timeouts, the operator keeps the
+                    # evidence.
+                    reasons = ['hold invoice missing at startup (expired, '
+                               'or hold_invoices section damaged — audit F04)']
+            if reasons:
+                self._quarantine_swap(payment_hash_hex, swap, reasons)
+                continue
+            payment_hash = bytes.fromhex(payment_hash_hex)
             self._add_or_reindex_swap(swap)
             if not swap.is_reverse and not swap.is_redeemed:
-                if self.lnworker.get_hold_invoice(payment_hash_hex) is not None:
-                    self.lnworker.register_hold_invoice_callback(payment_hash=payment_hash,
-                                                                 callback=self.hold_invoice_callback)
-                else:  # invoice doesn't exist anymore
-                    self.swaps.pop(payment_hash_hex)
+                self.lnworker.register_hold_invoice_callback(payment_hash=payment_hash,
+                                                             callback=self.hold_invoice_callback)
 
         self.prepayments = {}  # type: Dict[bytes, bytes] # fee_rhash -> rhash
         for k, swap in self.swaps.items():
@@ -252,7 +271,58 @@ class SwapManager:
         self._grace_hold_logged = set()
         self._grace_release_logged = set()
 
-    @log_exceptions
+    @staticmethod
+    def _swap_integrity_errors(payment_hash_hex: str, swap: SwapData) -> list:
+        """Issue #22 (audit F21) load-integrity: the key material the
+        claim/refund paths need. privkey + redeem_script are required in
+        BOTH directions (refund for forward, claim for reverse). preimage
+        is Optional by design in both — the client holds it for forwards,
+        it is extracted from the spending tx for reverses — but WHEN
+        present it must hash to the record's payment_hash (a mismatch
+        means fields from different records were merged)."""
+        errors = []
+        try:
+            payment_hash = bytes.fromhex(payment_hash_hex)
+            if len(payment_hash) != 32:
+                raise ValueError('not 32 bytes')
+        except ValueError:
+            errors.append('payment_hash key is not valid 32-byte hex')
+            payment_hash = None
+        for field in ('privkey', 'redeem_script'):
+            value = getattr(swap, field, None)
+            try:
+                raw = hex_to_bytes(value) if value else None
+                if not raw:
+                    raise ValueError('missing')
+                if field == 'privkey' and len(raw) != 32:
+                    raise ValueError(f'{len(raw)} bytes, need 32')
+            except (ValueError, TypeError):
+                errors.append(f'{field} missing/unparsable')
+        if swap.preimage and payment_hash is not None \
+                and sha256(hex_to_bytes(swap.preimage)) != payment_hash:
+            errors.append('preimage does not hash to payment_hash')
+        return errors
+
+    def _quarantine_swap(self, payment_hash_hex: str, swap: SwapData,
+                         reasons: list) -> None:
+        """Issues #18/#22 (audit F04/F21): startup refuse-loudly — the
+        damaged record is MOVED to the persisted 'quarantined_swaps' db
+        section (reason + full record), ERROR-logged with the payment
+        hash, and never processed (no chain watcher, no hold callback,
+        no payment). Restoring it is an explicit operator action."""
+        reason = '; '.join(reasons)
+        self.quarantined_swaps[payment_hash_hex] = {
+            'reason': reason,
+            'quarantined_at': now(),
+            'swap': swap.to_json(),
+        }
+        self.swaps.pop(payment_hash_hex, None)
+        self.logger.error(
+            f"quarantined swap {payment_hash_hex}: {reason} — record "
+            f"preserved in db section 'quarantined_swaps', will not be "
+            f"processed")
+        self.db.write()
+
     async def run_nostr_server(self):
         while True:
             try:
