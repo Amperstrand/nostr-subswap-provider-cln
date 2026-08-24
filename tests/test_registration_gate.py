@@ -79,10 +79,12 @@ def _manager_base(swap: SwapData) -> SwapManager:
 
 def _manager(swap: SwapData) -> SwapManager:
     sm = _manager_base(swap)
-    # default for the OLD tests: fully parked (they exercise the
+    # default for the OLD tests: payment settled (they exercise the
     # registration gate, not the ordering gate)
-    sm.lnworker.get_hold_invoice = MagicMock(return_value=SimpleNamespace(
-        received_amount_sat=swap.lightning_amount))
+    sm.lnworker.get_invoice = MagicMock(
+        return_value=SimpleNamespace(lightning_invoice="lntbs-x"))
+    sm.lnworker._rpc = MagicMock()
+    sm.lnworker._rpc.listpays = MagicMock(return_value={"status": "complete"})
     return sm
 
 
@@ -141,29 +143,49 @@ class TestParkBeforeClaim:
         swap.registered = True
         return swap
 
-    def _manager(self, swap, parked_msat=0, invoice_msat=20_000_000):
+    def _manager(self, swap, listpays_status=None, with_invoice=True):
+        # payer-side truth (live-earned): the hold lives at the CLIENT;
+        # the server's signal is listpays on the saved bolt11 —
+        # 'pending' = HTLCs committed/parked at the receiver
         sm = _manager_base(swap)
-        # lnworker.get_payment_info returns the payment's received amount
-        # (parked parts); None when the payment was never attempted
-        info = None if parked_msat is None else SimpleNamespace(
-            amount_msat=invoice_msat)
-        sm.lnworker.get_payment_info = MagicMock(return_value=info)
-        # listholdinvoices-style hold state via the lnworker stub
-        sm.lnworker.get_hold_invoice = MagicMock(return_value=SimpleNamespace(
-            received_amount_sat=parked_msat // 1000))
+        invoice = SimpleNamespace(lightning_invoice="lntbs-x") if with_invoice else None
+        sm.lnworker.get_invoice = MagicMock(return_value=invoice)
+        sm.lnworker._rpc = MagicMock()
+        sm.lnworker._rpc.listpays = MagicMock(
+            return_value={"status": listpays_status} if listpays_status else {})
         return sm
 
     def test_claim_gated_when_nothing_parked(self):
         swap = self._d2_registered_swap()
-        sm = self._manager(swap, parked_msat=0)
+        # payment never started: no listpays entry at all
+        sm = self._manager(swap, listpays_status=None)
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_not_called()
 
-    def test_claim_fires_once_fully_parked(self):
+    def test_claim_gated_when_payment_never_attempted_no_invoice(self):
         swap = self._d2_registered_swap()
-        sm = self._manager(swap, parked_msat=20_000_000)
+        sm = self._manager(swap, with_invoice=False)
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_not_called()
+
+    def test_claim_fires_once_parked_pending(self):
+        swap = self._d2_registered_swap()
+        sm = self._manager(swap, listpays_status="pending")
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_called_once()
+
+    def test_claim_fires_once_settled_complete(self):
+        swap = self._d2_registered_swap()
+        sm = self._manager(swap, listpays_status="complete")
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_called_once()
+
+    def test_claim_deferred_on_listpays_error_fail_closed(self):
+        swap = self._d2_registered_swap()
+        sm = self._manager(swap, listpays_status="pending")
+        sm.lnworker._rpc.listpays = MagicMock(side_effect=RuntimeError("rpc down"))
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_not_called()
 
     def test_gate_reads_the_parking_state(self):
         # source contract: the d2 branch must consult the hold's

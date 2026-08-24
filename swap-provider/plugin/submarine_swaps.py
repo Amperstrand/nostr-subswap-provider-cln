@@ -416,24 +416,28 @@ class SwapManager:
         self.db.write()
 
     def _payment_parked(self, swap: SwapData) -> bool:
-        """True when our payment of the client's hold has fully parked
-        (received >= lightning amount) or already settled — the #26
-        ordering gate signal. Parking is observable: the hold's received
-        amount reaches the invoice amount (electrum) / the hold plugin
-        reports received==amount; xpay-209 'reached destination' on a
-        hold is the payer-side view of the same fact."""
+        """True when OUR payment of the client's hold has committed
+        HTLCs parked at the receiver — the #26 ordering gate signal.
+
+        PAYER-SIDE TRUTH (live-earned 2026-08-24, jitlab): the hold
+        invoice lives at the CLIENT — the server can never query its
+        received amount (the first implementation did exactly that and
+        deferred a swap whose parking was already complete). The correct
+        signal is our own listpays status: 'pending' = HTLCs committed
+        and parked at the receiver (xpay-209 'reached destination'
+        semantics); 'complete' = settled. No invoice / no entry =
+        payment never started — defer (fail closed; the pay loop's
+        attempt cap + CLTV bound the wait)."""
         try:
-            hold = self.lnworker.get_hold_invoice(swap.payment_hash)
-            received = getattr(hold, 'received_amount_sat', None)
-            if received is None and isinstance(hold, dict):
-                received = hold.get('received_amount_sat', 0)
-            return int(received or 0) >= swap.lightning_amount
+            invoice = self.lnworker.get_invoice(swap.payment_hash)
+            bolt11 = getattr(invoice, 'lightning_invoice', None) if invoice else None
+            if not bolt11:
+                return False
+            pays = self.lnworker._rpc.listpays(bolt11=bolt11)
+            status = pays.get('status') if isinstance(pays, dict) else None
+            return status in ('pending', 'complete')
         except Exception:
-            # no hold visible (settled+deleted, or wallet restarted and
-            # the hold lookup path differs) — treat as parked: never let
-            # an observability gap block a claim forever (the CLTV
-            # bounds the wait and the refund branch protects the client)
-            return True
+            return False
 
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
