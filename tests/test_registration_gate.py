@@ -80,11 +80,10 @@ def _manager_base(swap: SwapData) -> SwapManager:
 def _manager(swap: SwapData) -> SwapManager:
     sm = _manager_base(swap)
     # default for the OLD tests: payment settled (they exercise the
-    # registration gate, not the ordering gate)
-    sm.lnworker.get_invoice = MagicMock(
-        return_value=SimpleNamespace(lightning_invoice="lntbs-x"))
+    # registration gate, not the ordering gate) — proven live shape
     sm.lnworker._rpc = MagicMock()
-    sm.lnworker._rpc.listpays = MagicMock(return_value={"status": "complete"})
+    sm.lnworker._rpc.listpays = MagicMock(
+        return_value={"pays": [{"status": "complete"}]})
     return sm
 
 
@@ -148,11 +147,11 @@ class TestParkBeforeClaim:
         # the server's signal is listpays on the saved bolt11 —
         # 'pending' = HTLCs committed/parked at the receiver
         sm = _manager_base(swap)
-        invoice = SimpleNamespace(lightning_invoice="lntbs-x") if with_invoice else None
-        sm.lnworker.get_invoice = MagicMock(return_value=invoice)
         sm.lnworker._rpc = MagicMock()
+        # the PROVEN live shape: listpays(payment_hash=…) → {'pays':[…]}
         sm.lnworker._rpc.listpays = MagicMock(
-            return_value={"status": listpays_status} if listpays_status else {})
+            return_value={"pays": [{"status": listpays_status}]}
+            if listpays_status else {"pays": []})
         return sm
 
     def test_claim_gated_when_nothing_parked(self):
@@ -162,9 +161,10 @@ class TestParkBeforeClaim:
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_not_called()
 
-    def test_claim_gated_when_payment_never_attempted_no_invoice(self):
+    def test_claim_gated_on_empty_pays_list(self):
+        # live shape: {'pays': []} — payment never started
         swap = self._d2_registered_swap()
-        sm = self._manager(swap, with_invoice=False)
+        sm = self._manager(swap, listpays_status=None)
         asyncio.run(sm._claim_swap(swap))
         sm._create_and_sign_claim_tx.assert_not_called()
 

@@ -419,23 +419,24 @@ class SwapManager:
         """True when OUR payment of the client's hold has committed
         HTLCs parked at the receiver — the #26 ordering gate signal.
 
-        PAYER-SIDE TRUTH (live-earned 2026-08-24, jitlab): the hold
-        invoice lives at the CLIENT — the server can never query its
-        received amount (the first implementation did exactly that and
-        deferred a swap whose parking was already complete). The correct
-        signal is our own listpays status: 'pending' = HTLCs committed
-        and parked at the receiver (xpay-209 'reached destination'
-        semantics); 'complete' = settled. No invoice / no entry =
-        payment never started — defer (fail closed; the pay loop's
-        attempt cap + CLTV bound the wait)."""
+        PAYER-SIDE TRUTH (live-earned 2026-08-24, jitlab, twice): the
+        hold invoice lives at the CLIENT — the server can never query
+        its received amount (implementation #1), and a bolt11-keyed
+        listpays returns {'pays': [...]} whose unwrapped status is None
+        (implementation #2 — deferred a parked swap for exactly this).
+        The PROVEN query is listpays(payment_hash=...): entries with
+        status 'pending' = HTLCs committed and parked at the receiver
+        (xpay-209 'reached destination' semantics), 'complete' =
+        settled. No entry = payment never started — defer (fail
+        closed; the pay loop's attempt cap + CLTV bound the wait)."""
         try:
-            invoice = self.lnworker.get_invoice(swap.payment_hash)
-            bolt11 = getattr(invoice, 'lightning_invoice', None) if invoice else None
-            if not bolt11:
-                return False
-            pays = self.lnworker._rpc.listpays(bolt11=bolt11)
-            status = pays.get('status') if isinstance(pays, dict) else None
-            return status in ('pending', 'complete')
+            out = self.lnworker._rpc.listpays(
+                payment_hash=swap.payment_hash.hex())
+            entries = out.get('pays', out) if isinstance(out, dict) else []
+            if isinstance(entries, dict):
+                entries = [entries]
+            return any(p.get('status') in ('pending', 'complete')
+                       for p in entries)
         except Exception:
             return False
 
