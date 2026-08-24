@@ -10,7 +10,7 @@ from .lnutil import hex_to_bytes, bytes_to_hex
 from .json_db import StoredObject
 from .cln_logger import PluginLogger
 from . import constants
-from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT
+from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT, INVOICE_EXPIRY_SECONDS_DEFAULT
 
 
 class PluginConfig:
@@ -29,6 +29,9 @@ class PluginConfig:
         self.confirmation_speed_target_blocks: int = 10
         self.fallback_fee_sat_per_vb:int = 60
         self.sweep_grace_blocks: int = SWEEP_GRACE_BLOCKS_DEFAULT
+        self.funding_gate_timeout_blocks: int = FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT
+        self.funding_gate_on_timeout: str = "fail"
+        self.invoice_expiry_seconds: int = INVOICE_EXPIRY_SECONDS_DEFAULT
         self.logger = logger  # PluginLogger("swap-provider", plugin, level="DEBUG")
 
     @classmethod
@@ -177,6 +180,40 @@ class PluginConfig:
             config.logger.warning(f"No SWEEP_GRACE_BLOCKS set in env. "
                                   f"Using default of {config.sweep_grace_blocks}")
 
+        # issue #24 option E (FUNDING-GATE-COMPAT-MEMO, operator-adopted):
+        # the #12 funding gate parks a d2 invoice at addswapinvoice until
+        # the lockup is observed (mempool counts — the watch loop rechecks
+        # sub-block). M bounds that parking; at M with no lockup the swap
+        # fails ("fail") or the invoice is paid anyway ("pay", bounded jam
+        # exposure). Memo recommendation: fail, M=30 (=300s on signet's
+        # ~10s blocks, matching the client invoice expiry of #25).
+        if m_blocks := os.getenv("FUNDING_GATE_TIMEOUT_BLOCKS"):
+            m_blocks = int(m_blocks.strip())
+            if not 1 <= m_blocks <= 100_000:
+                raise Exception("FUNDING_GATE_TIMEOUT_BLOCKS is out of allowed range [1;100000]")
+            config.funding_gate_timeout_blocks = m_blocks
+        else:
+            config.logger.warning(f"No FUNDING_GATE_TIMEOUT_BLOCKS set in env. "
+                                  f"Using default of {config.funding_gate_timeout_blocks} (memo option E)")
+        if gate_behavior := os.getenv("FUNDING_GATE_ON_TIMEOUT_BEHAVIOR"):
+            gate_behavior = gate_behavior.strip().lower()
+            if gate_behavior not in ("fail", "pay"):
+                raise Exception(f"FUNDING_GATE_ON_TIMEOUT_BEHAVIOR must be fail|pay, got '{gate_behavior}'")
+            config.funding_gate_on_timeout = gate_behavior
+        else:
+            config.logger.warning(f"No FUNDING_GATE_ON_TIMEOUT_BEHAVIOR set in env. "
+                                  f"Using default of '{config.funding_gate_on_timeout}' (memo recommendation)")
+        # memo option F: d1 hold+prepay invoice expiry (client fork
+        # hardcodes 300; extending gives M more room before expiry)
+        if expiry_s := os.getenv("INVOICE_EXPIRY_SECONDS"):
+            expiry_s = int(expiry_s.strip())
+            if not 30 <= expiry_s <= 604_800:
+                raise Exception("INVOICE_EXPIRY_SECONDS is out of allowed range [30;604800]")
+            config.invoice_expiry_seconds = expiry_s
+        else:
+            config.logger.warning(f"No INVOICE_EXPIRY_SECONDS set in env. "
+                                  f"Using default of {config.invoice_expiry_seconds}")
+
         if log_level := os.getenv("PLUGIN_LOG_LEVEL"):
             config.logger.change_level(log_level.strip())
 
@@ -216,7 +253,10 @@ class PluginConfig:
                f"swapserver_fee_millionths={self.swapserver_fee_millionths}, " \
                f"confirmation_speed_target_blocks={self.confirmation_speed_target_blocks}, " \
                f"fallback_fee_sat_per_vb={self.fallback_fee_sat_per_vb}, " \
-               f"sweep_grace_blocks={self.sweep_grace_blocks})"
+               f"sweep_grace_blocks={self.sweep_grace_blocks}, " \
+               f"funding_gate_timeout_blocks={self.funding_gate_timeout_blocks}, " \
+               f"funding_gate_on_timeout={self.funding_gate_on_timeout}, " \
+               f"invoice_expiry_seconds={self.invoice_expiry_seconds})"
 
 
 @attr.s
