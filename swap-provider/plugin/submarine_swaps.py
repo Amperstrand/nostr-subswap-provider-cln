@@ -92,7 +92,8 @@ from . import constants
 from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_DELTA,
                         MIN_FINAL_CLTV_DELTA_FOR_CLIENT, CLAIM_FEE_SIZE, LOCKUP_FEE_SIZE,
                         MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE,
-                        PAYMENT_INFLIGHT_LOCK)
+                        PAYMENT_INFLIGHT_LOCK, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT,
+                        FUNDING_GATE_POLL_SECONDS, INVOICE_EXPIRY_SECONDS_DEFAULT)
 # CLN-bound collaborators are import-time-free so the protocol/wire logic
 # (swap scripts, offers, fee math) stays testable without a node — the
 # cln_* classes only appear in annotations; InvoiceNotFoundError is
@@ -267,6 +268,12 @@ class SwapManager:
         # onchain (issue #12); memory-only like invoices_to_pay — clients
         # re-send addswapinvoice after a restart
         self.invoices_awaiting_funding = set()
+        # issue #24 option E: absolute block height at which a parked
+        # invoice's M-block funding-gate window ends (anchored on the
+        # first watch pass at/after addswapinvoice; None-pending values
+        # are resolved there). Memory-only, same restart contract as
+        # invoices_awaiting_funding.
+        self._funding_gate_deadline = {}  # type: Dict[str, Optional[int]]
         # issue #10: swap ids that already produced their grace-hold /
         # grace-release log line (log-once discipline); memory-only
         self._grace_hold_logged = set()
@@ -451,6 +458,7 @@ class SwapManager:
         tasks = [
                     self.lnwatcher.trigger_callbacks(),  # trigger all callbacks once
                     self.pay_pending_ln_invoices(),
+                    self.funding_gate_watch_loop(),
                     self.run_nostr_server()
                 ]
 
@@ -589,6 +597,7 @@ class SwapManager:
             self.lnworker.delete_invoice(swap.payment_hash, False)
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
+        self._funding_gate_deadline.pop(swap.payment_hash.hex(), None)
         if swap.funding_txid is None or swap.is_redeemed:
             # issue #22 (audit F23): only a swap that leaves the record
             # store drops its chain watch. While our funding is live
@@ -622,6 +631,7 @@ class SwapManager:
         self.lnwatcher.remove_callback(swap.lockup_address)
         self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
+        self._funding_gate_deadline.pop(swap.payment_hash.hex(), None)
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
@@ -644,6 +654,94 @@ class SwapManager:
         # in-flight attempts; 'failed' is permanently failed before flight
         statuses = self.lnworker.get_payment_statuses(key)
         return any(s in ('pending', 'inflight', 'complete') for s in statuses)
+
+    def _funding_gate_m(self) -> int:
+        # getattr-with-default keeps SimpleNamespace config fakes working
+        # (same pattern as max_swap_amount in server_update_pairs)
+        return int(getattr(self.config, 'funding_gate_timeout_blocks',
+                           FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT))
+
+    def _funding_gate_on_timeout(self) -> str:
+        return str(getattr(self.config, 'funding_gate_on_timeout', 'fail')).strip().lower()
+
+    async def funding_gate_watch_loop(self):
+        """issue #24 option E (FUNDING-GATE-COMPAT-MEMO, operator-adopted):
+        sub-block re-check of every invoice parked by the #12 funding
+        gate. This is the memo's mempool-scripthash subscription realized
+        on the bitcoind watch-wallet (get_addr_outputs is minconf=0, so a
+        lockup sitting in mempool is already visible there — only the
+        TRIGGER was block-bound before). Per pass: the bounded M-block
+        timer runs (expiry-first, then fail-or-pay), and any still-parked
+        swap gets a direct _claim_swap call so a mempool lockup discharges
+        the gate and queues the payment without waiting for a block.
+        Failure of a pass degrades to the block-boundary behavior of the
+        ChainMonitor (memo rationale 5: slower but functional) — logged
+        ERROR + tracker streak, never a death."""
+        while True:
+            await asyncio.sleep(FUNDING_GATE_POLL_SECONDS)
+            tracker.beat('funding-gate-watcher',
+                         detail=f'{len(self.invoices_awaiting_funding)} parked')
+            if not self.invoices_awaiting_funding:
+                continue
+            try:
+                await self._funding_gate_watch_pass()
+            except Exception:
+                self.logger.error(f'funding-gate watch pass failed (degraded to '
+                                  f'block-boundary triggers):\n{traceback.format_exc()}')
+                tracker.note_error('funding-gate-watcher', detail='pass failed')
+
+    async def _funding_gate_watch_pass(self):
+        current_height = await self.wallet.get_local_height()
+        for key in list(self.invoices_awaiting_funding):
+            swap = self.swaps.get(key)
+            if swap is None:
+                # already failed/finished elsewhere — drop the bookkeeping
+                self.invoices_awaiting_funding.discard(key)
+                self._funding_gate_deadline.pop(key, None)
+                continue
+            self._evaluate_funding_gate(swap, current_height)
+            if key in self.invoices_awaiting_funding:
+                # still parked: run the standard claim path so a mempool
+                # lockup discharges the gate immediately (the payment
+                # queues without waiting for a confirmation; the claim
+                # broadcast itself stays >=1-conf gated, R1)
+                await self._claim_swap(swap)
+
+    def _evaluate_funding_gate(self, swap: SwapData, current_height: int) -> None:
+        """The memo's bounded outcome for a parked invoice, in order:
+        (1) a client invoice that already died fails as expired the
+        moment we notice it — BEFORE any M timeout can fire (#25
+        ordering: expiry wins); (2) at exactly M blocks past the
+        addswapinvoice anchoring pass, fail (default) or pay per
+        FUNDING_GATE_ON_TIMEOUT_BEHAVIOR."""
+        key = swap.payment_hash.hex()
+        if key not in self.invoices_awaiting_funding:
+            return
+        invoice = self.lnworker.get_invoice(key)
+        if invoice is not None and invoice.has_expired():
+            return self._fail_swap(
+                swap, 'reverse swap invoice expired while awaiting lockup '
+                      '(funding gate, #25 expiry-before-timeout ordering)')
+        deadline = self._funding_gate_deadline.get(key)
+        if deadline is None:
+            self._funding_gate_deadline[key] = current_height + self._funding_gate_m()
+            return
+        if current_height < deadline:
+            return
+        if self._funding_gate_on_timeout() == 'pay':
+            self.invoices_awaiting_funding.discard(key)
+            self._funding_gate_deadline.pop(key, None)
+            self.logger.warning(
+                f'funding gate timeout for swap {key}: paying anyway '
+                f'(FUNDING_GATE_ON_TIMEOUT_BEHAVIOR=pay — bounded jam '
+                f'exposure of {self._funding_gate_m()} blocks per swap)')
+            self.invoices_to_pay[key] = 0
+        else:
+            self._fail_swap(
+                swap, f'funding gate timeout: no lockup observed '
+                      f'{self._funding_gate_m()} blocks after addswapinvoice '
+                      f'(issue #24 option E; a stock hold-invoice client that '
+                      f'never saw our HTLC can retry with a new swap)')
 
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
@@ -671,6 +769,12 @@ class SwapManager:
             txin = None
             # if it is a normal swap, we might have double spent the funding tx
             # in that case we need to fail the HTLCs
+            if swap.is_reverse:
+                # issue #24 option E degraded mode: the block tick also
+                # drives the bounded gate, so a dead funding-gate watcher
+                # (or a bitcoind RPC outage during its passes) still
+                # bounds the parking window — just at block cadence
+                self._evaluate_funding_gate(swap, current_height)
             if remaining_time <= 0:
                 return self._fail_swap(swap, 'expired')
 
@@ -770,6 +874,7 @@ class SwapManager:
                 key = swap.payment_hash.hex()
                 if key in self.invoices_awaiting_funding:
                     self.invoices_awaiting_funding.discard(key)
+                    self._funding_gate_deadline.pop(key, None)
                     self.logger.info(f'lockup funded for swap {key}, queueing invoice payment')
                     self.invoices_to_pay[key] = 0
                 # issue #10: a lockup whose LN leg was never committed to
@@ -956,11 +1061,16 @@ class SwapManager:
         else:
             invoice_amount_sat = lightning_amount_sat
 
+        # issue #24 option E / memo option F: INVOICE_EXPIRY_SECONDS,
+        # default 300 = the electrum client's hardcoded exp_delay
+        expiry_s = int(getattr(self.config, 'invoice_expiry_seconds',
+                               INVOICE_EXPIRY_SECONDS_DEFAULT))
+
         invoice = self.lnworker.b11invoice_from_hash(
             payment_hash=payment_hash,
             amount_msat=invoice_amount_sat * 1000,
             message='Submarine swap',
-            expiry=300,
+            expiry=expiry_s,
             fallback_address=None,
             min_final_cltv_expiry_delta=min_final_cltv_expiry_delta,
         )
@@ -971,7 +1081,7 @@ class SwapManager:
                 payment_hash=prepay_hash,
                 amount_msat=prepay_amount_sat * 1000,
                 message='Submarine swap mining fees',
-                expiry=300,
+                expiry=expiry_s,
                 fallback_address=None,
                 min_final_cltv_expiry_delta=min_final_cltv_expiry_delta,
             )
@@ -1132,7 +1242,12 @@ class SwapManager:
         # output for the lockup has been observed onchain (mempool or
         # confirmed). This waits for honest clients that send the invoice
         # before funding, instead of rejecting them.
+        # issue #24 option E: the parking is bounded — M blocks after
+        # this registration (FUNDING_GATE_TIMEOUT_BLOCKS) the gate ends
+        # in fail (default) or pay (FUNDING_GATE_ON_TIMEOUT_BEHAVIOR);
+        # a re-sent addswapinvoice restarts the window.
         self.invoices_awaiting_funding.add(key)
+        self._funding_gate_deadline[key] = None
         return {}
 
     def create_funding_tx(

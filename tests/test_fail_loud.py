@@ -62,6 +62,7 @@ def _sm(**attrs) -> SwapManager:
     sm.swaps = {}
     sm.invoices_to_pay = {}
     sm.invoices_awaiting_funding = set()
+    sm._funding_gate_deadline = {}
     sm._grace_hold_logged = set()
     sm._grace_release_logged = set()
     sm._swaps_by_funding_outpoint = {}
