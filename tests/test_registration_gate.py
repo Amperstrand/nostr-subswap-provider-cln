@@ -39,7 +39,7 @@ def _d2_swap(registered: bool = False) -> SwapData:
     return swap
 
 
-def _manager(swap: SwapData) -> SwapManager:
+def _manager_base(swap: SwapData) -> SwapManager:
     sm = SwapManager.__new__(SwapManager)
     sm.logger = MagicMock()
     sm.swaps = {swap._payment_hash: swap}
@@ -74,6 +74,15 @@ def _manager(swap: SwapData) -> SwapManager:
     sm.lnwatcher.get_tx_height = AsyncMock(
         return_value=SimpleNamespace(conf=1))          # lockup CONFIRMED
     sm.lnworker = MagicMock()
+    return sm
+
+
+def _manager(swap: SwapData) -> SwapManager:
+    sm = _manager_base(swap)
+    # default for the OLD tests: fully parked (they exercise the
+    # registration gate, not the ordering gate)
+    sm.lnworker.get_hold_invoice = MagicMock(return_value=SimpleNamespace(
+        received_amount_sat=swap.lightning_amount))
     return sm
 
 
@@ -117,3 +126,48 @@ class TestNostrLoopRobustness:
             r"isinstance\(content, dict\)[^\n]*\n\s*continue", src), (
             "check_direct_messages must skip non-dict payloads before "
             "any content['…'] access")
+
+
+class TestParkBeforeClaim:
+    """Issue #26: claim-vs-payment ordering — the d2 claim must not fire
+    until OUR payment of the client's hold has parked (or settled).
+    Current order has a client-loss corner: payment fails permanently
+    AFTER the claim ⇒ client holds an unfillable hold while we took
+    their lockup. Park-then-claim eliminates the corner on both sides
+    (client refunds at CLTV; our HTLCs fail back)."""
+
+    def _d2_registered_swap(self) -> SwapData:
+        swap = _d2_swap()
+        swap.registered = True
+        return swap
+
+    def _manager(self, swap, parked_msat=0, invoice_msat=20_000_000):
+        sm = _manager_base(swap)
+        # lnworker.get_payment_info returns the payment's received amount
+        # (parked parts); None when the payment was never attempted
+        info = None if parked_msat is None else SimpleNamespace(
+            amount_msat=invoice_msat)
+        sm.lnworker.get_payment_info = MagicMock(return_value=info)
+        # listholdinvoices-style hold state via the lnworker stub
+        sm.lnworker.get_hold_invoice = MagicMock(return_value=SimpleNamespace(
+            received_amount_sat=parked_msat // 1000))
+        return sm
+
+    def test_claim_gated_when_nothing_parked(self):
+        swap = self._d2_registered_swap()
+        sm = self._manager(swap, parked_msat=0)
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_not_called()
+
+    def test_claim_fires_once_fully_parked(self):
+        swap = self._d2_registered_swap()
+        sm = self._manager(swap, parked_msat=20_000_000)
+        asyncio.run(sm._claim_swap(swap))
+        sm._create_and_sign_claim_tx.assert_called_once()
+
+    def test_gate_reads_the_parking_state(self):
+        # source contract: the d2 branch must consult the hold's
+        # received amount before the claim fall-through
+        src = (_plugin / "submarine_swaps.py").read_text()
+        assert re.search(r"parked", src), (
+            "_claim_swap's d2 branch must gate on parking (received >= amount)")

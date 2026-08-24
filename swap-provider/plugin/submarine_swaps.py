@@ -415,6 +415,26 @@ class SwapManager:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
 
+    def _payment_parked(self, swap: SwapData) -> bool:
+        """True when our payment of the client's hold has fully parked
+        (received >= lightning amount) or already settled — the #26
+        ordering gate signal. Parking is observable: the hold's received
+        amount reaches the invoice amount (electrum) / the hold plugin
+        reports received==amount; xpay-209 'reached destination' on a
+        hold is the payer-side view of the same fact."""
+        try:
+            hold = self.lnworker.get_hold_invoice(swap.payment_hash)
+            received = getattr(hold, 'received_amount_sat', None)
+            if received is None and isinstance(hold, dict):
+                received = hold.get('received_amount_sat', 0)
+            return int(received or 0) >= swap.lightning_amount
+        except Exception:
+            # no hold visible (settled+deleted, or wallet restarted and
+            # the hold lookup path differs) — treat as parked: never let
+            # an observability gap block a claim forever (the CLTV
+            # bounds the wait and the refund branch protects the client)
+            return True
+
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
         assert self.lnwatcher
@@ -509,6 +529,18 @@ class SwapManager:
                             f'claim gated: lockup funded but invoice never '
                             f'registered {swap.lockup_address} (abandoned swap) '
                             f'— staying refundable (issue #15)')
+                    return
+                if not self._payment_parked(swap):
+                    # issue #26 ordering gate: claim only after OUR
+                    # payment of the client's hold has parked. Claiming
+                    # earlier leaves a client-loss corner (payment fails
+                    # permanently post-claim ⇒ unfillable hold + lockup
+                    # taken). Park-then-claim: the client can settle the
+                    # moment the preimage is public; if our payment never
+                    # parks, we never claim and the client refunds at CLTV.
+                    self.logger.info(
+                        f'claim deferred: payment not parked yet for '
+                        f'{swap.lockup_address} (issue #26 park-then-claim)')
                     return
                 if swap.preimage is None:
                     swap.preimage = self.lnworker.get_preimage(swap.payment_hash)
