@@ -152,8 +152,8 @@ def test_swaps_lib_reproduces_real_signet_scripts():
     fix = json.loads(FIXTURES.read_text())
     cases = [(s["request"], s["redeemScript"], "reversesubmarine")
              for s in fix["direction1_reverse_swaps"]]
-    d2 = fix["direction2_submarine_swap"]
-    cases.append((d2["request"], d2["redeemScript"], "submarine"))
+    onchain_to_ln = fix["direction2_submarine_swap"]
+    cases.append((onchain_to_ln["request"], onchain_to_ln["redeemScript"], "submarine"))
     for request, redeem_hex, direction in cases:
         parsed = swaps_lib.parse_swap_script(redeem_hex)
         if direction == "reversesubmarine":
@@ -161,9 +161,9 @@ def test_swaps_lib_reproduces_real_signet_scripts():
         else:
             assert parsed["refund_pubkey"] == request["refundPublicKey"]
             assert parsed["preimage_hash_ripemd"] == swaps_lib.ripemd160(
-                bytes.fromhex(d2["preimageHash"])).hex()  # F10: plain ripemd160
+                bytes.fromhex(onchain_to_ln["preimageHash"])).hex()  # F10: plain ripemd160
         rebuilt = swaps_lib.build_swap_script(
-            d2["preimageHash"] if direction == "submarine"
+            onchain_to_ln["preimageHash"] if direction == "submarine"
             else next(s["request"]["preimageHash"] for s in
                       fix["direction1_reverse_swaps"] if s["redeemScript"] == redeem_hex),
             parsed["claim_pubkey"], parsed["refund_pubkey"],

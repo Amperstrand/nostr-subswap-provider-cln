@@ -26,7 +26,7 @@ class CLNChainWallet:
         # excess_as_change=true and an exact-satoshi ask, CLN selects
         # inputs so excess lands at dust and DROPS the change output ->
         # 'tx needs to have at least 1 output' on a HEALTHY wallet
-        # (earned: 277k free, excess_msat=0, every d1 funding failed)
+        # (earned: 277k free, excess_msat=0, every ln_to_onchain funding failed)
         # CHANGE-SLACK ESCALATION: CLN's minimal coin selection returns
         # excess_msat as low as 0 REGARDLESS of the ask (excess depends on
         # UTXO granularity, not the satoshi parameter) — a 0-value change

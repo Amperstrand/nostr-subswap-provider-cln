@@ -84,7 +84,7 @@ if bytes.fromhex(swap.redeem_script) != redeem_script:
 ```
 Electrum `submarine_swaps.py:994-998` re-derives with `refund_pubkey=their_pubkey,
 claim_pubkey=our_pubkey` and asserts equality. Slot 7=claim=OURS, 13=refund=THEIRS —
-**the inverse of `create_normal_swap` (S-2), which is exactly what the d1-inverted
+**the inverse of `create_normal_swap` (S-2), which is exactly what the ln_to_onchain-inverted
 historical bug got wrong; the current code is correct.** Both port gotchas are
 handled: `swap.privkey` hex→bytes before `ECPrivkey` (comment documents the
 `803bbbe` bite) and `bytes.fromhex(swap.redeem_script)` before comparison (comment

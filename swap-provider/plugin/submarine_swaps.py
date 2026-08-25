@@ -158,7 +158,7 @@ class SwapData(StoredObject):
     funding_txid = attr.ib(type=Optional[str])
     spending_txid = attr.ib(type=Optional[str])
     is_redeemed = attr.ib(type=bool)
-    # issue #15: a d2 lockup may only be claimed after the client's
+    # issue #15: an onchain_to_ln lockup may only be claimed after the client's
     # addswapinvoice REGISTRATION — an abandoned swap (funded, never
     # registered) must stay refundable to the client's key at CLTV.
     # Persisted with the swap, so the gate survives restarts.
@@ -303,7 +303,7 @@ class SwapManager:
 
     async def pay_pending_ln_invoice(self, key):
         self.logger.debug(f'trying to pay invoice {key}')
-        # attempt cap: an unpayable invoice (e.g. d2 bind whose hints the
+        # attempt cap: an unpayable invoice (e.g. onchain_to_ln bind whose hints the
         # payer can't route — alias-scid mismatch) must not retry forever.
         # Earned live: one invoice retried every 60s for 2.5h+, spamming
         # logs and pinning the swap. 15 attempts then fail the swap.
@@ -880,9 +880,9 @@ class SwapManager:
             raise RequestFieldError('swap already in flight')
         # re-derive the redeem script: their_pubkey must reproduce
         # phase-1's script or the refund path silently mis-binds.
-        # Role order for d2 (create_reverse_swap): slot 7 = CLAIM key =
+        # Role order for onchain_to_ln (create_reverse_swap): slot 7 = CLAIM key =
         # OURS (server claims with preimage), slot 13 = REFUND key =
-        # THEIRS. The d1 order (create_normal_swap) is the inverse —
+        # THEIRS. The ln_to_onchain order (create_normal_swap) is the inverse —
         # copying it here rejected every legit bind (earned live; the
         # direction-inversion trap the AGENTS terminology table warns of).
         # SwapData.privkey is HEX in this port (see sign_tx) — ECPrivkey

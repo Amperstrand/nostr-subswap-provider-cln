@@ -27,7 +27,7 @@ from plugin.submarine_swaps import SwapManager, SwapData  # noqa: E402
 
 
 def _d2_swap(registered: bool = False) -> SwapData:
-    # d2 on the server = "reverse for server" = is_reverse=True
+    # onchain_to_ln on the server = "reverse for server" = is_reverse=True
     # (server_create_normal_swap → create_reverse_swap)
     swap = SwapData(
         is_reverse=True, locktime=5000, onchain_amount=21181,
@@ -109,11 +109,11 @@ class TestRegistrationGate:
             "server_add_swap_invoice must set swap.registered = True")
 
     def test_gate_reads_the_registered_flag(self):
-        # source contract: _claim_swap's reverse (d2) branch must gate
+        # source contract: _claim_swap's reverse (onchain_to_ln) branch must gate
         # on swap.registered before the claim fall-through
         src = (_plugin / "submarine_swaps.py").read_text()
         assert re.search(r"if not .*registered", src), (
-            "_claim_swap must gate the d2 claim on swap.registered")
+            "_claim_swap must gate the onchain_to_ln claim on swap.registered")
 
 
 class TestNostrLoopRobustness:
@@ -130,7 +130,7 @@ class TestNostrLoopRobustness:
 
 
 class TestParkBeforeClaim:
-    """Issue #26: claim-vs-payment ordering — the d2 claim must not fire
+    """Issue #26: claim-vs-payment ordering — the onchain_to_ln claim must not fire
     until OUR payment of the client's hold has parked (or settled).
     Current order has a client-loss corner: payment fails permanently
     AFTER the claim ⇒ client holds an unfillable hold while we took
@@ -188,8 +188,8 @@ class TestParkBeforeClaim:
         sm._create_and_sign_claim_tx.assert_not_called()
 
     def test_gate_reads_the_parking_state(self):
-        # source contract: the d2 branch must consult the hold's
+        # source contract: the onchain_to_ln branch must consult the hold's
         # received amount before the claim fall-through
         src = (_plugin / "submarine_swaps.py").read_text()
         assert re.search(r"parked", src), (
-            "_claim_swap's d2 branch must gate on parking (received >= amount)")
+            "_claim_swap's onchain_to_ln branch must gate on parking (received >= amount)")

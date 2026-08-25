@@ -216,7 +216,7 @@ hits `continue` forever. Reachable when the plugin dies between
 main callback never fires, the FUNDED main invoice never expires
 (`check_invoice_expiry` skips FUNDED/SETTLED, `cln_lightning.py:121-122`), and
 the payer's parked HTLCs sit until their own CLTV. This is the same bug class
-as the fixed "d1 swaps hung in swap.created 30+ min" incident (the `None`
+as the fixed "ln_to_onchain swaps hung in swap.created 30+ min" incident (the `None`
 sibling was patched; the SETTLED sibling was not). Fix: treat SETTLED (or
 preimage-known) prepay as redeemed and proceed.
 
@@ -310,7 +310,7 @@ electrum's `_sanity_check_prepayment` caps prepay
 Electrum: `assert self.get_preimage(payment_hash) is None` at registration
 (`lnworker.py:2917-2919`) — the callback would never fire otherwise. Ours
 (`cln_lightning.py:386-390`) has no such check. Unreachable in the current
-d1 flow (server never holds the prepay), but the guard documents the
+ln_to_onchain flow (server never holds the prepay), but the guard documents the
 invariant.
 
 ### PD-11 (P3): duplicate-hash guards — electrum has three, ours has two and a no-op

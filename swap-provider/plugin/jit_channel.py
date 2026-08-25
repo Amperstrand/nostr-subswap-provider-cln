@@ -8,7 +8,7 @@ can open a channel to the payee node, wait for lockin, and retry.
 ## Timing proof (the binding constraint)
 
 The JIT channel must be usable before the EARLIER of:
-  A) the bolt11 invoice expiry (typically 3600s for d2 swaps)
+  A) the bolt11 invoice expiry (typically 3600s for onchain_to_ln swaps)
   B) the onchain CLTV (locktime - tip ≈ 70 blocks from creation)
 
 But the payment attempt only STARTS after the user's lockup confirms

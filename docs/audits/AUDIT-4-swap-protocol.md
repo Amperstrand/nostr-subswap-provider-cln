@@ -35,7 +35,7 @@ verdicts on every claim/refund invariant, and a port-divergence list.
    (`construct_script` + templates). Slot order of pubkey/locktime/
    ripemd. is_reverse slot mapping in BOTH create_normal_swap and
    create_reverse_swap vs electrum's — a historical bug (423ed93) was
-   exactly a d1-inverted slot order in addswapinvoice re-derivation.
+   exactly a ln_to_onchain-inverted slot order in addswapinvoice re-derivation.
 2. `_claim_swap` vs electrum's equivalent: the funding-detection loop,
    underfund guard, preimage extraction from claim witness (normal
    swaps), refund branch (locktime checks, spent_height semantics:
