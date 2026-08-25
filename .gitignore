@@ -1,6 +1,1 @@
-venv
-.venv
-.vscode
-.idea
-cln-testing-env/plugins/*
-*__pycache__*
+.omo/
