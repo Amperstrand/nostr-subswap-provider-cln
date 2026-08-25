@@ -268,10 +268,13 @@ class SwapManager:
     async def main_loop(self):
         if self.is_initialized.is_set():
             raise Exception("swap manager main_loop called twice, already running")
-        # readd all swaps to lnwatcher
+        # re-register persisted swaps' lockup addresses into the bitcoind
+        # wallet (imports are lost on wallet restart/recreate; without
+        # this, _claim_swap hits UnknownAddressError every block)
         for k, swap in self.swaps.items():
             if swap.is_redeemed:
                 continue
+            await self.lnwatcher.register_address(swap.lockup_address)
             self.add_lnwatcher_callback(swap)
 
         tasks = [
@@ -448,7 +451,19 @@ class SwapManager:
             return
         current_height = await self.wallet.get_local_height()
         remaining_time = swap.locktime - current_height
-        txos = await self.lnwatcher.get_addr_outputs(swap.lockup_address)
+        try:
+            txos = await self.lnwatcher.get_addr_outputs(swap.lockup_address)
+        except UnknownAddressError:
+            # addresses are registered into the bitcoind wallet at swap
+            # creation only; a restarted/recreated wallet loses the
+            # import, and raising here crash-loops the chain callback
+            # every block. Re-register and let the next block retry.
+            # timestamp="now" means a lockup funded BEFORE the loss
+            # needs a manual rescan to become claimable again.
+            self.logger.warning(
+                f'_claim_swap: {swap.lockup_address} lost its wallet import — re-registering')
+            await self.lnwatcher.register_address(swap.lockup_address)
+            return
 
         self.logger.debug(f'_claim_swap lockup addr: {swap.lockup_address} found {len(txos)} txout spending to it')
         for txin in txos:
