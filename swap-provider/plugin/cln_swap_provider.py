@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Optional
 
 from .cln_logger import PluginLogger
@@ -46,8 +47,17 @@ class CLNSwapProvider:
         # the method must be in pyln's dispatch table before plugin.run()
         # answers lightningd's getmanifest. The handler answers honestly
         # at every stage (parts missing during init report as "starting")
-        self.plugin_handler = await CLNPlugin(
-            rpc_methods=[("swapprovider-health", self._swapprovider_health_rpc)])
+        rpc_methods = [("swapprovider-health", self._swapprovider_health_rpc)]
+        if getattr(PluginConfig, "SWAP_MODE_DEFAULT", None) is None:
+            # client RPCs register unconditionally (they no-op with a
+            # clean error outside client mode); this keeps getmanifest
+            # stable across SWAP_MODE changes without a restart race
+            rpc_methods += [
+                ("swapclient-offers", self._swapclient_offers_rpc),
+                ("swapclient", self._swapclient_swap_rpc),
+                ("swapclient-status", self._swapclient_status_rpc),
+            ]
+        self.plugin_handler = await CLNPlugin(rpc_methods=rpc_methods)
 
         # logging to cln logs
         self.logger = PluginLogger("swap-provider", self.plugin_handler.plugin.log)
@@ -90,6 +100,68 @@ class CLNSwapProvider:
                                         plugin_config=self.config,
                                         logger=self.logger)
 
+        # client mode (design 12): a client of electrum-protocol swap
+        # servers -- discovery, gated reverse swaps, onchain claims.
+        # Registered up front like the health RPC (same getmanifest
+        # rule); no-ops unless SWAP_MODE=client.
+        self._asyncio_loop = asyncio.get_running_loop()
+        if self.config.swap_mode == "client":
+            from .swap_client import SwapClient
+            self.swap_client = SwapClient(
+                plugin_rpc=self._plugin_rpc,
+                config=self.config,
+                logger=self.logger,
+                chain_monitor=self.chain_monitor,
+                wallet=self.cln_chain_wallet,
+                db=self.json_db)
+        else:
+            self.swap_client = None
+
+    async def _plugin_rpc(self, method: str, *args, **kwargs):
+        """Thin async wrapper over the pyln pipe (client-mode RPCs:
+        pay/getinfo/newaddr -- keyed params per the clnrest mandate)."""
+        return await self.plugin_handler.plugin.rpc.__getattr__(method)(
+            *args, **kwargs)
+
+    def _swapclient_offers_rpc(self, plugin=None, **kwargs) -> dict:
+        """`lightning-cli swapclient-offers`: currently discovered
+        providers (kind 30315 with PoW+freshness gates applied)."""
+        if self.swap_client is None:
+            return {"error": "not in client mode (SWAP_MODE=client)"}
+        return {"offers": [
+            {"pubkey": o.server_pubkey, "fee_pct": o.percentage_fee,
+             "mining_fee": o.mining_fee, "min": o.min_amount,
+             "max_reverse": o.max_reverse, "age_s": int(time.time()) - o.timestamp}
+            for o in self.swap_client.offers.values()]}
+
+    def _swapclient_swap_rpc(self, plugin=None, amount_sat=None, **kwargs) -> dict:
+        """`lightning-cli swapclient amount_sat=<n> [provider=<hex>]`:
+        run one gated reverse swap (pay LN, receive onchain)."""
+        if self.swap_client is None:
+            return {"error": "not in client mode (SWAP_MODE=client)"}
+        if not amount_sat:
+            return {"error": "amount_sat required (satoshis)"}
+        fut = asyncio.run_coroutine_threadsafe(
+            self.swap_client.reverse_swap(
+                lightning_amount_sat=int(amount_sat),
+                provider=kwargs.get("provider")),
+            self._asyncio_loop)
+        try:
+            return fut.result(timeout=400)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+
+    def _swapclient_status_rpc(self, plugin=None, **kwargs) -> dict:
+        """`lightning-cli swapclient-status`: our swap rows."""
+        if self.swap_client is None:
+            return {"error": "not in client mode (SWAP_MODE=client)"}
+        out = []
+        for k, s in self.swap_client.swaps.items():
+            out.append({"payment_hash": k, "onchain": s.onchain_amount,
+                        "state": "claimed" if s.is_redeemed else "open",
+                        "spending_txid": s.spending_txid})
+        return {"swaps": out}
+
     def _swapprovider_health_rpc(self, plugin=None, **kwargs) -> dict:
         """`lightning-cli swapprovider-health`: read-only liveness
         snapshot (audit R2) — no side effects, safe to poll every 30s.
@@ -125,6 +197,13 @@ class CLNSwapProvider:
                   on_death=lambda exc: fatal_exit(
                       f"pyln pipe watchdog died: {exc!r}",
                       logger=self.logger))
+        if self.config.swap_mode == "client":
+            # client mode: ONLY the client loops (offers + DM demux +
+            # chain watcher). The server loops (hold invoices, offer
+            # publishing, DM serving) never start -- client mode must
+            # not carry server attack surface.
+            await self.swap_client.run()
+            raise Exception("swap client main loop exited unexpectedly")
         # await asyncio.sleep(100000000)
         await self.swap_manager.main_loop()
         raise Exception("CLNSwapProvider main loop exited unexpectedly")

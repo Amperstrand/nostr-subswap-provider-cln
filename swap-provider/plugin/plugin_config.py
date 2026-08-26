@@ -101,6 +101,15 @@ class PluginConfig:
         else:
             config.logger.warning(f"No swap fee in env. Using default value: {config.swapserver_fee_millionths}")
 
+        # Client mode (design 12, NOSTR-SWAP.md): SWAP_MODE=client runs
+        # the node as a CLIENT of electrum-protocol swap servers only --
+        # no offers published, no DMs served, no hold invoices; the
+        # `swapclient-*` RPCs drive the reverse-swap lifecycle. Default
+        # remains the provider (server) mode this plugin has always been.
+        config.swap_mode = os.getenv("SWAP_MODE", "server").strip().lower()
+        if config.swap_mode not in ("server", "client"):
+            raise Exception(f"SWAP_MODE must be server|client, got {config.swap_mode!r}")
+
         # R3: honest advertised cap — the offer must not promise capacity
         # the node cannot fund (clamped again at server_update_pairs time)
         if max_amt := os.getenv("MAX_SWAP_AMOUNT"):
