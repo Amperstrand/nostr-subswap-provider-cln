@@ -32,6 +32,11 @@ class PluginConfig:
         self.funding_gate_timeout_blocks: int = FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT
         self.funding_gate_on_timeout: str = "fail"
         self.invoice_expiry_seconds: int = INVOICE_EXPIRY_SECONDS_DEFAULT
+        # issue #24 r8 traffic attribution: normalized hex pubkeys of
+        # OUR OWN test clients (TEST_NPUBS env, npub… or 64-hex, csv).
+        # Empty registry is honest: every known requester then reads
+        # 'stranger'. Monitoring only — never a gate.
+        self.test_npubs: tuple = ()
         self.logger = logger  # PluginLogger("swap-provider", plugin, level="DEBUG")
 
     @classmethod
@@ -214,6 +219,24 @@ class PluginConfig:
             config.logger.warning(f"No INVOICE_EXPIRY_SECONDS set in env. "
                                   f"Using default of {config.invoice_expiry_seconds}")
 
+        # issue #24 r8 (traffic attribution): npubs of our own test
+        # clients — the only 'ours' signal (explicit registration; a
+        # refund-pubkey pattern heuristic would misclassify strangers).
+        # npub… and 64-hex forms both accepted, stored normalized-hex.
+        from .attribution import parse_test_npubs
+        if (raw_npubs := os.getenv("TEST_NPUBS", "").strip()):
+            config.test_npubs = parse_test_npubs(raw_npubs)
+            if dropped := len([x for x in raw_npubs.split(',') if x.strip()]) - len(config.test_npubs):
+                config.logger.warning(f"TEST_NPUBS: {dropped} entr"
+                                      f"{'y' if dropped == 1 else 'ies'} invalid and dropped")
+        if config.test_npubs:
+            config.logger.info(f"TEST_NPUBS: {len(config.test_npubs)} test-client "
+                               f"npub(s) registered for attribution")
+        else:
+            config.logger.warning("No TEST_NPUBS set in env. Every swap requester "
+                                  "will be attributed 'stranger' (or 'unknown' for "
+                                  "records without a requester npub).")
+
         if log_level := os.getenv("PLUGIN_LOG_LEVEL"):
             config.logger.change_level(log_level.strip())
 
@@ -256,7 +279,8 @@ class PluginConfig:
                f"sweep_grace_blocks={self.sweep_grace_blocks}, " \
                f"funding_gate_timeout_blocks={self.funding_gate_timeout_blocks}, " \
                f"funding_gate_on_timeout={self.funding_gate_on_timeout}, " \
-               f"invoice_expiry_seconds={self.invoice_expiry_seconds})"
+               f"invoice_expiry_seconds={self.invoice_expiry_seconds}, " \
+               f"test_npubs={len(self.test_npubs)} registered)"
 
 
 @attr.s

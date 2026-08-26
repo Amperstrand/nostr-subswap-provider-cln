@@ -85,6 +85,7 @@ from .utils import (OldTaskGroup, now, BelowDustLimit, TxBroadcastError,
 from .bitcoin import DummyAddress
 from .crypto import ripemd, sha256
 from .health import tracker
+from .attribution import attribution_tracker, classify_requester
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
 from .invoices import Invoice, InvoiceState
 from .json_db import StoredObject, stored_in, JsonDB
@@ -171,6 +172,17 @@ class SwapData(StoredObject):
     # until locktime + SWEEP_GRACE_BLOCKS, after which it is swept under
     # the ERROR-level policy log.
     registered = attr.ib(type=bool, default=False)
+    # issue #24 r8 (traffic attribution, operator directive "strangers
+    # welcome, monitoring not gating"): the nostr pubkey that REQUESTED
+    # this swap, taken from the DM envelope by the transport AFTER
+    # decryption (a client-supplied requester field is always
+    # overridden). Additive with defaults so pre-r8 records — including
+    # the 35-record production jsondb — load unchanged (the `registered`
+    # pattern). OBSERVABILITY only: nothing gates on this field.
+    requester_npub = attr.ib(type=Optional[str], default=None)
+    # wall-clock creation time (seconds) for the swapprovider-swaps age
+    # column; pre-r8 records carry None -> age_sec null
+    created_at = attr.ib(type=Optional[float], default=None)
 
     _funding_prevout = None  # type: Optional[TxOutpoint]  # for RBF
     _payment_hash = None
@@ -1012,7 +1024,8 @@ class SwapManager:
         if self.lnworker.get_preimage(payment_hash) is not None:
             raise RequestFieldError('payment_hash already in use')
 
-    async def create_normal_swap(self, *, lightning_amount_sat: int, payment_hash: bytes, their_pubkey: bytes = None):
+    async def create_normal_swap(self, *, lightning_amount_sat: int, payment_hash: bytes, their_pubkey: bytes = None,
+                                 requester_npub: Optional[str] = None):
         """ server method """
         assert lightning_amount_sat
         locktime = await self.wallet.get_local_height() + LOCKTIME_DELTA_REFUND
@@ -1037,6 +1050,7 @@ class SwapManager:
             payment_hash=payment_hash,
             our_privkey=our_privkey,
             prepay=True,
+            requester_npub=requester_npub,
         )
         # callback will be triggered when the swap invoice is paid to broadcast the funding tx
         self.lnworker.register_hold_invoice_callback(payment_hash=payment_hash, callback=self.hold_invoice_callback)
@@ -1053,6 +1067,7 @@ class SwapManager:
             our_privkey: bytes,
             prepay: bool,
             min_final_cltv_expiry_delta: Optional[int] = None,
+            requester_npub: Optional[str] = None,
     ) -> Tuple[SwapData, str, Optional[str]]:
         """creates a hold invoice"""
         if prepay:
@@ -1108,6 +1123,8 @@ class SwapManager:
             is_redeemed = False,
             funding_txid = None,
             spending_txid = None,
+            requester_npub = requester_npub,
+            created_at = time.time(),
         )
         swap._payment_hash = bytes_to_hex(payment_hash)
         self._add_or_reindex_swap(swap)
@@ -1115,7 +1132,8 @@ class SwapManager:
         self.add_lnwatcher_callback(swap)
         return swap, invoice.bolt11, prepay_invoice.bolt11
 
-    async def create_reverse_swap(self, *, lightning_amount_sat: int, their_pubkey: bytes) -> SwapData:
+    async def create_reverse_swap(self, *, lightning_amount_sat: int, their_pubkey: bytes,
+                                  requester_npub: Optional[str] = None) -> SwapData:
         """ server method. """
         assert lightning_amount_sat is not None
         locktime = await self.wallet.get_local_height() + LOCKTIME_DELTA_REFUND
@@ -1140,7 +1158,8 @@ class SwapManager:
             payment_hash=payment_hash,
             prepay_hash=None,  # server doesn't prepay
             onchain_amount_sat=onchain_amount_sat,
-            lightning_amount_sat=lightning_amount_sat)
+            lightning_amount_sat=lightning_amount_sat,
+            requester_npub=requester_npub)
         return swap
 
     async def add_reverse_swap(
@@ -1154,6 +1173,7 @@ class SwapManager:
         preimage: bytes,
         payment_hash: bytes,
         prepay_hash: Optional[bytes] = None,
+        requester_npub: Optional[str] = None,
     ) -> SwapData:
         lockup_address = script_to_p2wsh(redeem_script, net=self.config.network)
         receive_address = self.wallet.get_receiving_address()
@@ -1172,6 +1192,8 @@ class SwapManager:
             is_redeemed = False,
             funding_txid = None,
             spending_txid = None,
+            requester_npub = requester_npub,
+            created_at = time.time(),
         )
         if prepay_hash:
             self.prepayments[prepay_hash] = payment_hash
@@ -1235,6 +1257,13 @@ class SwapManager:
         if key in self.invoices_to_pay:
             raise RequestFieldError('invoice already bound')
         swap.registered = True
+        # issue #24 r8 late fill: a record whose phase-1 DM carried no
+        # npub (pre-r8 record, or the restart contract) takes the
+        # registrant's; an existing attribution is never overwritten —
+        # the phase-1 creator owns the swap's attribution
+        requester = request.get('_requester_npub')
+        if requester and swap.requester_npub is None:
+            swap.requester_npub = requester
         self.lnworker.save_invoice(invoice)
         # issue #12: never start paying on the invoice alone — the client
         # may not have funded the lockup at all. Park the invoice; the
@@ -1468,6 +1497,7 @@ class SwapManager:
         swap = await self.create_reverse_swap(
             lightning_amount_sat=lightning_amount_sat,
             their_pubkey=their_pubkey,
+            requester_npub=request.get('_requester_npub'),
         )
         response = {
             "id": swap.payment_hash.hex(),
@@ -1505,7 +1535,8 @@ class SwapManager:
             swap, invoice, prepay_invoice = await self.create_normal_swap(
                 lightning_amount_sat=lightning_amount_sat,
                 payment_hash=payment_hash,
-                their_pubkey=their_pubkey
+                their_pubkey=their_pubkey,
+                requester_npub=request.get('_requester_npub'),
             )
             response = {
                 'id': payment_hash.hex(),
@@ -1744,6 +1775,18 @@ class NostrTransport:  # (Logger):
         else:
             handler = None
             r = {'error': f'unknown swap method: {method}'}
+        if handler is not None:
+            # issue #24 r8 traffic attribution: the DM envelope's signer
+            # IS the requester. Set AFTER the pops so a client-supplied
+            # '_requester_npub' in the payload is ALWAYS overridden —
+            # attribution cannot be spoofed. Monitoring only: the label
+            # never influences any decision below (strangers welcome).
+            request['_requester_npub'] = event_pubkey
+            label = classify_requester(
+                event_pubkey, getattr(self.config, 'test_npubs', ()))
+            attribution_tracker.note_request(label)
+            self.logger.info(
+                f'swap request from npub={event_pubkey} attributed={label}')
         if handler is not None and not self.sm.is_initialized.is_set():
             # issue #20 (audit F06): while the transport is dead/restarting
             # the offer is withdrawn; accepting swap work into a pipeline
