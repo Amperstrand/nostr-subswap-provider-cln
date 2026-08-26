@@ -135,6 +135,26 @@ class CLNLightning:
         if invoice is None:
             return False
 
+        # FUNDED-abandonment watchdog (#28 residual, live 2026-08-25): a
+        # fully-parked hold whose swap callback fired but the funding
+        # never happened parks FOREVER — the sweeper deliberately skips
+        # FUNDED (it's waiting for claim→settle), so the payer's HTLC
+        # dangles to CLTV (~95min), pinning channel capacity and
+        # cascading no-failcode routing failures into every later swap.
+        # Settle is the ONLY valid exit from FUNDED; past expiry + a
+        # grace window (callback retries, mempool lag), it is abandoned —
+        # cancel. Grace = expiry again (300s default → ~10min total).
+        if (invoice.funding_status is InvoiceState.FUNDED
+                and invoice.created_at + invoice.expiry * 2 < time.time()):
+            self._logger.warning(
+                f"check_invoice_expiry: cancelling ABANDONED funded hold "
+                f"{invoice.payment_hash.hex()} (parked {int(time.time()) - invoice.created_at}s, "
+                f"no settle — swap funding never completed; #28 watchdog)")
+            invoice.cancel_all_htlcs()
+            self.unregister_hold_invoice_callback(invoice.payment_hash)
+            self.delete_hold_invoice(invoice.payment_hash)
+            return True
+
         # cancel all htlcs and delete invoice if it's expired
         if (invoice.created_at + invoice.expiry < time.time()
                 and invoice.funding_status not in [InvoiceState.FUNDED, InvoiceState.SETTLED]):

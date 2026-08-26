@@ -32,3 +32,42 @@ def test_main_loop_re_registers_persisted_lockups_before_callbacks():
 
 def test_unknown_address_error_referenced():
     assert 'UnknownAddressError' in SRC  # the catch names the exact class (no bare except)
+
+
+# ─── #28 residual: FUNDED-abandonment watchdog (2026-08-25) ──────────────────
+# A fully-parked hold whose swap funding never happened parked FOREVER:
+# the sweeper skips FUNDED (waiting for claim→settle), so the payer's
+# HTLC dangled to CLTV (~95min) pinning capacity (live: run-A 19.7k,
+# 90+min, three later swaps failed with no failcode). The watchdog
+# cancels FUNDED holds past expiry×2. These are source-contract pins
+# (module imports only inside the container env).
+
+def test_funded_abandonment_watchdog_exists():
+    src = (Path(__file__).resolve().parent.parent
+           / 'swap-provider' / 'plugin' / 'cln_lightning.py').read_text()
+    assert 'funding_status is InvoiceState.FUNDED' in src
+    assert 'invoice.expiry * 2 < time.time()' in src
+    assert 'ABANDONED funded hold' in src  # the log line operators grep for
+
+
+def test_watchdog_runs_before_the_unfunded_branch():
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / 'swap-provider' / 'plugin' / 'cln_lightning.py').read_text()
+    fn = src[src.index('def check_invoice_expiry'):]
+    m = re.search(r'\n    def ', fn[10:])  # next method boundary
+    fn = fn[:m.start() + 10] if m else fn
+    watchdog = fn.index('funding_status is InvoiceState.FUNDED')
+    unfunded = fn.index('funding_status not in')
+    assert watchdog < unfunded, 'FUNDED watchdog must be evaluated first (it returns True)'
+
+
+def test_watchdog_cleans_all_three_registrations():
+    """cancel + unregister callback + delete — a partial cleanup re-strands."""
+    src = (Path(__file__).resolve().parent.parent
+           / 'swap-provider' / 'plugin' / 'cln_lightning.py').read_text()
+    fn = src[src.index('ABANDONED funded hold'):]
+    fn = fn[:fn.index('def ') if 'def ' in fn else len(fn)]
+    assert 'cancel_all_htlcs()' in fn
+    assert 'unregister_hold_invoice_callback' in fn
+    assert 'delete_hold_invoice' in fn
