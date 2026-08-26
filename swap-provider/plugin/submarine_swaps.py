@@ -276,6 +276,17 @@ class SwapManager:
                 continue
             await self.lnwatcher.register_address(swap.lockup_address)
             self.add_lnwatcher_callback(swap)
+            # #28: re-register the hold-invoice callback too — the dict
+            # starts empty each process, so a FUNDED hold parked before a
+            # restart never fired its funding callback afterward (the
+            # payer's HTLC sat parked until the #28 watchdog or CLTV).
+            # Only ln_to_onchain (is_reverse server-side) holds carry a
+            # funding obligation; registered==False means phase-2 never
+            # bound an invoice — nothing to fund, skip (firing the
+            # callback for it would just hit the no-swap guard).
+            if not swap.is_reverse and swap.registered and swap.funding_txid is None:
+                self.lnworker.register_hold_invoice_callback(
+                    payment_hash=swap.payment_hash, callback=self.hold_invoice_callback)
 
         tasks = [
                     self.lnwatcher.trigger_callbacks(),  # trigger all callbacks once

@@ -71,3 +71,27 @@ def test_watchdog_cleans_all_three_registrations():
     assert 'cancel_all_htlcs()' in fn
     assert 'unregister_hold_invoice_callback' in fn
     assert 'delete_hold_invoice' in fn
+
+
+# ─── #28 root fix: hold-callback re-registration on restart ─────────────────
+# The callback dict starts empty each process; a FUNDED hold parked before
+# a restart never fired its funding callback afterward. main_loop must
+# re-register it alongside the lnwatcher re-registration.
+
+def test_main_loop_re_registers_hold_callbacks():
+    src = (Path(__file__).resolve().parent.parent
+           / 'swap-provider' / 'plugin' / 'submarine_swaps.py').read_text()
+    fn = src[src.index('async def main_loop'):]
+    import re as _re
+    m = _re.search(r'\n    async def ', fn[10:])
+    fn = fn[:m.start() + 10] if m else fn
+    assert 'register_hold_invoice_callback' in fn, 'main_loop must re-register hold callbacks'
+    # the guard: only is_reverse (server PoV) + registered + unfunded swaps
+    assert 'swap.registered and swap.funding_txid is None' in fn
+
+
+def test_create_normal_swap_still_registers_live():
+    src = (Path(__file__).resolve().parent.parent
+           / 'swap-provider' / 'plugin' / 'submarine_swaps.py').read_text()
+    # live path unchanged: create_normal_swap registers at creation time
+    assert src.count('register_hold_invoice_callback') >= 3  # live + main_loop re-arm + this doc
