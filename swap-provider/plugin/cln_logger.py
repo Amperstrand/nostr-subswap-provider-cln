@@ -26,13 +26,16 @@ class PluginLogger:
 
     def warning(self, msg: str):
         if self.is_enabled("WARNING"):
-            msg = f"WARNING: {msg}"  # CLN/plugin doesnt support WARN, so we use info
-            self.logger(msg, level="info")
+            # pyln DOES support "warn" on current CLN (audit #23 A1: the
+            # "CLN doesnt support WARN" workaround collapsed every level to
+            # info — money-relevant events were indistinguishable from
+            # routine chatter to level filters/journal/alerting). Prefix
+            # kept for older-CLN tails where unsupported levels fall back.
+            self.logger(f"WARNING: {msg}", level="warn")
 
     def error(self, msg: str):
         self.replay_debug_buffer()  # Replay debug messages to make it easier to debug the error
-        msg = f"ERROR: {msg}"  # CLN/plugin doesnt support ERROR, so we use info
-        self.logger(msg, level="info")
+        self.logger(f"ERROR: {msg}", level="error")
 
     def exception(self, msg: str):
         # @log_exceptions calls this — without it every handler crash

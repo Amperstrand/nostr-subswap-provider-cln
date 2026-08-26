@@ -198,7 +198,7 @@ class TestCallbackLessHtlcIssue6:
         healthy.created_at = int(time.time()) - 301
         ln._hold_invoices[poisoned.payment_hash.hex()] = poisoned
         ln._hold_invoices[healthy.payment_hash.hex()] = healthy
-        ln._expire_pass()  # one sweep — must process BOTH, not abort on #1
+        ln._expire_pass({})  # one sweep — must process BOTH, not abort on #1
         assert poisoned.payment_hash.hex() not in ln._hold_invoices
         assert healthy.payment_hash.hex() not in ln._hold_invoices
 

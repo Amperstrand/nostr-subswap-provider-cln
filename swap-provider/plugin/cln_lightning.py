@@ -91,14 +91,19 @@ class CLNLightning:
 
     def monitor_expiries(self):
         """Iterate through the hold invoices and cancel expired htlcs"""
+        # audit #23 A2: a permanently-broken invoice used to emit a full
+        # traceback ERROR every 10s forever. Per-invoice error counters:
+        # full detail on first occurrence, then 1-in-50 summary lines —
+        # grep-able signal without the log-flood.
+        err_counts: dict = {}
         while True:
             try:
-                self._expire_pass()
+                self._expire_pass(err_counts)
             except Exception:
                 self._logger.error(f"monitor_expiries loop encountered an error:\n{traceback.format_exc()}")
             time.sleep(10)
 
-    def _expire_pass(self):
+    def _expire_pass(self, err_counts: dict):
         """One expiry sweep. Issue #6 (PD-3): failures are isolated
         PER-INVOICE — one poisoned entry must not starve the rest of
         the sweep (the old whole-loop try/except restarted from the top
@@ -125,9 +130,15 @@ class CLNLightning:
                     if self.check_invoice_expiry(invoice):
                         self._logger.warning(f"monitor_expiries: "
                                              f"cancelled expired invoice {invoice.payment_hash.hex()}")
+                    err_counts.pop(payment_hash, None)  # recovered — reset
                 except Exception:
-                    self._logger.error(f"monitor_expiries: skipping invoice "
-                                       f"{payment_hash[:12]}… after error:\n"
+                    n = err_counts.get(payment_hash, 0) + 1
+                    err_counts[payment_hash] = n
+                    if n == 1 or n % 50 == 0:
+                        self._logger.error(f"monitor_expiries: invoice "
+                                       f"{payment_hash[:12]}… errored {n}× "
+                                       f"(first occurrence logged in full; "
+                                           f"summary every 50):\n"
                                        f"{traceback.format_exc()}")
 
     def check_invoice_expiry(self, invoice: HoldInvoice) -> bool:
@@ -253,12 +264,19 @@ class CLNLightning:
                                 self.update_invoice(prepay_invoice)
                                 self._logger.debug(f"callback_handler: prepay invoice "
                                                    f"{prepay_invoice.payment_hash.hex()} redeemed")
-                            self._logger.debug(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
+                            # #23/#28: the funding-callback dispatch IS the
+                            # money moment — if it silently no-ops (empty
+                            # registry after restart, the #28 class), only
+                            # this line distinguishes "never called" from
+                            # "called and failed". Default-visible.
+                            self._logger.info(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
                                                 f"calling callback")
 
                             # Call the callback
                             callback(invoice.payment_hash)
                             self.unregister_hold_invoice_callback(invoice.payment_hash)
+                            self._logger.info(f"callback_handler: callback returned for "
+                                                f"{invoice.payment_hash.hex()} — funding dispatched")
 
             except Exception as e:
                 self._logger.error(f"callback_handler encountered an error:\n{traceback.format_exc()}")

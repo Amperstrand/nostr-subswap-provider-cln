@@ -1335,7 +1335,10 @@ class NostrTransport:  # (Logger):
                         f"replay of an already-executed request) — skipped:\n"
                         f"{traceback.format_exc()}")
             else:
-                print('unknown message', content)
+                # audit #23 A3: bare print() writes to stdout — the pyln
+                # JSON-RPC pipe — potentially corrupting the plugin protocol;
+                # logger, never print, inside a plugin process
+                self.logger.warning(f'unknown nostr DM shape — ignored: {str(content)[:120]}')
 
     @log_exceptions
     async def handle_request(self, request):

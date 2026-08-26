@@ -95,3 +95,43 @@ def test_create_normal_swap_still_registers_live():
            / 'swap-provider' / 'plugin' / 'submarine_swaps.py').read_text()
     # live path unchanged: create_normal_swap registers at creation time
     assert src.count('register_hold_invoice_callback') >= 3  # live + main_loop re-arm + this doc
+
+
+# ─── #23 A1/A2/A3: logging severity + aggregation + no-print contracts ──────
+
+def test_logger_uses_real_levels():
+    src = (Path(__file__).resolve().parent.parent / 'plugin_src' / 'plugin' / 'cln_logger.py').read_text() \
+        if (Path(__file__).resolve().parent.parent / 'plugin_src').exists() \
+        else (Path(__file__).resolve().parent.parent / 'swap-provider' / 'plugin' / 'cln_logger.py').read_text()
+    # warn/error ride their REAL pyln levels (the old workaround collapsed
+    # everything to level="info")
+    assert 'level="warn"' in src
+    assert 'level="error"' in src
+    assert 'CLN/plugin doesnt support WARN' not in src
+
+
+def test_no_bare_print_in_plugin_runtime():
+    # audit #23 A3: print() writes to the pyln JSON-RPC pipe — the known
+    # one was submarine_swaps.py:1338; none may return
+    src = (Path(__file__).resolve().parent.parent / 'swap-provider' / 'plugin' / 'submarine_swaps.py').read_text()
+    import re
+    offenders = [l for l in src.splitlines()
+                 if re.match(r'\s+print\(', l) and 'unknown message' not in l]
+    assert offenders == [], f'bare print() in plugin runtime: {offenders}'
+
+
+def test_expire_pass_error_aggregation():
+    src = (Path(__file__).resolve().parent.parent / 'swap-provider' / 'plugin' / 'cln_lightning.py').read_text()
+    assert 'err_counts' in src                # the aggregation dict exists
+    assert 'n == 1 or n % 50 == 0' in src     # first + 1-in-50 cadence
+    assert 'errored {n}×' in src or 'errored ' in src  # summary shape
+
+
+def test_callback_dispatch_is_default_visible():
+    # the #28 lesson: the funding-callback dispatch must be visible at
+    # default level — "never called" vs "called and failed"
+    src = (Path(__file__).resolve().parent.parent / 'swap-provider' / 'plugin' / 'cln_lightning.py').read_text()
+    fn = src[src.index('def callback_handler'):]
+    assert '_logger.info(' in fn, 'callback dispatch must log at info'
+    assert 'calling callback' in fn
+    assert 'callback returned' in fn
