@@ -34,6 +34,26 @@ LOCKUP_FEE_SIZE = 153 # assuming 1 output, 2 outputs
 MIN_LOCKTIME_DELTA = 60
 LOCKTIME_DELTA_REFUND = 70
 MAX_LOCKTIME_DELTA = 100
+# blocks past locktime before a funded lockup with no LN commitment may be claimed (issue #10); SWEEP_GRACE_BLOCKS env var overrides
+SWEEP_GRACE_BLOCKS_DEFAULT = 288
+# issue #24 option E (FUNDING-GATE-COMPAT-MEMO): M, the max wait in
+# blocks after addswapinvoice before the #12 funding gate gives up on a
+# lockup that never appeared (fail, or pay per
+# FUNDING_GATE_ON_TIMEOUT_BEHAVIOR). Memo default 30 — on signet's ~10s
+# blocks that matches the 300s client invoice expiry (#25); on mainnet
+# 30 blocks = ~5h, well inside the 70-block locktime delta.
+FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT = 30
+# issue #24 option E / memo option F: d1 hold+prepay invoice expiry
+# seconds. Default 300 preserves the electrum client contract (its
+# exp_delay=300 hardcode); operators may extend to give M more room.
+INVOICE_EXPIRY_SECONDS_DEFAULT = 300
+# funding_gate_watch_loop poll cadence: sub-block mempool re-check for
+# parked d2 lockups (Option E's mempool-scripthash reaction window)
+FUNDING_GATE_POLL_SECONDS = 5
+# pay_pending_ln_invoices parks invoices_to_pay[key] at this sentinel
+# while a payment attempt is in flight (the r4 requeue-backoff contract);
+# swapprovider-health counts these as inflight_payments
+PAYMENT_INFLIGHT_LOCK = 1000000000000
 MIN_FINAL_CLTV_DELTA_FOR_CLIENT = 3 * 144  # note: put in invoice, but is not enforced by receiver in lnpeer.py
 
 # the minimum cltv_expiry accepted for newly received HTLCs

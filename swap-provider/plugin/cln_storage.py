@@ -1,4 +1,5 @@
 import sys
+import time
 from collections.abc import Callable
 from .cln_logger import PluginLogger
 
@@ -18,6 +19,11 @@ class CLNStorage:  # (Logger):
         self.pos = None
         self.init_pos = None
         self.initialized = False
+        # swapprovider-health observability: the CLN datastore generation
+        # of the last successful write + when it happened (audit R2's
+        # "datastore last-successful-write" heartbeat)
+        self.last_generation = None
+        self.last_write_monotonic = None
         self.raw = self._fetch_db_content(key=self.read_key)
 
     def _fetch_db_content(self, *, key: str) -> str:
@@ -32,7 +38,9 @@ class CLNStorage:  # (Logger):
             if element['key'] == self.write_key:
                 our_data = element['string']
                 break
-        self.logger.debug(f"Data fetched from cln datastore: {our_data}")
+        # never log the db content: it contains claim privkeys and
+        # preimages in plaintext (issue #13) — size only
+        self.logger.debug(f"Data fetched from cln datastore: {len(our_data)} characters")
         self.pos = len(our_data)
         self.init_pos = self.pos
         if our_data == "":  # as the later write calls can be append only we have to write once to create the key
@@ -60,12 +68,14 @@ class CLNStorage:  # (Logger):
             raise StorageReadWriteError(f"Failed to write to CLN-DB: {e}")
         if "error" in res:
             raise StorageReadWriteError(f"CLN DB returned error on write: {res}")
+        self._note_write(res)
         self.init_pos = len(data)  # update initial position
         self.pos = self.init_pos
         self.raw = data  # update raw data to the new content
+        # content is secret-bearing (issue #13) — log size, not the data
         self.logger.debug(f"Wrote to CLN db: \nkey:{res['key']} "
                           f"\ngeneration: {res['generation']} "
-                          f"\ncontent:{res['string']}")
+                          f"\nsize:{len(data)} characters")
 
     def wipe(self):
         """ Wipe the jsondb entry in the cln datastore. Used for manual testing and debugging."""
@@ -82,10 +92,36 @@ class CLNStorage:  # (Logger):
             raise StorageReadWriteError(f"Failed to append data to CLN DB: {e}")
         if "error" in res:
             raise StorageReadWriteError(f"CLN DB returned error on append: {res}")
+        self._note_write(res)
         self.pos += len(data)
+        # content is secret-bearing (issue #13) — log size, not the data
         self.logger.debug(f"Appended to CLN db: \nkey:{res['key']} "
                       f"\ngeneration: {res['generation']} "
-                      f"\ncontent:{res['string']}")
+                      f"\nsize:{len(data)} characters")
+
+    def _note_write(self, res: dict) -> None:
+        self.last_generation = res.get("generation", self.last_generation)
+        self.last_write_monotonic = time.monotonic()
+
+    def write_quarantine(self, fragment: str, label: str = "jsondb") -> str:
+        """#19/#18 (audit R3): persist a damaged-but-forensic fragment
+        (discarded jsondb tail) NEXT TO the datastore itself, as a
+        sibling child key swap-provider/<label>-discarded-<ts>.frag.
+        Milliseconds in the name keep multi-amputation recursion from
+        colliding; failures raise (the caller stays loud but recovers)."""
+        ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) \
+            + f"-{int(time.time() * 1000) % 1000:03d}"
+        key = ["swap-provider", f"{label}-discarded-{ts}.frag"]
+        try:
+            self.dbwriter(key=key, string=fragment, mode="create-or-replace")
+        except Exception as e:
+            raise StorageReadWriteError(f"Failed to write quarantine fragment: {e}")
+        name = "/".join(key)
+        # the fragment may itself contain key material (issue #13) —
+        # log the location + size only, never the content
+        self.logger.debug(f"quarantine fragment stored at datastore key "
+                          f"{name} ({len(fragment)} chars)")
+        return name
 
     def _test_db(self):
         """Test if we can read and write to the cln datastore."""

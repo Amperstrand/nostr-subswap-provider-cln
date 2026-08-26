@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Monitoring consumer for the swapprovider-health RPC (audit round 5,
+issue #21 observability half — the piece soak3/inr2-health wires later).
+
+Polls `lightning-cli swapprovider-health` and maps the plugin verdict to
+a process exit code a monitor can branch on:
+
+    0  verdict ok
+    1  verdict degraded   (nostr withdrawn/restarting, bitcoind retrying,
+                           error streaks — r4's policies stay the ACTION)
+    2  verdict dead       (wedged core loop / dead pyln pipe)
+    3  RPC unreachable    (plugin not answering — investigate, do NOT
+                           conflate with the plugin self-reporting dead)
+
+The RPC is read-only and safe at a 30s cadence.
+
+Suggested ansible task (inr2-health wiring):
+
+    - name: swap provider liveness gate
+      ansible.builtin.command:
+        cmd: /opt/nostr-subswap-provider-cln/scripts/swap-provider-health --once
+      register: swapprovider_health
+      changed_when: false
+      failed_when: swapprovider_health.rc not in [0, 1]
+      # rc 2 (dead) and rc 3 (unreachable) fail the task; rc 1
+      # (degraded) only alerts — the r4 policies are already acting.
+"""
+import argparse
+import json
+import subprocess
+import sys
+import time
+
+EXIT_OK, EXIT_DEGRADED, EXIT_DEAD, EXIT_RPC_ERROR = 0, 1, 2, 3
+VERDICT_EXIT = {"ok": EXIT_OK, "degraded": EXIT_DEGRADED, "dead": EXIT_DEAD}
+
+
+def poll(cli):
+    proc = subprocess.run(cli, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"lightning-cli rc={proc.returncode}: {proc.stderr.strip()[:200]}")
+    return json.loads(proc.stdout)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--rpc-bin", default="lightning-cli",
+                    help="lightning-cli binary (may be a wrapper, e.g. "
+                         "'docker exec <node> lightning-cli --regtest')")
+    ap.add_argument("--lightning-dir", default=None,
+                    help="passed as --lightning-dir=DIR to lightning-cli")
+    ap.add_argument("--interval", type=int, default=30,
+                    help="poll cadence in poll mode (default 30)")
+    ap.add_argument("--once", action="store_true",
+                    help="single poll then exit (monitoring/ansible mode)")
+    args = ap.parse_args()
+
+    cli = args.rpc_bin.split()
+    if args.lightning_dir:
+        cli.append(f"--lightning-dir={args.lightning_dir}")
+    cli.append("swapprovider-health")
+
+    while True:
+        try:
+            report = poll(cli)
+        except Exception as e:
+            print(f"swapprovider-health: RPC unreachable: {e}", file=sys.stderr)
+            sys.exit(EXIT_RPC_ERROR)
+        verdict = report.get("verdict", "dead")
+        print(json.dumps({
+            "verdict": verdict,
+            "reasons": report.get("reasons", []),
+            "uptime_sec": report.get("uptime_sec"),
+            "subsystems": {k: v["last_seen_ms_ago"]
+                           for k, v in report.get("subsystems", {}).items()},
+        }))
+        if args.once:
+            sys.exit(VERDICT_EXIT.get(verdict, EXIT_DEAD))
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

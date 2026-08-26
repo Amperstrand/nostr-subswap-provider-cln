@@ -78,6 +78,15 @@ class CLNLightning:
         self._logger.debug("CLNLightning initialized")
 
     async def run(self):
+        # These loops are immortal BY DESIGN and must stay NON-DAEMON
+        # threads: JsonDB.write refuses writes from daemon threads
+        # ('daemon thread cannot write db' — an electrum-inherited
+        # invariant), and monitor_expiries/callback_handler/the pyln hook
+        # all persist invoices. Issue #16 therefore fixes the zombie at
+        # the TOP level instead (swap-provider.py hard-exits on every
+        # crash path, so asyncio.run's executor join — which would block
+        # forever on these threads — is structurally unreachable). Do NOT
+        # convert these to daemon threads.
         # put the htlc expiry monitoring in a separate thread to avoid blocking the async event loop
         htlc_expiry_watcher = asyncio.to_thread(self.monitor_expiries)
         self.monitoring_tasks.append(asyncio.create_task(htlc_expiry_watcher))
@@ -435,6 +444,17 @@ class CLNLightning:
 
     def get_invoice(self, key: str) -> Optional[Invoice]:
         return self._invoices.get(key)
+
+    def get_payment_statuses(self, payment_hash_hex: str) -> List[str]:
+        """Statuses of the CLN payment attempts for a payment hash.
+        Returns an empty list if no payment was ever attempted (note that
+        listpays returns {'pays': [...]}, there is no top-level 'status')."""
+        try:
+            pays = self._rpc.listpays(payment_hash=payment_hash_hex).get('pays', [])
+        except Exception as e:
+            self._logger.error(f"get_payment_statuses: listpays rpc failed: {e}")
+            return []
+        return [p.get('status') for p in pays]
 
     def get_hold_invoice(self, payment_hash: Union[str, bytes]) -> Optional[HoldInvoice]:
         if isinstance(payment_hash, bytes):

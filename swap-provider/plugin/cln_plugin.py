@@ -1,5 +1,5 @@
 import time
-from typing import Callable
+from typing import Callable, List, Optional, Tuple
 from pyln.client.plugin import JSONType
 from pyln.client import Plugin
 from threading import Event
@@ -7,14 +7,30 @@ import asyncio
 
 
 class CLNPlugin:
-    def __init__(self):
+    def __init__(self, rpc_methods: Optional[List[Tuple[str, Callable]]] = None):
         self.plugin = Plugin()
         self.__htlc_hook = None
         self.__hook_ready = Event()
         self.__buffered_htlcs = []  # CLN replays htlcs, we buffer them until the hook is set so none get missed
         self.plugin.add_hook("htlc_accepted", self.__htlc_hook_handler, background=True)
+        # custom RPC methods must be registered here, BEFORE __await__
+        # starts plugin.run() in its thread — pyln answers lightningd's
+        # getmanifest with the method list collected so far, so anything
+        # added later would never be dispatched (issue #21 observability
+        # surface: swapprovider-health)
+        for name, func in (rpc_methods or []):
+            self.plugin.add_method(name, func, background=False)
         # Create but don't start the thread yet
         self.__task = None
+
+    def thread_alive(self) -> bool:
+        """True while the pyln plugin.run dispatch thread is still
+        running — the pipe-late-death probe for the #17/#23 watchdog.
+        A done task after startup means lightningd closed the pipe (or
+        the dispatcher crashed) while the asyncio side keeps serving
+        hooks — exactly the half-alive mode the audit flagged."""
+        return self.__task is not None and not self.__task.done()
+
 
     def __await__(self):
         async def __run():

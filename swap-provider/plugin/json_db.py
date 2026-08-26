@@ -24,6 +24,7 @@
 # SOFTWARE.
 import threading
 import copy
+import hashlib
 import json
 import jsonpatch
 
@@ -241,7 +242,9 @@ class JsonDB:  # (Logger):
         #     await self.write_and_force_consolidation()
 
     def load_data(self, s: str) -> dict:
-        self.logger.debug(f"JsonDB: loading data: {s}")
+        # never log the db content: it contains claim privkeys and
+        # preimages in plaintext (issue #13) — size only
+        self.logger.debug(f"JsonDB: loading {len(s)} characters of data")
         if s == '':
             self.logger.debug('JsonDB: empty input string')
             return {}
@@ -254,7 +257,13 @@ class JsonDB:  # (Logger):
             elif r := self.maybe_load_incomplete_data(s):
                 data, patches = r, []
             else:
-                raise WalletFileException("Cannot read wallet file. (parsing failed). Content: " + s)
+                # issue #19/#13: the old message embedded the WHOLE db
+                # content — plaintext privkeys/preimages straight into
+                # the crash log. Size + digest only; the db itself is
+                # the operator's forensic source.
+                raise WalletFileException(
+                    "Cannot read wallet file. (parsing failed). "
+                    f"len={len(s)}B sha256={hashlib.sha256(s.encode('utf-8', errors='replace')).hexdigest()}")
         if not isinstance(data, dict):
             raise WalletFileException("Malformed wallet file (not dict)")
         if patches:
@@ -294,10 +303,69 @@ class JsonDB:  # (Logger):
             if s[i] == '}':
                 n = n + 1
             if n == 0:
-                s = s[0:i]
-                assert s[-2:] == ',\n'
-                self.logger.info('found incomplete data {s[i:]}')
-                return self.load_data(s[0:-2])
+                prefix = s[0:i]
+                # the append format separates entries with ',\n' — the
+                # only boundary this recovery can amputate at. A
+                # balanced prefix ending anywhere else (e.g. truncated
+                # inside a consolidated compact dump) is not
+                # recoverable here: fall through to the loud
+                # WalletFileException instead of a bare assert crash.
+                if prefix[-2:] != ',\n':
+                    return None
+                # issue #19 (audit F05): recovering by amputating the
+                # unparsable tail used to be SILENT — the old log line
+                # even lacked its f-prefix, so the discarded bytes (the
+                # NEWEST appended state: swap records, hold invoices,
+                # claim privkeys) vanished without a trace. Amputation
+                # as recovery stays — but the damage is now loud and
+                # forensic: ERROR + quarantine fragment (below), and
+                # the intact prefix still loads.
+                self._report_discarded_fragment(s[i - 2:])
+                return self.load_data(prefix[0:-2])
+
+    # markers: a discarded fragment containing any of these may carry
+    # key material in plaintext (issue #13 — the jsondb holds claim
+    # privkeys/preimages), so it is never hex-previewed in a log; only
+    # its length + sha256 are printed. Section names count too: a tail
+    # cut before any field name still belongs to that section.
+    SENSITIVE_FRAGMENT_MARKERS = ('privkey', 'preimage', 'lightning_preimages',
+                                  'lightning_invoice', 'payment_secret',
+                                  'submarine_swaps', 'hold_invoices')
+
+    def _report_discarded_fragment(self, discarded: str) -> None:
+        """Issue #19 (audit F05): refuse-loudly tail amputation."""
+        frag = discarded.encode('utf-8', errors='replace')
+        if not frag or not frag.strip():
+            return  # nothing of substance was dropped — stay quiet
+        digest = hashlib.sha256(frag).hexdigest()
+        if any(m in discarded.lower() for m in self.SENSITIVE_FRAGMENT_MARKERS):
+            preview = (f"len={len(frag)}B sha256={digest} "
+                       f"(content withheld: may contain key material)")
+        else:
+            preview = (f"len={len(frag)}B sha256={digest} "
+                       f"first64={frag[:64].hex()} last64={frag[-64:].hex()}")
+        where = self._quarantine_discarded_fragment(discarded)
+        loc = f", preserved as {where}" if where else \
+            " (no quarantine sink on this storage — fragment NOT preserved)"
+        self.logger.error(
+            f"JsonDB: datastore damage — discarding unparsable final "
+            f"fragment [{preview}]{loc}; loading intact prefix")
+
+    def _quarantine_discarded_fragment(self, discarded: str):
+        """Persist the discarded fragment durably for forensics, next to
+        the datastore itself (CLNStorage: a sibling datastore child key,
+        …-discarded-<ts>.frag). Failure to quarantine is loud but must
+        not block the prefix recovery."""
+        sink = getattr(self.storage, 'write_quarantine', None)
+        if sink is None:
+            return None
+        try:
+            return sink(discarded, label='jsondb')
+        except Exception as e:
+            self.logger.error(f"JsonDB: failed to preserve discarded "
+                              f"fragment: {e!r}")
+            return None
+
 
     def set_modified(self, b):
         with self.lock:
