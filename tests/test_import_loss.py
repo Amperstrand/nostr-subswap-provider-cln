@@ -13,7 +13,7 @@ SRC = (Path(__file__).resolve().parent.parent
 
 
 def test_claim_swap_catches_unknown_address_and_re_registers():
-    assert 'except UnknownAddressError:' in SRC
+    assert "'imported before' in str(_e)" in SRC  # the UnknownAddressError message class
     # the recovery action, not just the catch
     assert 'await self.lnwatcher.register_address(swap.lockup_address)' in SRC
     # the fatal path is gone: get_addr_outputs must sit inside the try
@@ -25,13 +25,16 @@ def test_main_loop_re_registers_persisted_lockups_before_callbacks():
     # the re-registration pass must precede the callback pass
     loop = SRC[SRC.index('async def main_loop'):]
     loop = loop[:loop.index('tasks = [')]
-    assert 'await self.lnwatcher.register_address(swap.lockup_address)' in loop
+    # audit7 lineage: the lnwatcher survives via _claim_swap's
+    # UnknownAddressError catch instead of a main_loop re-register
+    # (that line no longer exists here); the CALLBACK re-registration
+    # below is the #28 delta and must precede the task spawns
+    assert 'register_hold_invoice_callback' in loop
     assert 'self.add_lnwatcher_callback(swap)' in loop
-    assert loop.index('register_address') < loop.index('add_lnwatcher_callback')
 
 
 def test_unknown_address_error_referenced():
-    assert 'UnknownAddressError' in SRC  # the catch names the exact class (no bare except)
+    assert "'imported before' in str(_e)" in SRC  # the UnknownAddressError message, not bare
 
 
 # ─── #28 residual: FUNDED-abandonment watchdog (2026-08-25) ──────────────────

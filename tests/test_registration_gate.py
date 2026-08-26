@@ -46,8 +46,7 @@ def _d2_swap(registered: bool = False) -> SwapData:
     return swap
 
 
-def _manager(swap: SwapData, height: int = 4900,
-             has_invoice: bool = False) -> SwapManager:
+def _manager_base(swap: SwapData, height: int = 4900, has_invoice: bool = False) -> SwapManager:
     sm = SwapManager.__new__(SwapManager)
     sm.logger = MagicMock()
     sm.db = MagicMock()  # issue #22: _claim_swap flushes on-chain mutations
@@ -94,8 +93,8 @@ def _manager(swap: SwapData, height: int = 4900,
     return sm
 
 
-def _manager(swap: SwapData) -> SwapManager:
-    sm = _manager_base(swap)
+def _manager(swap: SwapData, height: int = 4900, has_invoice: bool = False) -> SwapManager:
+    sm = _manager_base(swap, height=height, has_invoice=has_invoice)
     # default for the OLD tests: payment settled (they exercise the
     # registration gate, not the ordering gate) — proven live shape
     sm.lnworker._rpc = MagicMock()
@@ -202,7 +201,7 @@ class TestParkBeforeClaim:
         # payer-side truth (live-earned): the hold lives at the CLIENT;
         # the server's signal is listpays on the saved bolt11 —
         # 'pending' = HTLCs committed/parked at the receiver
-        sm = _manager_base(swap)
+        sm = _manager_base(swap, has_invoice=with_invoice)
         sm.lnworker._rpc = MagicMock()
         # the PROVEN live shape: listpays(payment_hash=…) → {'pays':[…]}
         sm.lnworker._rpc.listpays = MagicMock(

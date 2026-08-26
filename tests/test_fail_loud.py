@@ -408,6 +408,11 @@ class TestPersistenceDiscipline:
         fake_tx = MagicMock()
         fake_tx.txid = lambda: "f" * 64
         sm._create_and_sign_claim_tx = MagicMock(return_value=fake_tx)
+        # #26 park-then-claim: the payer-side listpays must report the
+        # payment parked/settled, else the claim defers before signing
+        sm.lnworker._rpc = MagicMock()
+        sm.lnworker._rpc.listpays = MagicMock(
+            return_value={"pays": [{"status": "complete"}]})
         return sm, events
 
     async def test_claim_persisted_before_broadcast(self):

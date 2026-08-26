@@ -106,6 +106,11 @@ def _manager(swap: SwapData, *, height=4900, conf=0, txins=None,
     sm.lnworker.get_invoice = MagicMock(return_value=invoice)
     sm.lnworker.get_payment_statuses = MagicMock(return_value=[])
     sm.lnworker.get_preimage = MagicMock(return_value=swap.preimage)
+    # #26 park-then-claim: payer-side listpays must report parked/
+    # settled for the claim to fire in these discharge tests
+    sm.lnworker._rpc = MagicMock()
+    sm.lnworker._rpc.listpays = MagicMock(
+        return_value={"pays": [{"status": "complete"}]})
     return sm
 
 
