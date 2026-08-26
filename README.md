@@ -54,3 +54,24 @@ The following variables are available:
 ### <u>Libraries</u>
 This plugin uses a lot of Electrum Wallet code that has been stripped/modified for this use case.
 It also uses the `pyln-client` library to communicate with CLN over the RPC interface.
+## Client mode (SWAP_MODE=client)
+
+The plugin can also run as a pure **client** of other Electrum-protocol
+swap providers: no offers published, no DMs served, no hold invoices —
+just discovery, gated swaps, and onchain claims (`swapclient`,
+`swapclient-offers`, `swapclient-status` RPCs).
+
+```bash
+SWAP_MODE=client lightningd ... --plugin=swap-provider.py
+lightning-cli swapclient-offers
+lightning-cli swapclient amount_sat=50000 [provider=<pubkey>]
+```
+
+`cli-swap.py` (repo root) is an educational walker over that mode: it
+prints the state machine, narrates every state with the attack it
+defends against, and dry-runs by default (`--execute` moves sats).
+
+The client implementation is the Python twin of the C++ client in
+`../clboss` (branch `nostr-swaps`, see its NOSTR-SWAP.md for the full
+bug ledger and e2e history); both are pinned to the same live swap
+values in their tests.
