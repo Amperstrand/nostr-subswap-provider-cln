@@ -282,6 +282,9 @@ class TestNostrWithdrawal:
         sm.server_add_swap_invoice = MagicMock(return_value={"ok": 1})
         t.sm = sm
         t.logger = MagicMock()
+        # r8: handle_request attributes against the transport config
+        # (production __init__ always sets it; npub registry empty here)
+        t.config = SimpleNamespace(test_npubs=())
         replies = []
 
         async def send(pubkey, content):

@@ -47,7 +47,8 @@ class CLNSwapProvider:
         # the method must be in pyln's dispatch table before plugin.run()
         # answers lightningd's getmanifest. The handler answers honestly
         # at every stage (parts missing during init report as "starting")
-        rpc_methods = [("swapprovider-health", self._swapprovider_health_rpc)]
+        rpc_methods = [("swapprovider-health", self._swapprovider_health_rpc),
+                       ("swapprovider-swaps", self._swapprovider_swaps_rpc)]
         if getattr(PluginConfig, "SWAP_MODE_DEFAULT", None) is None:
             # client RPCs register unconditionally (they no-op with a
             # clean error outside client mode); this keeps getmanifest
@@ -168,6 +169,15 @@ class CLNSwapProvider:
         Executed on the pyln dispatch thread; build_report touches only
         in-memory state under the tracker lock."""
         return build_report(self)
+
+    def _swapprovider_swaps_rpc(self, plugin=None, limit=None, **kwargs) -> dict:
+        """`lightning-cli swapprovider-swaps [limit]`: recent swaps
+        with traffic attribution (#24 r8) — {payment_hash, direction,
+        state, requester_npub, attributed, onchain_amount, age_sec}.
+        Read-only, in-memory records only; safe to poll. Monitoring
+        surface: attribution NEVER gates stranger traffic."""
+        from .attribution import list_recent_swaps
+        return list_recent_swaps(self, limit=limit)
 
     async def _pyln_pipe_watchdog(self):
         """#23 pyln pipe late-death detection: if the dispatch thread

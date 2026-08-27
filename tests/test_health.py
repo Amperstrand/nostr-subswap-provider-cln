@@ -404,6 +404,9 @@ def _stub_transport(monkeypatch, send_boom=False):
     t = object.__new__(ss.NostrTransport)
     t.logger = MagicMock()
     t.sm = _sm()
+    # r8: handle_request attributes against the transport config
+    # (production __init__ always sets it; npub registry empty here)
+    t.config = SimpleNamespace(test_npubs=())
     t.sm.is_server = True
     t.sm.is_initialized.set()
     t.sm.server_create_swap = AsyncMock(

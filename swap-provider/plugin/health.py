@@ -27,6 +27,8 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
+from .attribution import attribution_health_section
+
 # heartbeat specs: how stale a beat may get before it means something.
 # chain-monitor and payment-loop are tight fixed-period loops — a beat
 # past dead_after means the loop is WEDGED (the r4 fatal policy should
@@ -294,5 +296,8 @@ def build_report(provider) -> dict:
         if sm is not None else None,
         "inflight_payments": _inflight_payment_count(sm) if sm is not None else None,
         "expiring_soon_invoices": _expiring_soon_count(lnworker) if lnworker is not None else None,
+        # issue #24 r8 traffic attribution: monitoring-only counters
+        # ({ours, stranger, unknown}); never gates anything
+        "attribution": attribution_health_section(provider),
         "datastore": datastore,
     }
