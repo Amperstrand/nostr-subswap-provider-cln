@@ -102,7 +102,14 @@ def test_create_transaction_retries_when_excess_below_dust(monkeypatch):
     calls = []
 
     class FakeRPC:
-        def fundpsbt(self, **kw):
+        def listfunds(self):
+            # healthy pool: one free plain-script output (issue #29 filter
+            # only offers plain P2WPKH/P2TR confirmed+unreserved outputs)
+            return {"outputs": [{
+                "txid": "ab" * 32, "output": 0, "amount_msat": 100_000_000,
+                "status": "confirmed", "reserved": False,
+                "scriptpubkey": "0014" + "11" * 20}]}
+        def utxopsbt(self, **kw):
             calls.append(kw["satoshi"])
             # first two attempts: excess below dust; third: healthy
             excess = 0 if len(calls) < 3 else 700_000

@@ -15,13 +15,61 @@ class CLNChainWallet:
         self.logger = logger
         self.logger.debug("CLNChainWallet initialized")
 
+    @staticmethod
+    def _is_plain_key_script(scriptpubkey_hex: str) -> bool:
+        """True for plain wallet key scripts (P2WPKH 0014…/44, P2TR
+        5120…/68). Everything else in the CLN wallet (P2WSH to_local /
+        HTLC-timeout / anchor outputs, P2SH) is channel-close machinery
+        with CSV/CLTV encumbrances — never valid funding input for a tx
+        built at the current tip (issue #29)."""
+        return ((len(scriptpubkey_hex) == 44 and scriptpubkey_hex[:4] == '0014')
+                or (len(scriptpubkey_hex) == 68 and scriptpubkey_hex[:4] == '5120'))
+
     def create_transaction(self, *, outputs_without_change: [PartialTxOutput], rbf: bool) -> Optional[PartialTransaction]:
         """Assembles a signed PSBT spending to the passed outputs from the CLN wallet. Automatically adds change output."""
         output_sum_sat: int = int(sum([o.value for o in outputs_without_change]))
         tx_core_weight = 42
         spk_weights: int = sum([(len(o.scriptpubkey) + 9) * 4 for o in outputs_without_change])
         startweight: int = tx_core_weight + spk_weights  # weight of the tx without any inputs (required for CLN)
-        # get inpts from CLN wallet using fundpsbt rpc call
+        # issue #29: select inputs ONLY from plain key-script outputs
+        # (P2WPKH / P2TR of our keys) via an EXPLICIT utxo list. CLN's
+        # fundpsbt pool includes the wallet's own channel-close machinery
+        # outputs (to_local CSV, HTLC-timeout CLTV, anchors) — spendable
+        # only under conditions a funding tx at the current tip does not
+        # satisfy, so bitcoind rejects the whole tx at broadcast:
+        #   sendpsbt -26 mandatory-script-verify-flag-failed
+        #   (Locktime requirement not satisfied), input 0 …
+        # (earned live 2026-08-26 19:31Z+, mutinynet 0be690ad…:4 /
+        # 75829f98…:6 — deterministic whenever selection lands on them).
+        # This CLN has no fundpsbt `exclusions` param (-32602,
+        # live-probed), so we filter ourselves and hand the list to
+        # utxopsbt. onchaind sweeps the machinery outputs into plain
+        # wallet outputs on its own — excluding them loses nothing.
+        # Stricter than the old fundpsbt minconf=None on purpose: only
+        # confirmed+unreserved outputs are offered (no mempool-chain
+        # funding of our own change).
+        try:
+            funds = self.rpc.listfunds()
+        except Exception as e:
+            self.logger.error(f"create_transaction failed to call listfunds rpc: {e}")
+            return None
+        free_utxos, excluded_utxos = [], []
+        for o in funds.get('outputs', []):
+            selectable = (o.get('status') == 'confirmed'
+                          and not o.get('reserved')
+                          and self._is_plain_key_script(o.get('scriptpubkey', '')))
+            (free_utxos if selectable else excluded_utxos).append(
+                f"{o['txid']}:{o['output']}")
+        if excluded_utxos:
+            self.logger.info(f"create_transaction: excluding {len(excluded_utxos)} "
+                             "wallet output(s) from coin selection "
+                             "(reserved/unconfirmed or channel-close machinery "
+                             "with CSV/CLTV encumbrances — issue #29)")
+        if not free_utxos:
+            self.logger.error("create_transaction: no free plain-script utxos in "
+                              f"the wallet ({len(excluded_utxos)} excluded, "
+                              "issue #29) — cannot fund the lockup")
+            return None
         # CHANGE-SLACK (+1000 sat over the output sum): with
         # excess_as_change=true and an exact-satoshi ask, CLN selects
         # inputs so excess lands at dust and DROPS the change output ->
@@ -36,14 +84,14 @@ class CLNChainWallet:
         # Escalate the ask until excess clears dust; each re-ask asks CLN
         # to select for a larger target so excess grows with granularity.
         DUST_SAT = 546
-        fundpsbt_response = None
+        funding_response = None
         for attempt in range(4):
             ask_sat = output_sum_sat + 1000 + attempt * 2500
             try:
-                resp = self.rpc.fundpsbt(satoshi=ask_sat,
+                resp = self.rpc.utxopsbt(satoshi=ask_sat,
                                                 feerate=self.config.cln_feerate_str,
                                                 startweight=startweight,
-                                                minconf=None,
+                                                utxos=free_utxos,
                                                 # reserve=12 blocks (~6 min on mutinynet):
                                                 # signpsbt REFUSES unreserved inputs,
                                                 # but the DEFAULT 253-block reservation
@@ -57,11 +105,11 @@ class CLNChainWallet:
             except Exception as e:
                 # PluginLogger.error takes ONE arg (printf-style args crash
                 # it — earned: the crash message replaced the real error)
-                self.logger.error(f"create_transaction failed to call fundpsbt rpc: {e}")
+                self.logger.error(f"create_transaction failed to call utxopsbt rpc: {e}")
                 return None
             excess_sat = int(resp.get("excess_msat", 0)) // 1000
             if excess_sat >= DUST_SAT or attempt == 3:
-                fundpsbt_response = resp
+                funding_response = resp
                 break
             # release the dusty ask's reservation before re-asking, or the
             # escalation starves the wallet one UTXO-granule per attempt
@@ -69,10 +117,10 @@ class CLNChainWallet:
                 self.rpc.unreserveinputs(resp['psbt'])
             except Exception:
                 pass  # best-effort; reserve=12 bounds any leak
-            self.logger.info(f"fundpsbt excess {excess_sat} sat < dust "
+            self.logger.info(f"utxopsbt excess {excess_sat} sat < dust "
                              f"({DUST_SAT}) — unreserved + escalating ask "
                              f"({ask_sat} -> {ask_sat + 2500})")
-        raw_inputs_only_psbt = fundpsbt_response['psbt']
+        raw_inputs_only_psbt = funding_response['psbt']
 
         # add outputs to inputs_only_psbt
         complete_psbt = PartialTransaction().from_raw_psbt(raw_inputs_only_psbt)
