@@ -264,22 +264,47 @@ class CLNChainWallet:
 
     def min_emergency_reserve_sat(self) -> int:
         """issue #31: CLN's min-emergency-msat — the floor no wallet
-        spend may cross. Node config, so it is fetched once and cached;
-        listconfigs shape (live-pinned, CLN v26.06):
-        {'min-emergency-msat': {'value_msat': 25000000, 'source': …}}."""
+        spend may cross. Node config, so it is fetched once and cached.
+        LIVE shape (2026-08-28, pyln socket RPC, CLN v26.06): the raw
+        listconfigs result wraps every option under a 'configs' key —
+        {'configs': {'min-emergency-msat': {'value_msat': 10000000,
+        'source': …}}}. Probing the top level silently missed the key
+        and fell back to 25,000 for three quotation ticks while the
+        node was configured to 10,000 (live 2026-08-28 16:46-17:06Z:
+        the accept gate rejected 20k swaps at '18,535 spendable' with
+        true capacity 33,535)."""
         if self._min_emergency_sat is None:
-            try:
-                raw = self.rpc.listconfigs().get('min-emergency-msat', {})
-                msat = raw.get('value_msat') if isinstance(raw, dict) else raw
-                self._min_emergency_sat = (int(msat) // 1000
-                                           if msat is not None
-                                           else self.MIN_EMERGENCY_FALLBACK_SAT)
-            except Exception as e:
-                self.logger.warning(f"min_emergency_reserve_sat: listconfigs "
-                                    f"failed ({e}) — assuming CLN default "
-                                    f"{self.MIN_EMERGENCY_FALLBACK_SAT} sat")
-                self._min_emergency_sat = self.MIN_EMERGENCY_FALLBACK_SAT
+            self._min_emergency_sat = self._read_min_emergency_sat()
         return self._min_emergency_sat
+
+    def _read_min_emergency_sat(self) -> int:
+        try:
+            resp = self.rpc.listconfigs()
+        except Exception as e:
+            self.logger.warning(f"min_emergency_reserve_sat: listconfigs "
+                                f"failed ({e}) — assuming CLN default "
+                                f"{self.MIN_EMERGENCY_FALLBACK_SAT} sat")
+            return self.MIN_EMERGENCY_FALLBACK_SAT
+        # socket RPC wraps options under 'configs'; clnrest-style
+        # renderings are flat — support both
+        cfg = resp.get('configs', resp) if isinstance(resp, dict) else {}
+        raw = cfg.get('min-emergency-msat') if isinstance(cfg, dict) else None
+        msat = None
+        if isinstance(raw, dict):
+            msat = raw.get('value_msat')
+        elif isinstance(raw, int):
+            msat = raw
+        elif isinstance(raw, str) and raw.endswith('msat'):
+            msat = raw[:-len('msat')]
+        if msat is None:
+            # issue #31 follow-up (live-earned): the fallback direction is
+            # SAFE (under-advertise) but silent-fallback hid a mis-parse
+            # for 40 minutes — an unreadable reserve is ALWAYS loud
+            self.logger.warning(f"min_emergency_reserve_sat: could not read "
+                                f"min-emergency-msat (raw={raw!r}) — assuming "
+                                f"CLN default {self.MIN_EMERGENCY_FALLBACK_SAT} sat")
+            return self.MIN_EMERGENCY_FALLBACK_SAT
+        return int(msat) // 1000
 
     def spendable_capacity_sat(self) -> int:
         """issue #31: what the wallet can actually fund — balance_sat()

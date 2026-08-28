@@ -44,7 +44,21 @@ from plugin.submarine_swaps import SwapManager  # noqa: E402
 
 FREE_P2WPKH = "0014" + "1f" * 20
 
-LIVE_LISTCONFIGS = {  # captured from cln-swap-mutinynet, CLN v26.06
+# Live-pinned 2026-08-28, pyln socket RPC on cln-swap-mutinynet (CLN
+# v26.06): the RAW listconfigs result wraps every option under a
+# 'configs' key — the flat view earlier tests used is what clnrest-style
+# renderings show, NOT what the plugin's rpc sees.
+SOCKET_LISTCONFIGS = {
+    "configs": {
+        "min-emergency-msat": {
+            "value_msat": 10000000,
+            "source": "/root/.lightning/lightning-config:16",
+        },
+    },
+}
+
+# The clnrest-rendered flat view (kept for backward-compat parsing).
+LIVE_LISTCONFIGS = {
     "min-emergency-msat": {"value_msat": 25000000, "source": "default"},
 }
 
@@ -91,6 +105,43 @@ class TestSpendableCapacity:
 
         assert rpc.listconfigs.call_count == 1, \
             "the reserve is node config — cache it, do not RPC per tick"
+
+    def test_reads_socket_wrapped_shape(self):
+        """The shape the plugin's rpc ACTUALLY returns (live 2026-08-28
+        16:46-17:06Z): options nested under 'configs'; the top-level
+        probe silently fell back to 25,000 and the gate rejected three
+        clboss ticks at '18,535 spendable' with true capacity 33,535."""
+        wallet, _ = _wallet(confirmed_free_sat=80_000,
+                            listconfigs=SOCKET_LISTCONFIGS)
+
+        cap = wallet.spendable_capacity_sat()
+
+        assert cap == 80_000 * 0.9 - 10_000, \
+            "configs-wrapped listconfigs must yield the configured reserve"
+
+    def test_accepts_msat_string_form(self):
+        wrapped_str = {"configs": {"min-emergency-msat": "10000000msat"}}
+        wallet, _ = _wallet(confirmed_free_sat=80_000,
+                            listconfigs=wrapped_str)
+
+        cap = wallet.spendable_capacity_sat()
+
+        assert cap == 80_000 * 0.9 - 10_000
+
+    def test_unreadable_reserve_warns_never_silent(self):
+        """The availability killer: a missing/unrecognized reserve must
+        WARN, not silently assume — the silent fallback understated
+        capacity by 15k sat for 40 minutes (live 2026-08-28)."""
+        wallet, _ = _wallet(confirmed_free_sat=80_000,
+                            listconfigs={"configs": {}})
+
+        cap = wallet.spendable_capacity_sat()
+
+        assert cap == 80_000 * 0.9 - 25_000, \
+            "fallback direction stays safe (CLN default reserve)"
+        assert wallet.logger.warning.called, \
+            "an unreadable reserve MUST be loud — silent fallback hid a " \
+            "live mis-parse for three quotation ticks"
 
 
 class TestOfferCap:
