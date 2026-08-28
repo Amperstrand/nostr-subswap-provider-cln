@@ -1400,9 +1400,13 @@ class SwapManager:
         # real capacity is a few hundred k — clients would negotiate swaps
         # the node can't fund. Plugin config clamps to available capacity
         # at update time (min(env cap, spendable onchain, LN send+recv)).
+        # issue #31 (live 2026-08-28: offer said 67,475, utxopsbt then
+        # refused 45,004 with 313 min-emergency-msat): cap at what CLN
+        # will actually fund — balance minus the emergency reserve —
+        # never at bare balance_sat().
         self._max_amount = min(
             int(getattr(self.config, "max_swap_amount", 10_000_000)),
-            max(20000, int(self.wallet.balance_sat())),
+            max(20000, int(self.wallet.spendable_capacity_sat())),
             max(20000, int(self.lnworker.num_sats_can_receive())
                 + int(self.lnworker.num_sats_can_send())),
         )
@@ -1592,8 +1596,13 @@ class SwapManager:
                                     f'{self.lnworker.num_sats_can_receive()}, '
                                     f'rejecting swap for {lightning_amount_sat}sat')
                 return {'error': 'not enough incoming capacity, please open channel'}
-            if self.wallet.balance_sat() < lightning_amount_sat:
-                self.logger.warning(f'not enough onchain balance to satisfy: {self.wallet.balance_sat()} sat'
+            # issue #31: reserve-aware gate — reject BEFORE the payer
+            # funds (live 2026-08-28: the balance-blind gate accepted a
+            # 44,232-sat swap, the payer parked 43,954 sat, THEN the
+            # funding failed at utxopsbt 313 min-emergency-msat)
+            if self.wallet.spendable_capacity_sat() < lightning_amount_sat:
+                self.logger.warning(f'not enough onchain balance to satisfy: '
+                                    f'{self.wallet.spendable_capacity_sat()} sat spendable'
                                     f', rejecting swap for {lightning_amount_sat} sat')
                 return {'error': 'not enough onchain balance'}
             swap, invoice, prepay_invoice = await self.create_normal_swap(

@@ -9,10 +9,18 @@ from .transaction import PartialTxOutput, PartialTransaction
 from .utils import TxBroadcastError
 
 class CLNChainWallet:
+    # issue #31: CLN refuses any wallet spend that would dip below the
+    # min-emergency-msat reserve (utxopsbt error 313 "We would not have
+    # enough left for min-emergency-msat", live 2026-08-28 15:26Z). This
+    # is the fallback when listconfigs cannot be read; under-advertising
+    # is the safe direction.
+    MIN_EMERGENCY_FALLBACK_SAT = 25_000
+
     def __init__(self, *, plugin_rpc: LightningRpc, config: PluginConfig, logger: PluginLogger):
         self.rpc = plugin_rpc
         self.config = config
         self.logger = logger
+        self._min_emergency_sat = None
         self.logger.debug("CLNChainWallet initialized")
 
     @staticmethod
@@ -253,3 +261,30 @@ class CLNChainWallet:
             if output['status'] == 'confirmed' and output['reserved'] == False:
                 balance += output['amount_msat'] // 1000
         return int(balance * 0.9)
+
+    def min_emergency_reserve_sat(self) -> int:
+        """issue #31: CLN's min-emergency-msat — the floor no wallet
+        spend may cross. Node config, so it is fetched once and cached;
+        listconfigs shape (live-pinned, CLN v26.06):
+        {'min-emergency-msat': {'value_msat': 25000000, 'source': …}}."""
+        if self._min_emergency_sat is None:
+            try:
+                raw = self.rpc.listconfigs().get('min-emergency-msat', {})
+                msat = raw.get('value_msat') if isinstance(raw, dict) else raw
+                self._min_emergency_sat = (int(msat) // 1000
+                                           if msat is not None
+                                           else self.MIN_EMERGENCY_FALLBACK_SAT)
+            except Exception as e:
+                self.logger.warning(f"min_emergency_reserve_sat: listconfigs "
+                                    f"failed ({e}) — assuming CLN default "
+                                    f"{self.MIN_EMERGENCY_FALLBACK_SAT} sat")
+                self._min_emergency_sat = self.MIN_EMERGENCY_FALLBACK_SAT
+        return self._min_emergency_sat
+
+    def spendable_capacity_sat(self) -> int:
+        """issue #31: what the wallet can actually fund — balance_sat()
+        minus the emergency reserve. Advertising or accepting above this
+        sells swaps CLN refuses to fund (live 2026-08-28: offer max
+        67,475 vs a 44,232-sat swap refused at utxopsbt 313 with 43,954
+        sat of payer HTLCs already parked)."""
+        return int(self.balance_sat()) - self.min_emergency_reserve_sat()

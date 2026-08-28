@@ -253,6 +253,7 @@ class TestRecordAtCreation:
         sm.create_normal_swap = AsyncMock(return_value=fake)
         sm.lnworker.num_sats_can_receive = MagicMock(return_value=10**9)
         sm.wallet.balance_sat = MagicMock(return_value=10**9)
+        sm.wallet.spendable_capacity_sat = MagicMock(return_value=10**9)
         await sm.server_create_swap({
             'type': 'reversesubmarine', 'pairId': 'BTC/BTC',
             'invoiceAmount': 1000, 'preimageHash': '22' * 32,
