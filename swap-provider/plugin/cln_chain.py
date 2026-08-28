@@ -122,23 +122,42 @@ class CLNChainWallet:
                              f"({ask_sat} -> {ask_sat + 2500})")
         raw_inputs_only_psbt = funding_response['psbt']
 
-        # add outputs to inputs_only_psbt
-        complete_psbt = PartialTransaction().from_raw_psbt(raw_inputs_only_psbt)
-        complete_psbt.add_outputs(outputs_without_change)
-        complete_psbt.set_rbf(rbf)
-        complete_psbt_b64 = complete_psbt._serialize_as_base64()
-
-        # sign psbt using CLN rpc call
+        # issue #30: utxopsbt RESERVED the selected inputs (reserve=12).
+        # Every path below that abandons the ask WITHOUT spending them
+        # must release the reservation, or failed funding rounds lock the
+        # wallet until reservation expiry (live 2026-08-27/28: stale
+        # reservations of 12,535 + 17,074 + 54,000 = 83,609 of 103,664
+        # confirmed sat locked — a swap-dead provider until they aged out).
         try:
-           signed_psbt = self.rpc.signpsbt(complete_psbt_b64)["signed_psbt"]
+            # add outputs to inputs_only_psbt
+            complete_psbt = PartialTransaction().from_raw_psbt(raw_inputs_only_psbt)
+            complete_psbt.add_outputs(outputs_without_change)
+            complete_psbt.set_rbf(rbf)
+            complete_psbt_b64 = complete_psbt._serialize_as_base64()
+
+            # sign psbt using CLN rpc call
+            signed_psbt = self.rpc.signpsbt(complete_psbt_b64)["signed_psbt"]
         except Exception as e:
-            self.logger.error(f"create_transaction failed to call signpsbt rpc: {e}")
+            self._unreserve_best_effort(raw_inputs_only_psbt)
+            self.logger.error(f"create_transaction failed to assemble/sign the "
+                              f"funding psbt (reserved inputs released): {e}")
             return None
 
         signed_psbt = PartialTransaction().from_raw_psbt(signed_psbt)
         signed_psbt.finalize_psbt()
 
         return signed_psbt
+
+    def _unreserve_best_effort(self, psbt_b64: str) -> None:
+        """issue #30: release a utxopsbt reservation on an abandoned ask.
+        Must be the PSBT form — the bare-outpoint form was a live no-op on
+        CLN v26.06 (issue #30 body); the reserve expiry bounds any failure
+        of this call itself."""
+        try:
+            self.rpc.unreserveinputs(psbt_b64)
+        except Exception as e:
+            self.logger.warning(f"unreserveinputs failed (leak bounded by "
+                                f"reservation expiry): {e}")
 
     def broadcast_transaction(self, signed_psbt: PartialTransaction) -> None:
         """Broadcasts a signed transaction to the bitcoin network."""
@@ -148,6 +167,11 @@ class CLNChainWallet:
             res = self.rpc.sendpsbt(signed_psbt._serialize_as_base64())
             self.logger.debug(f"broadcasted tx: {res}")
         except RpcError as e:
+            # issue #30: the tx never went out, so its inputs are not
+            # spent — release their utxopsbt reservation now instead of
+            # at expiry, or one failed broadcast per swap starves funding
+            # rounds for the whole reserve window.
+            self._unreserve_best_effort(signed_psbt._serialize_as_base64())
             raise TxBroadcastError(e)
 
     async def get_local_height(self, retries_30sec: int = 20) -> int:

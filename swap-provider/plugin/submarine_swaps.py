@@ -605,8 +605,19 @@ class SwapManager:
         if swap is None:
             return
         self.logger.warning(f'failing swap {swap.payment_hash.hex()}: {reason}')
-        if not swap.is_reverse and swap.payment_hash in self.lnworker._hold_invoice_callbacks:
-            self.lnworker.unregister_hold_invoice_callback(swap.payment_hash)
+        # R5 + live 2026-08-28 15:26Z (swap cff928cd…, clboss client): the
+        # cancel branch below used to be gated on `swap.payment_hash in
+        # self.lnworker._hold_invoice_callbacks` — SwapData.payment_hash is
+        # BYTES while the registry normalizes to HEX-string keys
+        # (register_hold_invoice_callback), so the gate was ALWAYS False:
+        # a fully-funded swap whose funding tx failed (utxopsbt 313,
+        # min-emergency-msat) deleted its swap state but left the payer's
+        # 4 parked MPP HTLCs (43,954 sat) hanging until CLTV ~1.3h later,
+        # with the 278-sat prepay already settled. Cancel regardless of
+        # registration state; unregister only if present.
+        if not swap.is_reverse:
+            if swap.payment_hash.hex() in self.lnworker._hold_invoice_callbacks:
+                self.lnworker.unregister_hold_invoice_callback(swap.payment_hash)
             for payment_hash in [swap.payment_hash, swap.prepay_hash]:
                 # prepay hash should already be settled at this point
                 invoice = self.lnworker.get_hold_invoice(payment_hash)
