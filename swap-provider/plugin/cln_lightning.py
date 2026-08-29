@@ -622,6 +622,21 @@ class CLNLightning:
                                                             available_channels)
         routing_hints = []
         for channel in suitable_channels:
+            # a NORMAL channel whose gossip exchange has not completed yet
+            # (fresh channel + just-reconnected peer) carries no
+            # updates.remote — hinting from it crashes the whole swap
+            # creation with KeyError (earned live on the regtest lab
+            # 2026-08-29: every createswap died on a 1-block-old channel
+            # whose remote channel_update never arrived). Skip instead —
+            # a hint-less-but-healthy sibling channel still covers the
+            # R9 case; if none do, the payer's NoPathFound surfaces.
+            updates = (channel.get("updates") or {}).get("remote")
+            if not updates:
+                self._logger.warning(
+                    f"_get_route_hints: skipping channel "
+                    f"{channel.get('short_channel_id')} (no remote updates — "
+                    "gossip exchange incomplete)")
+                continue
             short_id = ShortID.from_str(channel["short_channel_id"])
             routing_hints.append(('r', [(
                 bytes.fromhex(channel["peer_id"]),
