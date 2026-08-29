@@ -23,12 +23,41 @@ class BitcoinCoreRPC:
         self.iface = BitcoinRPC.from_config(
             url=f"{bcore_rpc_credentials.url}/wallet/{self._wallet_name}",
             auth=bcore_rpc_credentials.auth,)
+        self._rpc_credentials = bcore_rpc_credentials
+        # playground #60: bitcoinrpc keeps a persistent httpx pool; when
+        # the keepalive flows die (live 2026-08-29: transient blip), every
+        # call times out with str()=='' forever while bitcoind is healthy.
+        # 3 consecutive failures rebuild the client (fresh pool).
+        self._iface_fail_streak = 0
         self._logger = logger
         self._network = bcore_rpc_credentials.network
         # lookup mode (txindex|esplora) + esplora base URL; set via
         # set_lookup_mode before _init when running under the plugin
         self._chain_lookup_mode = "txindex"
         self._esplora_urls = []
+
+    def note_rpc_failure(self, exc: Exception) -> bool:
+        """Count a consecutive Core-RPC failure; rebuild the client
+        (fresh connection pool) every 3rd one. Returns True when the
+        rebuild happened (#60: claims must not sit dead for a stale
+        keepalive pool)."""
+        self._iface_fail_streak += 1
+        if self._iface_fail_streak >= 3:
+            self._rebuild_iface()
+            self._iface_fail_streak = 0
+            return True
+        return False
+
+    def note_rpc_success(self) -> None:
+        self._iface_fail_streak = 0
+
+    def _rebuild_iface(self) -> None:
+        self._logger.warning(
+            f"ChainMonitor: rebuilding bitcoind RPC client after "
+            f"{self._iface_fail_streak} consecutive failures (#60 stale-pool)")
+        self.iface = BitcoinRPC.from_config(
+            url=f"{self._rpc_credentials.url}/wallet/{self._wallet_name}",
+            auth=self._rpc_credentials.auth,)
 
     async def _test_connection(self) -> None:
         """Test the connection to the Bitcoin Core node"""

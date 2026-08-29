@@ -48,7 +48,17 @@ class ChainMonitor(BitcoinCoreRPC):
         last_height = None
         while True:
             try:
-                blockheight = await self.get_local_height()
+                try:
+                    blockheight = await self.get_local_height()
+                    self.note_rpc_success()
+                except Exception as e:
+                    # #60: a stale keepalive pool times out with str()==''
+                    # forever — rebuild the client on streaks, keep retrying
+                    if self.note_rpc_failure(e):
+                        self._logger.warning(
+                            "ChainMonitor: bitcoind RPC client rebuilt "
+                            "(#60) — next pass uses a fresh pool")
+                    raise
                 # heartbeat: one beat per pass — a beat that goes stale
                 # means the loop itself is wedged (a hanging RPC without
                 # timeout), which the fatal policy cannot catch
