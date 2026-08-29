@@ -224,6 +224,7 @@ class SwapManager:
         self.percentage = None
         self._min_amount = None
         self._max_amount = None
+        self._max_reverse_amount = None
 
         self.wallet = wallet
         self.lnworker = lnworker
@@ -1410,6 +1411,16 @@ class SwapManager:
             max(20000, int(self.lnworker.num_sats_can_receive())
                 + int(self.lnworker.num_sats_can_send())),
         )
+        # playground #61: one cap served both directions, but the
+        # reverse serve gate (server_create_swap) checks
+        # num_sats_can_receive() alone — a one-sided CLN node (all-local
+        # channels) advertised reverse swaps it refused at 20k (live:
+        # maxReverse 51,500 vs HTTP 400). Gate the advertised reverse
+        # cap on receivable inbound; the forward cap stays onchain-based.
+        self._max_reverse_amount = min(
+            int(getattr(self.config, "max_swap_amount", 10_000_000)),
+            max(20000, int(self.lnworker.num_sats_can_receive())),
+        )
         # PORT FIND #9: one mining_fee everywhere, like electrum's server.
         # The client derives its expected onchainAmount from the OFFER's
         # mining_fee (pre-batcher formula), then also subtracts it again
@@ -1742,7 +1753,7 @@ class NostrTransport:  # (Logger):
             mining_fee_sat=self.sm.normal_fee,
             min_amount_sat=self.sm._min_amount,
             max_forward_sat=self.sm._max_amount,
-            max_reverse_sat=self.sm._max_amount,
+            max_reverse_sat=self.sm._max_reverse_amount,
             relays_csv=self.sm.config.nostr_relays_csv,
             pow_nonce=self.config.ann_pow_nonce,
             # percent units, matching percentage_fee semantics; 0 hides
