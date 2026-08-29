@@ -1,7 +1,10 @@
+import asyncio
 import sys
+import time
 import types
 from pathlib import Path
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "swap-provider"))
@@ -10,7 +13,9 @@ _stub.BitcoinRPC = object
 _stub.RPCError = RuntimeError
 sys.modules.setdefault("bitcoinrpc", _stub)
 
-from plugin.bitcoin_core_rpc import BitcoinCoreRPC  # noqa: E402
+import plugin.bitcoin_core_rpc as bcr  # noqa: E402
+from plugin.bitcoin_core_rpc import (  # noqa: E402
+    BitcoinCoreRPC, BitcoinCoreRPCError)
 
 
 class _FakeEsplora:
@@ -91,6 +96,178 @@ def test_lookup_mode_routing():
     assert m._chain_lookup_mode == "txindex" and m._esplora_urls == []
     m.set_lookup_mode("esplora", ["http://shim:8788/"])
     assert m._esplora_urls == ["http://shim:8788"]  # trailing slash stripped
+
+
+# ---------------------------------------------------------------------------
+# #34: esplora fetch timeouts — the live wedge (2026-08-28/29) showed
+# fetches hanging 30-40 MINUTES with a nominally-configured aiohttp
+# total=20s that never fired, wedging the whole monitoring loop (no
+# 'New blockheight' lines, network-wide claim stalls, burst on return).
+# The fetch layer must: hard-cap EVERY attempt (a deadline no transport
+# subtlety can defeat), retry an endpoint a bounded number of times,
+# then fall through to the next ESPLORA_URLS entry.
+# ---------------------------------------------------------------------------
+
+DEAD = "http://127.0.0.1:1"    # refused fast on any box (no DNS in play)
+LIVE = "http://127.0.0.2:1"    # distinct base for handler dispatch
+
+
+class _FetchMon(BitcoinCoreRPC):
+    """Minimal harness that exercises the REAL _esplora_get (no override)."""
+
+    def __init__(self):
+        self._logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None),
+                                       "info": staticmethod(lambda *a, **k: None),
+                                       "warning": staticmethod(lambda *a, **k: None),
+                                       "error": staticmethod(lambda *a, **k: None)})()
+
+
+def _wire_handler(monkeypatch, handler):
+    monkeypatch.setattr(BitcoinCoreRPC, "_new_esplora_client",
+                        lambda self: httpx.AsyncClient(
+                            transport=httpx.MockTransport(handler)))
+
+
+def _shrink_caps(monkeypatch, cap_s=0.2):
+    monkeypatch.setattr(bcr, "ESPLORA_ATTEMPT_HARD_CAP_S", cap_s)
+
+
+async def test_esplora_hanging_endpoint_hits_hard_cap_and_falls_through(monkeypatch):
+    """THE #34 regression: a wedged endpoint (accepts, never answers) must
+    cost one bounded attempt-cycle, then the next endpoint serves the lookup.
+    The watcher must never block indefinitely on one endpoint."""
+    calls = {"dead": 0, "live": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "127.0.0.2":
+            calls["live"] += 1
+            return httpx.Response(200, json={"txid": "ab" * 32, "status": {}})
+        calls["dead"] += 1
+        await asyncio.sleep(30)  # the wedge: headers never arrive
+        return httpx.Response(200, json={})
+
+    _wire_handler(monkeypatch, handler)
+    _shrink_caps(monkeypatch)
+    m = _FetchMon()
+    m.set_lookup_mode("esplora", [DEAD, LIVE])
+
+    t0 = time.monotonic()
+    res = await m._esplora_get(f"/tx/{'ab' * 32}")
+    elapsed = time.monotonic() - t0
+
+    assert res is not None and res.get("txid") == "ab" * 32
+    assert calls["dead"] == bcr.ESPLORA_ATTEMPTS_PER_ENDPOINT  # bounded retry, not forever
+    assert calls["live"] == 1
+    assert elapsed < 10, f"fallback took {elapsed:.1f}s — hard cap not bounding"
+
+
+async def test_esplora_all_endpoints_dead_raises_bounded(monkeypatch):
+    """Dead stack: bounded attempts, then the typed error — never a hang."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={})
+
+    _wire_handler(monkeypatch, handler)
+    _shrink_caps(monkeypatch)
+    m = _FetchMon()
+    m.set_lookup_mode("esplora", [DEAD])
+
+    t0 = time.monotonic()
+    with pytest.raises(BitcoinCoreRPCError, match="failed on all 1 endpoints"):
+        await m._esplora_get("/tx/" + "ab" * 32)
+    elapsed = time.monotonic() - t0
+    assert calls["n"] == bcr.ESPLORA_ATTEMPTS_PER_ENDPOINT
+    assert elapsed < 10, f"dead endpoint cost {elapsed:.1f}s — unbounded"
+
+
+async def test_esplora_retries_endpoint_then_succeeds(monkeypatch):
+    """Transient 5xx on attempt 1 must not fail the lookup (bounded retry),
+    nor burn the fallback endpoint."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(502)  # mempool.space 5xx class
+        return httpx.Response(200, text="deadbeef",
+                              headers={"Content-Type": "text/plain"})
+
+    _wire_handler(monkeypatch, handler)
+    m = _FetchMon()
+    m.set_lookup_mode("esplora", [DEAD])
+
+    res = await m._esplora_get("/tx/" + "ab" * 32 + "/hex")
+    assert res == "deadbeef"
+    assert calls["n"] == 2
+
+
+async def test_esplora_404_is_definitive_no_retry(monkeypatch):
+    """404 = esplora's 'unknown txid' answer — a definitive response, not
+    an endpoint failure: no retry, no fallback, None returned."""
+    calls = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(404)
+
+    _wire_handler(monkeypatch, handler)
+    m = _FetchMon()
+    m.set_lookup_mode("esplora", [DEAD, LIVE])
+
+    assert await m._esplora_get("/tx/" + "cd" * 32) is None
+    assert calls["n"] == 1
+
+
+async def test_esplora_client_timeout_config_is_bounded():
+    """The per-attempt httpx timeout must be explicit — the default (5 min)
+    or None would put the bound entirely on the hard cap."""
+    mon = _FetchMon()
+    client = mon._new_esplora_client()
+    try:
+        t = client.timeout
+        assert t is not None and t.connect is not None and t.read is not None
+        assert t.connect <= 10 and t.read <= 30, (
+            f"per-attempt timeout too generous: connect={t.connect} read={t.read}")
+    finally:
+        await client.aclose()
+
+
+async def test_esplora_no_endpoints_raises_typed(monkeypatch):
+    m = _FetchMon()
+    m.set_lookup_mode("esplora", [])
+    with pytest.raises(BitcoinCoreRPCError, match="failed on all 0 endpoints"):
+        await m._esplora_get("/tx/" + "ab" * 32)
+
+
+async def test_esplora_endpoint_exhaustion_logs_warning(monkeypatch):
+    """#23 severity lesson: money-path degradation must be separable by
+    level — an exhausted endpoint logs a WARNING naming it."""
+    warned = []
+
+    class L:
+        debug = staticmethod(lambda *a, **k: None)
+        info = staticmethod(lambda *a, **k: None)
+        error = staticmethod(lambda *a, **k: None)
+
+        def warning(self, *a, **k):
+            warned.append(" ".join(str(x) for x in a))
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return httpx.Response(200, json={})
+
+    _wire_handler(monkeypatch, handler)
+    _shrink_caps(monkeypatch)
+    m = _FetchMon()
+    m._logger = L()
+    m.set_lookup_mode("esplora", [DEAD, LIVE])
+
+    with pytest.raises(BitcoinCoreRPCError):
+        await m._esplora_get("/tx/" + "ab" * 32)
+    assert any(DEAD in w for w in warned), f"no warning named the dead endpoint: {warned}"
 
 
 def test_create_transaction_retries_when_excess_below_dust(monkeypatch):

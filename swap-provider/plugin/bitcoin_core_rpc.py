@@ -1,6 +1,7 @@
 import traceback
 
 import attr
+import httpx
 from bitcoinrpc import BitcoinRPC, RPCError as BitcoinRPCError
 from typing import Optional, Tuple, List, Union
 from httpx import Timeout as HttpxTimeout
@@ -13,6 +14,20 @@ from .lnutil import bytes_to_hex
 from .transaction import Transaction, PartialTxInput, TxOutpoint
 from .utils import TxMinedInfo, descsum_create
 from .bitcoin import COIN
+
+# #34: esplora fetch policy — the live wedge (2026-08-28/29 signet) had
+# fetches hanging 30-40 MINUTES with a nominally-configured aiohttp
+# total=20s that never fired, wedging the whole monitoring loop (zero
+# 'New blockheight' lines, network-wide claim stalls, backlog burst on
+# return). Every attempt now carries TWO independent bounds: an httpx
+# per-attempt timeout AND a hard outer deadline (asyncio.wait_for) that
+# no transport subtlety (DNS resolver threads, header trickle, pool
+# waits) can defeat. An endpoint gets a bounded retry count, then the
+# fetch falls through to the next ESPLORA_URLS entry.
+ESPLORA_ATTEMPTS_PER_ENDPOINT = 2
+ESPLORA_ATTEMPT_TIMEOUT = httpx.Timeout(5.0, read=15.0)  # connect/write/pool=5, read=15
+ESPLORA_ATTEMPT_HARD_CAP_S = 20.0
+
 
 class BitcoinCoreRPC:
     def __init__(self, logger: PluginLogger,
@@ -218,25 +233,45 @@ class BitcoinCoreRPC:
                               else ([esplora_urls.rstrip("/")] if esplora_urls else []))
 
     async def _esplora_get(self, path: str) -> Optional[dict | str]:
-        # trustedcoin pattern: iterate endpoints until one answers;
-        # transport errors AND 4xx both fall through to the next
-        import aiohttp
-        last_exc = None
+        # #34: trustedcoin pattern (multi-endpoint fallback) with bounded
+        # attempts per endpoint and a hard per-attempt deadline. Transport
+        # errors, timeouts AND non-(200|400|404) statuses all count as
+        # endpoint failures; 400/404 stay the definitive unknown-txid answer.
+        last_exc: Exception | None = None
         for base in self._esplora_urls:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{base}{path}",
-                                           timeout=aiohttp.ClientTimeout(total=20)) as r:
-                        if r.status in (400, 404):
-                            return None  # esplora convention: unknown txid
-                        r.raise_for_status()
-                        ct = r.headers.get("Content-Type", "")
-                        return await (r.json() if "json" in ct else r.text())
-            except Exception as e:
-                last_exc = e
-                continue
+            for attempt in range(1, ESPLORA_ATTEMPTS_PER_ENDPOINT + 1):
+                try:
+                    return await asyncio.wait_for(
+                        self._esplora_fetch_once(base, path),
+                        timeout=ESPLORA_ATTEMPT_HARD_CAP_S)
+                except asyncio.TimeoutError:
+                    last_exc = TimeoutError(
+                        f"{base}: hard cap {ESPLORA_ATTEMPT_HARD_CAP_S}s exceeded")
+                except Exception as e:
+                    last_exc = e
+                self._logger.debug(
+                    f"esplora {base}{path} attempt {attempt}/"
+                    f"{ESPLORA_ATTEMPTS_PER_ENDPOINT} failed: {last_exc!r}")
+            self._logger.warning(
+                f"esplora endpoint {base} exhausted after "
+                f"{ESPLORA_ATTEMPTS_PER_ENDPOINT} attempts ({path}): "
+                f"{last_exc!r} — trying next endpoint")
         raise BitcoinCoreRPCError(f"esplora lookup {path} failed on all "
                                   f"{len(self._esplora_urls)} endpoints: {last_exc}")
+
+    async def _esplora_fetch_once(self, base: str, path: str) -> Optional[dict | str]:
+        async with self._new_esplora_client() as client:
+            r = await client.get(f"{base}{path}")
+            if r.status_code in (400, 404):
+                return None  # esplora convention: unknown txid
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            return r.json() if "json" in ct else r.text
+
+    def _new_esplora_client(self) -> httpx.AsyncClient:
+        # fresh client per fetch — no shared pool to poison (the #60
+        # dead-keepalive class); bounded lifetime matches the one-shot fetch
+        return httpx.AsyncClient(timeout=ESPLORA_ATTEMPT_TIMEOUT)
 
     async def get_tx_height(self, txid_hex: str) -> TxMinedInfo:
         if self._chain_lookup_mode == "esplora":
