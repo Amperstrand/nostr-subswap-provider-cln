@@ -45,7 +45,7 @@ reckless install --network=signet swap-provider
 The plugin settings are configured using [environment variables](https://kinsta.com/knowledgebase/what-is-an-environment-variable/).
 
 The following variables are available:
-- `NOSTR_RELAYS`: A comma-separated string of nostr relay URIs. Example: `wss://relay.damus.io,wss://relay.primal.net,wss://nos.lol`
+- `NOSTR_RELAYS`: A comma-separated string of nostr relay URIs. Example: `wss://nos.lol,wss://relay.primal.net,wss://nostr.mom`
 - `SWAP_FEE_PPM`: Fee to charge for swaps in ppm. Example: `10000` (1%)
 - `CONFIRMATION_TARGET_BLOCKS`: Desired confirmation speed of onchain transactions. Example: `6`
 - `FALLBACK_FEE_SATVB`: Fallback feerate to use if no reliable fee estimation is possible. Example:`65`
