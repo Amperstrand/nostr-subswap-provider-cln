@@ -1,0 +1,32 @@
+# THROWAWAY-overlay pattern for the regtest lab: point regtest-cln at a
+# branch-built image. Env lists REPLACE wholesale (repeat the subswap
+# overlay's env); official images carry a lightningd ENTRYPOINT — custom
+# builds don't (set it); a TIP build against a v26.06 lab volume needs
+# --database-upgrade=true (schema migration is refused in non-final
+# builds otherwise).
+services:
+  cln:
+    image: cln-branch-smoke:latest
+    entrypoint: ["lightningd"]
+    command:
+      - --network=regtest
+      - --bitcoin-rpcconnect=bitcoind
+      - --bitcoin-rpcuser=user
+      - --bitcoin-rpcpassword=pass
+      - --log-level=info
+      - --alias=LABCLN
+      - --addr=:9735
+      - --fee-base=0
+      - --fee-per-satoshi=0
+      - --min-capacity-sat=10000
+      - --database-upgrade=true
+      - --plugin=/opt/swap-provider/swap-provider.py
+    environment:
+      - NOSTR_SECRET_HEX=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      - NOSTR_RELAYS=ws://relay:7777
+      - SWAP_FEE_PPM=5000
+      - ANN_POW_TARGET_BITS=16
+      - SWAPSERVER_JIT_CHANNEL=25
+      - PLUGIN_LOG_LEVEL=DEBUG
+      - CHAIN_LOOKUP_MODE=esplora
+      - ESPLORA_URLS=http://mempool-shim:8788
