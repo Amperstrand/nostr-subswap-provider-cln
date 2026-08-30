@@ -15,6 +15,16 @@ class CLNChainWallet:
     # is the fallback when listconfigs cannot be read; under-advertising
     # is the safe direction.
     MIN_EMERGENCY_FALLBACK_SAT = 25_000
+    # upstream #9452 / plugin #35 (five lightningd cores on inr2
+    # 2026-08-29 19:28-19:33Z): utxopsbt with excess_as_change=true
+    # SIGABRTs the daemon in change_for_emergency when the unselected
+    # wallet cannot cover the emergency reserve AND the change-from-excess
+    # also cannot. The guard below refuses such fundings BEFORE the RPC;
+    # this margin absorbs the tx fee + change fee + estimation drift at
+    # the fallback feerate (60 sat/vB x ~250 vB). Conservative on
+    # purpose — under-funding is a clean swap failure, over-funding is a
+    # daemon crash-loop.
+    FUNDING_FEE_MARGIN_SAT = 15_000
 
     def __init__(self, *, plugin_rpc: LightningRpc, config: PluginConfig, logger: PluginLogger):
         self.rpc = plugin_rpc
@@ -62,12 +72,16 @@ class CLNChainWallet:
             self.logger.error(f"create_transaction failed to call listfunds rpc: {e}")
             return None
         free_utxos, excluded_utxos = [], []
+        free_total_sat = 0
         for o in funds.get('outputs', []):
             selectable = (o.get('status') == 'confirmed'
                           and not o.get('reserved')
                           and self._is_plain_key_script(o.get('scriptpubkey', '')))
-            (free_utxos if selectable else excluded_utxos).append(
-                f"{o['txid']}:{o['output']}")
+            if selectable:
+                free_utxos.append(f"{o['txid']}:{o['output']}")
+                free_total_sat += o['amount_msat'] // 1000
+            else:
+                excluded_utxos.append(f"{o['txid']}:{o['output']}")
         if excluded_utxos:
             self.logger.info(f"create_transaction: excluding {len(excluded_utxos)} "
                              "wallet output(s) from coin selection "
@@ -77,6 +91,24 @@ class CLNChainWallet:
             self.logger.error("create_transaction: no free plain-script utxos in "
                               f"the wallet ({len(excluded_utxos)} excluded, "
                               "issue #29) — cannot fund the lockup")
+            return None
+        # upstream #9452 crash-window guard: even selecting EVERYTHING
+        # must leave the change above the emergency reserve + fee
+        # headroom, else utxopsbt(excess_as_change=true) aborts
+        # lightningd (assert only valid for entering change == 0 — our
+        # excess IS the change). Refusing here converts a daemon
+        # crash-loop into a clean swap failure. Evaluated at the MAX
+        # escalation ask so every retry attempt stays inside the bound.
+        ask_base_slack_sat, ask_step_sat, ask_attempts = 1000, 2500, 4
+        max_ask_sat = output_sum_sat + ask_base_slack_sat + (ask_attempts - 1) * ask_step_sat
+        headroom_needed = self.min_emergency_reserve_sat() + self.FUNDING_FEE_MARGIN_SAT
+        if free_total_sat - max_ask_sat < headroom_needed:
+            self.logger.error(
+                f"create_transaction: refusing to fund — change would land in "
+                f"the emergency-reserve crash window (upstream #9452): "
+                f"{free_total_sat} sat free, max ask {max_ask_sat}, reserve "
+                f"+ margin {headroom_needed}. Top up the wallet or lower "
+                f"min-emergency-msat before this swap can fund.")
             return None
         # CHANGE-SLACK (+1000 sat over the output sum): with
         # excess_as_change=true and an exact-satoshi ask, CLN selects
@@ -93,8 +125,8 @@ class CLNChainWallet:
         # to select for a larger target so excess grows with granularity.
         DUST_SAT = 546
         funding_response = None
-        for attempt in range(4):
-            ask_sat = output_sum_sat + 1000 + attempt * 2500
+        for attempt in range(ask_attempts):
+            ask_sat = output_sum_sat + ask_base_slack_sat + attempt * ask_step_sat
             try:
                 resp = self.rpc.utxopsbt(satoshi=ask_sat,
                                                 feerate=self.config.cln_feerate_str,
@@ -116,7 +148,7 @@ class CLNChainWallet:
                 self.logger.error(f"create_transaction failed to call utxopsbt rpc: {e}")
                 return None
             excess_sat = int(resp.get("excess_msat", 0)) // 1000
-            if excess_sat >= DUST_SAT or attempt == 3:
+            if excess_sat >= DUST_SAT or attempt == ask_attempts - 1:
                 funding_response = resp
                 break
             # release the dusty ask's reservation before re-asking, or the

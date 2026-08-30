@@ -312,6 +312,7 @@ def test_create_transaction_retries_when_excess_below_dust(monkeypatch):
                                  "info": staticmethod(lambda *a, **k: None)})()
     class Cfg: cln_feerate_str = "urgent"
     inst.config = Cfg()
+    inst._min_emergency_sat = 25_000  # harness skips __init__; pin the guard's reserve
 
     out = type("O", (), {"value": 18995, "scriptpubkey": b"\x00" * 34})()
     tx = inst.create_transaction(outputs_without_change=[out], rbf=True)

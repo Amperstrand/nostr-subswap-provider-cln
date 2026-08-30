@@ -121,7 +121,7 @@ class TestCltvLockedCoinSelection:
             {"txid": "ee" * 32, "output": 0, "amount_msat": 20_000_000,
              "status": "confirmed", "reserved": True,
              "scriptpubkey": FREE_P2WPKH},
-            {"txid": "ff" * 32, "output": 0, "amount_msat": 30_000_000,
+            {"txid": "ff" * 32, "output": 0, "amount_msat": 70_000_000,
              "status": "confirmed", "reserved": False,
              "scriptpubkey": FREE_P2WPKH},
         ]

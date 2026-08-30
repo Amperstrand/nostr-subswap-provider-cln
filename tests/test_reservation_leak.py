@@ -74,7 +74,7 @@ CANNED_PSBT = (
 FREE_P2WPKH = "0014" + "1f" * 20
 
 
-def _free_output(txid="bb" * 32, vout=0, sats=50_000_000):
+def _free_output(txid="bb" * 32, vout=0, sats=100_000_000):
     return {"txid": txid, "output": vout, "amount_msat": sats,
             "status": "confirmed", "reserved": False,
             "scriptpubkey": FREE_P2WPKH}

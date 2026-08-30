@@ -172,7 +172,8 @@ class TestFundingTxShape:
         from plugin.cln_chain import CLNChainWallet
         import inspect
         src = inspect.getsource(CLNChainWallet.create_transaction)
-        assert "+ 1000" in src
+        assert "ask_base_slack_sat" in src and "+ ask_base_slack_sat" in src, \
+            "the dust-excess slack must be part of the ask (hoisted constants ok)"
 
     def test_psbt_add_outputs_produces_valid_tx(self):
         """from_raw_psbt → add_outputs must produce a tx with ≥1 output."""
