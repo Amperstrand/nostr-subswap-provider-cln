@@ -281,3 +281,42 @@ requirements above stay intact.
 6. Vendored electrum files keep their MIT headers; quote-refreshes in
    them are fine, behavior changes are not (they drift from upstream on
    purpose — document why in the commit).
+
+## Session 2026-08-30 III — security deep-dive: #10 electrum study, hold
+## invoice analysis, complete threat model
+
+1. **#10 electrum study (docs/issue-10-electrum-vulnerability-study.md):**
+   electrum IS vulnerable with FEWER mitigations than ours (no option-E,
+   no park-then-claim, no LN-commitment — just a last-30-blocks guard).
+   The payment and claim paths fire completely independently. Electrum
+   is also fully exposed to #12 (pays immediately on addswapinvoice
+   with zero funding check — our option-E gate fixed this). Bitcoin
+   Script cannot express branch expiry (no upper-bound opcode) — this
+   is a scripting-language limitation, not a design oversight. The
+   long-term fix is adaptor signatures / PTLCs (Lightning evolution).
+
+2. **Complete threat model (docs/security-analysis-2026-08-30.md):**
+   step-by-step exploit details for #10 (zero-effort batch theft via
+   datastore read), #12 (zero-cost LN liquidity jamming — fixed),
+   #25 (block-gap expiry race — 21k sat lost in testing). #13 is the
+   force multiplier for #10 (plaintext secrets → single RPC call to
+   extract a complete sweep kit). Funds-at-risk vs DoS classification
+   per attack. Prepayment coverage: d2 has NONE (the prepay mechanism
+   exists only for d1). Prioritized defense roadmap.
+
+3. **Hold invoice analysis (docs/hold-invoice-analysis.md):** the hold
+   invoice IS the atomic binding mechanism — it's what makes the swap
+   "atomic" at all. But in d2 it only binds if the server actually
+   pays. A malicious server that skips the payment breaks the chain.
+   Park-then-claim (#26) is the server-side enforcement; client-side
+   park-before-fund is the client-side defense. Both have race windows
+   (HTLC cancellation between park and irrevocable commitment). A d2
+   prepayment hold would increase attacker cost proportionally. The
+   structural fix is adaptor signatures (PTLC).
+
+4. **Issues filed for further investigation** (see GitHub #63-#67):
+   HSM-split of secrets, time-based monitoring, d2 prepayment design,
+   trust-boundary diagram, PTLC feasibility.
+
+5. **PR #9455 submitted to ElementsProject/lightning** (the #9452
+   fix — dust-shortfall crash). Owner-authorized.
