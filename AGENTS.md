@@ -4,6 +4,15 @@ Operational guide for AI agents working on this project. Everything here is
 grounded in the code in `swap-provider/plugin/` — file:line references are
 the authority, this file is the map.
 
+## External-projects rule (owner directive 2026-08-30, canonical text in
+## ../boltz-bridge/AGENTS.md)
+
+**Never post on external projects** — upstream (ElementsProject/lightning
+included), no issues/PRs/comments/reviews, not even well-intentioned bug
+reports. Read everything; fork into our namespace and push fix branches
+there for human review (never submit them); write the analysis in OUR
+tracker. ElementsProject/lightning#9452 predates the rule — owner's call.
+
 ## Project Summary
 
 A Core Lightning plugin that turns the CLN node itself into an Electrum-
