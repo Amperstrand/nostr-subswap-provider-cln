@@ -129,3 +129,36 @@ class TestTimeBasedFallback:
         # both paths call trigger_callbacks
         assert src.count('await self.trigger_callbacks()') >= 2, \
             "both the block path and the time-based path must call trigger_callbacks"
+
+
+class TestHsmDerivation:
+    """#36 research validation: makesecret output is a valid secp256k1
+    private key (verified live on production signet, 2026-08-30)."""
+
+    def test_makesecret_output_is_valid_secp256k1_scalar(self):
+        """The exact bytes returned by CLN's makesecret (verified live):
+        32 bytes, non-zero, < curve order — usable as a private key."""
+        secret = bytes.fromhex(
+            "8d372130d0e6fa5723108a958175caf0aec5aebdc6b8e3ead95c7c03c166c79e")
+        assert len(secret) == 32
+        assert secret != b'\x00' * 32
+        order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        assert 0 < int.from_bytes(secret, 'big') < order
+
+    def test_hsm_split_design_properties(self):
+        """The #36 design contract: datastore stores only public data +
+        the derivation seed; secrets are re-derived from the HSM at
+        claim time using the seed as the label. Old-format swaps (with
+        plaintext secrets) are migrated on a per-swap basis."""
+        import inspect
+        # the SwapData class must NOT gain a persistent plaintext privkey
+        # field if HSM-split is implemented — this test pins the CURRENT
+        # state so the future implementation must update it consciously
+        from plugin.submarine_swaps import SwapData
+        src = inspect.getsource(SwapData)
+        # current state: privkey IS stored (plaintext) — this test will
+        # FAIL when the HSM-split lands, forcing the developer to update
+        # the design contract here
+        assert 'privkey' in src, \
+            "SwapData has a privkey field (current state — must be " \
+            "removed when #36 HSM-split is implemented)"
