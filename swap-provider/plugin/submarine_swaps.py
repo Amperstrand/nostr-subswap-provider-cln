@@ -665,6 +665,10 @@ class SwapManager:
         self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         self._funding_gate_deadline.pop(swap.payment_hash.hex(), None)
+        # #14 item 8: prepayments grew without bound (only ever added,
+        # never pruned — a slow memory leak across the swap lifetime)
+        if swap.prepay_hash is not None:
+            self.prepayments.pop(swap.prepay_hash, None)
         if swap.funding_txid is None or swap.is_redeemed:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
@@ -1321,6 +1325,19 @@ class SwapManager:
             raise RequestFieldError('refundPublicKey does not match phase-1')
         if key in self.invoices_to_pay:
             raise RequestFieldError('invoice already bound')
+        # #14 item 4: client-invoice CLTV sanity — a tiny cltv inverts
+        # the LN-death > refund-unlock ordering the plugin's own invoices
+        # guarantee (assert_constants), stranding the server holding a
+        # preimage it paid for but cannot use before the lockup refunds
+        try:
+            cltv_delta = invoice._lnaddr.get_min_final_cltv_delta()
+        except Exception:
+            cltv_delta = None
+        if cltv_delta is not None and cltv_delta < constants.MIN_FINAL_CLTV_DELTA_ACCEPTED:
+            raise RequestFieldError(
+                f'invoice min_final_cltv_expiry {cltv_delta} < '
+                f'{constants.MIN_FINAL_CLTV_DELTA_ACCEPTED} — the LN leg '
+                f'would die before our refund unlock')
         swap.registered = True
         # issue #24 r8 late fill: a record whose phase-1 DM carried no
         # npub (pre-r8 record, or the restart contract) takes the

@@ -388,13 +388,19 @@ class CLNLightning:
 
     async def pay_invoice(self, *, bolt11: str, attempts: int) -> (bool, str):  # -> (success, log)
         self._logger.debug("pay_invoice: " + bolt11)
-        try:  # first check if payment was already initiated earlier
-            existing_pay_req = self._rpc.listpays(bolt11=bolt11)
-            if existing_pay_req['status'] == 'complete':
-                return True, existing_pay_req['preimage']
-            elif existing_pay_req['status'] == "pending":
-                return False, f"payment is already pending {existing_pay_req['status']}"
-        except Exception as e:
+        # #14 item 1: listpays(bolt11=...) returns a LIST of payment
+        # objects, not a single dict — the old ['status'] subscript threw
+        # TypeError on every call, the except swallowed it, and the dedup
+        # short-circuit never ran. CLN-level dedup masked the impact.
+        try:
+            pays = self._rpc.listpays(bolt11=bolt11)
+            pays_list = pays if isinstance(pays, list) else pays.get('pays', [])
+            for p in pays_list:
+                if p.get('status') == 'complete':
+                    return True, p.get('preimage', '')
+                elif p.get('status') == 'pending':
+                    return False, f"payment is already pending for this bolt11"
+        except Exception:
             pass
 
         retry_for = attempts * 45 if attempts > 1 else 60  # CLN automatically retries for the given amount of time
