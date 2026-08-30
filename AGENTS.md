@@ -11,7 +11,9 @@ the authority, this file is the map.
 included), no issues/PRs/comments/reviews, not even well-intentioned bug
 reports. Read everything; fork into our namespace and push fix branches
 there for human review (never submit them); write the analysis in OUR
-tracker. ElementsProject/lightning#9452 predates the rule — owner's call.
+tracker. ElementsProject/lightning#9452 predates the rule; its body was
+corrected 2026-08-30 under explicit owner authorization (dust-shortfall
+mechanism) — no further upstream writes without the same.
 
 ## Project Summary
 
