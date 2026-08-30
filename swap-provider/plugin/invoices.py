@@ -225,6 +225,7 @@ class HoldInvoice:
             self.funding_status = InvoiceState(data['funding_status'])
             self.created_at = data['created_at']
             self.associated_invoice = hex_to_bytes(data['associated_invoice'])
+            self.funding_dispatched_at = data.get('funding_dispatched_at')
         else:
             # Individual arguments
             self.payment_hash = hex_to_bytes(payment_hash)
@@ -235,6 +236,7 @@ class HoldInvoice:
             self.funding_status = InvoiceState.UNFUNDED
             self.created_at = int(time.time())
             self.associated_invoice = None
+            self.funding_dispatched_at = None
 
     def attach_prepay_invoice(self, invoice_payment_hash: Union[str, bytes]) -> None:
         """Attach a prepay invoice payment hash to this HoldInvoice"""
@@ -315,7 +317,8 @@ class HoldInvoice:
             "incoming_htlcs": [stored_htlc.to_json() for stored_htlc in self.incoming_htlcs],
             "funding_status": self.funding_status.value,
             "created_at": self.created_at,
-            "associated_invoice": self.associated_invoice.hex() if self.associated_invoice else None
+            "associated_invoice": self.associated_invoice.hex() if self.associated_invoice else None,
+            "funding_dispatched_at": self.funding_dispatched_at
         }
 
 class DuplicateInvoiceCreationError(Exception):

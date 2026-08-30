@@ -164,6 +164,24 @@ class CLNLightning:
         # Settle is the ONLY valid exit from FUNDED; past expiry + a
         # grace window (callback retries, mempool lag), it is abandoned —
         # cancel. Grace = expiry again (300s default → ~10min total).
+        # #80 (live 2026-08-30, ~53k signet): the FUNDED branch below
+        # assumed "no settle ⇒ the swap's onchain funding never happened".
+        # False: the callback had already dispatched the escrow funding,
+        # and the client's claim — which settles this hold via
+        # _finish_normal_swap — lands at CHAIN speed (blocks), not invoice
+        # speed. Cancelling here burns the provider's onchain leg while
+        # the preimage reveal is still in flight. A dispatched hold is
+        # untouchable: park until the escrow resolves (claim → settle;
+        # timeout → refund → _fail_swap cancels). The HTLC rides to CLTV
+        # at worst — capacity pinning, never funds loss.
+        if (invoice.funding_status is InvoiceState.FUNDED
+                and invoice.funding_dispatched_at is not None):
+            self._logger.info(
+                f"check_invoice_expiry: funded hold {invoice.payment_hash.hex()} has onchain "
+                f"funding dispatched ({int(time.time()) - invoice.funding_dispatched_at}s ago) "
+                f"— leaving parked for escrow resolution (#80 guard)")
+            return False
+
         if (invoice.funding_status is InvoiceState.FUNDED
                 and invoice.created_at + invoice.expiry * 2 < time.time()):
             self._logger.warning(
@@ -284,6 +302,16 @@ class CLNLightning:
                             # Call the callback
                             callback(invoice.payment_hash)
                             self.unregister_hold_invoice_callback(invoice.payment_hash)
+                            # #80: the FUNDED-abandonment watchdog below must
+                            # never cancel a hold whose swap already committed
+                            # onchain funds — the escrow's resolution (client
+                            # claim → _finish_normal_swap settles this hold
+                            # with the extracted preimage; escrow timeout →
+                            # refund → _fail_swap cancels it) is the only safe
+                            # exit once money is on the chain. Record it
+                            # persistently (JsonDB) so it survives restarts.
+                            invoice.funding_dispatched_at = int(time.time())
+                            self.update_invoice(invoice)
                             self._logger.info(f"callback_handler: callback returned for "
                                                 f"{invoice.payment_hash.hex()} — funding dispatched")
 
