@@ -75,3 +75,94 @@ The client implementation is the Python twin of the C++ client in
 `../clboss` (branch `nostr-swaps`, see its NOSTR-SWAP.md for the full
 bug ledger and e2e history); both are pinned to the same live swap
 values in their tests.
+
+## Security Model (read before operating)
+
+Submarine swaps have **two directions with different trust properties**.
+Understanding this is essential for both operators and clients.
+
+### Direction summary
+
+| Direction | Client action | Trustless? | Why |
+|---|---|---|---|
+| **LN→onchain** (`createswap` reversesubmarine) | Pays LN invoice, receives onchain | ✅ Yes | Client generates the preimage; server can't claim without payment |
+| **onchain→LN** (`createnormalswap` + `addswapinvoice`) | Sends onchain, receives LN | ⚠️ No | Server generates the preimage and *can* claim without paying |
+
+### What protects onchain→LN swaps (the non-trustless direction)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  onchain→LN swap lifecycle (d2)                                 │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  createnormalswap ──→ addswapinvoice ──→ client funds lockup   │
+│       │                      │                      │           │
+│   [SERVER has                [GATE 1: option-E       │           │
+│    preimage                  funding gate]            │           │
+│    from here]                 │                      │           │
+│                              ▼                      ▼           │
+│                       invoice PARKED          onchain tx         │
+│                       (not paid yet)          confirmed          │
+│                              │                      │           │
+│                              ▼                      ▼           │
+│                    [GATE 2: funding           lockup spendable   │
+│                     observed onchain]          by EITHER branch  │
+│                              │                      │           │
+│                              ▼                      │           │
+│                    payment fires (LN HTLC)          │           │
+│                              │                      │           │
+│                              ▼                      │           │
+│                    [GATE 3: park-then-claim]        │           │
+│                    HTLC parked = server             │           │
+│                    committed LN funds               │           │
+│                              │                      │           │
+│                              ▼                      ▼           │
+│                              └──── claim broadcast ──┘           │
+│                                      │                           │
+│                                      ▼                           │
+│                            preimage revealed                    │
+│                            in claim witness                     │
+│                                      │                           │
+│                                      ▼                           │
+│                            client settles hold                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Gates 1-3 are code-level policies in this plugin.** They prevent our
+own server from claiming without paying. They do NOT prevent:
+
+- **A malicious operator** bypassing the code and broadcasting a raw
+  claim directly (the claim key + preimage are in the datastore)
+- **A compromised plugin** (code injection bypasses all gates)
+- **A race window** between HTLC parking and irrevocable commitment
+
+### What clients should do
+
+If you're a client sending onchain funds:
+- **Wait for the server's HTLC to park** before funding the lockup
+- Check `listholdinvoices` (or equivalent) for incoming payment status
+- If no HTLC is parked, don't fund — the server hasn't committed
+
+### What operators should know
+
+- The claim privkey + preimage for every swap are stored in the CLN
+  datastore (readable via `datastore` RPC)
+- Anyone with CLN RPC access can extract a complete sweep kit
+- The HSM-split design (issue #36) would move secrets to HSM-derived
+  storage — designed, tested, awaiting implementation
+- Keep CLN RPC access restricted (runes, network isolation)
+
+### Known limitations (protocol-level)
+
+- The onchain→LN direction's witness script has **no claim-time
+  expiry** — the preimage branch is spendable at any height, even
+  after the refund branch unlocks. This is a Bitcoin Script
+  limitation, not an implementation bug.
+- The long-term fix is adaptor signatures / PTLCs (Lightning protocol
+  evolution — see issue #40)
+- Every submarine swap implementation (electrum, Boltz, ours) shares
+  this property
+
+For the complete analysis: `docs/security-analysis-2026-08-30.md`,
+`docs/hold-invoice-analysis.md`, `docs/issue-10-electrum-vulnerability-study.md`
