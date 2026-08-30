@@ -202,6 +202,13 @@ AttributeError spam. All CLN interaction goes through clnrest (see
 lightning-playground AGENTS.md CLN API mandate) — no new
 lightning-cli-over-ssh code.
 
+Backend reality (2026-08-30): the live `bitcoind-signet` on inr2 runs
+PRUNED with NO txindex despite the README's `txindex=1` mandate — the
+plugin's tx lookups ride the esplora paths, so this works. Consequence
+for ops/triage on that box: `getrawtransaction` cannot serve confirmed
+txs; use esplora/`gettxout` (see lightning-playground AGENTS.md
+"inr2 detection suite").
+
 ## Future optimizations (and their tradeoffs)
 
 None of these are implemented; all are sound ideas IF the hard
