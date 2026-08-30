@@ -93,6 +93,34 @@ the constructed change covers exactly).
   plumbing inside the container); the pyln RED demo carries the same
   evidence with a resolved backtrace.
 
+## Independent verification round (2026-08-30, isolated container)
+
+Fresh clone of the PUSHED branch (74a6b277) — not any working tree —
+built and tested inside a pristine ubuntu:24.04 container (fresh
+toolchain, fresh pip env, freshly downloaded bitcoind 27.1):
+
+- 3/3 core tests pass (both deterministic dust-shortfall regressions —
+  utxopsbt AND fundpsbt — plus the 10-round property walk)
+- 20/20 adjacent slice passes (fundpsbt/utxopsbt/reserveinputs/
+  unreserve/withdraw)
+- Logs preserved at ~/verify-9452/ (moved out of /tmp after a parallel
+  session's cleanup swept /tmp/opencode mid-campaign)
+
+shc was DOWN during the window (control-plane DNS failure), so this ran
+on the local host's container runtime instead of separate hardware —
+fresh userspace/toolchain + fresh clone, same kernel. shc can still be
+used for a hardware-independent rerun when it's back.
+
+Build recipe earned (CLN tip from a bare ubuntu:24.04 — five failures
+deep): apt `build-essential autoconf automake libtool git lowdown jq
+sqlite3 libsodium-dev libsqlite3-dev libgmp-dev zlib1g-dev gettext
+python3 python-is-python3 python3-pip python3-setuptools python3-dev
+libssl-dev curl` + pip `pytest requests mako grpcio-tools uv` + the
+repo's `contrib/pylightning/requirements.txt` + `-e
+contrib/pyln-testing`. Tip's configure resolves python THROUGH uv, and
+pytest must run from the repo root (running from tests/ breaks pyln's
+lightningd path resolution).
+
 ## How the other implementations handle the same situation
 
 | | Reserve policy | Enforcement style | Daemon behavior on caller-induced funding shortfall |
