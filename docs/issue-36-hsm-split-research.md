@@ -1,41 +1,106 @@
-# #36 Research: HSM-Split of Claim Secrets — Design Study
-# (research only, no implementation per owner directive 2026-08-30)
+# #36 Research: HSM-Split of Claim Secrets — Complete Design Study
+# (research + unit tests only, no implementation per owner directive 2026-08-30)
 
-## What we validated live
+## Part 1: CLN's HSM internals (from source study + docs)
 
-### 1. `makesecret` is deterministic (same input → same output)
+### The derivation chain
+
+```
+hsm_secret (root, 32 bytes legacy / 64 bytes BIP39 v25.12+)
+  │
+  ├─ HKDF-SHA256("bip32 seed") → bip32_seed (64 bytes)
+  │   └─ BIP32 master key → wallet addresses (P2WPKH, P2TR)
+  │
+  ├─ HKDF-SHA256(...) → derived_secret (32 bytes, the makesecret IKM)
+  │   │
+  │   ├─ HKDF-SHA256("nodeid") → node private key (identity)
+  │   ├─ HKDF-SHA256("bolt12-invoice-base") → BOLT12 invoice secret
+  │   ├─ HKDF-SHA256("node-alias-base") → node alias key
+  │   ├─ HKDF-SHA256("scb secret") → static channel backup
+  │   └─ HKDF-SHA256(<our label>) → our per-swap claim key
+  │
+  └─ HKDF-SHA256("peer seed" + peer_id + channel_dbid) → channel seed
+```
+
+Source: `hsmd/libhsmd.c:312-325` (handle_derive_secret), `hsmd/hsmd.c` (populate_secretstuff)
+
+### What makesecret actually does
+
+```c
+// hsmd/libhsmd.c:312-325
+static u8 *handle_derive_secret(struct hsmd_client *c, const u8 *msg_in) {
+    hkdf_sha256(&secret, sizeof(secret), NULL, 0,
+                &secretstuff.derived_secret, sizeof(secretstuff.derived_secret),
+                info, tal_bytelen(info));
+    return towire_hsmd_derive_secret_reply(NULL, &secret);
+}
+```
+
+**RFC 5869 HKDF-SHA256** with:
+- Salt: NULL (none)
+- Input Key Material: `secretstuff.derived_secret` (an intermediate key derived from bip32_seed)
+- Info: the label string you provide
+- Output: 32 bytes
+
+### Security properties (from the HKDF spec + CLN's design)
+
+| Property | What it means | Why it matters for us |
+|---|---|---|
+| **Deterministic** | Same hsm_secret + same label → same output | Claim key re-derivable on restart |
+| **Hardened** | Leaking one derived key doesn't reveal others | One compromised swap doesn't compromise all |
+| **One-way** | Can't recover hsm_secret from derived keys | Datastore leak doesn't expose the root |
+| **Node-specific** | Different hsm_secret → different outputs | Cross-node: our keys don't work on other nodes |
+| **No length extension** | HKDF is immune to SHA-256 extension attacks | Labels can't be manipulated |
+
+### CLN's own uses (the precedent)
+
+CLN uses `makesecret` / `derive_secret` for its own critical secrets:
+- Node identity (private key)
+- BIP32 wallet master key (all onchain funds)
+- BOLT12 invoice secrets
+- Channel seeds (all Lightning funds)
+- Static channel backup
+
+Our swap claim keys would be in the same security class.
+
+### hsm_secret formats (v25.12+ change)
+
+| Version | Format | Size | Notes |
+|---|---|---|---|
+| Pre-v25.12 | Raw binary | 32 bytes | Still supported (backward compat) |
+| v25.12+ | BIP39 mnemonic | 12 words | Default for new nodes; optional passphrase |
+| Either + encrypted | Encrypted | varies | `--hsm-passphrase` startup option |
+
+**Important:** the hsm_secret format doesn't affect makesecret — the derivation chain handles both transparently (the BIP39 seed is converted to the same 32-byte root internally).
+
+**Also important:** even with an encrypted hsm_secret, "lightningd always needs to access keys from the wallet which is thus not locked" — the RPC surface (including makesecret) is always available to anyone with RPC access. This is a documented CLN property, not a bug.
+
+## Part 2: What we validated live (production signet, 2026-08-30)
+
+### Determinism verified
 
 ```
 $ lightning-cli makesecret string=test-derivation-label
   → 8d372130d0e6fa5723108a958175caf0aec5aebdc6b8e3ead95c7c03c166c79e
+
 $ lightning-cli makesecret string=test-derivation-label
   → 8d372130d0e6fa5723108a958175caf0aec5aebdc6b8e3ead95c7c03c166c79e  (identical)
 ```
 
-This is critical — the claim key MUST be re-derivable on every restart.
+### secp256k1 validity verified
 
-### 2. The output is a valid secp256k1 private key
+32 bytes, non-zero, < curve order, compressed pubkey derivable (03fedb86ae63e49e…).
+
+### Datastore clean post-deploy
 
 ```
-32 bytes, non-zero, < curve order → valid scalar
-compressed pubkey derivable (verified with electrum_ecc)
+$ lightning-cli -k datastore key=swap-provider
+  → entries: 0 (no active swaps, no secrets persisted)
 ```
 
-No additional transformation needed — the raw makesecret output IS a
-usable private key.
-
-### 3. The existing pattern in our plugin
-
-The plugin already uses `derive_secret` (which calls `makesecret` via
-pyln RPC) for two secrets:
+### Our existing pattern (precedent in our own code)
 
 ```python
-# cln_plugin.py:88-93
-def derive_secret(self, derivation_str: str) -> bytes:
-    secret_hex = self.plugin.rpc.call("makesecret",
-        payload={"string": derivation_str})["secret"]
-    return bytes.fromhex(secret_hex)
-
 # plugin_config.py:51 — the nostr identity
 nostr_secret = cln_plugin_handler.derive_secret("NOSTRSECRET")
 
@@ -43,160 +108,147 @@ nostr_secret = cln_plugin_handler.derive_secret("NOSTRSECRET")
 self._payment_secret_key = plugin_instance.derive_secret("payment_secret")
 ```
 
-Neither of these is stored in the datastore. They exist only in memory
-and are re-derived on every plugin start from CLN's HSM.
+Neither is stored in the datastore. Both are re-derived on every start.
 
-### 4. The datastore is clean post-deploy (verified live)
-
-```
-$ lightning-cli -k datastore key=swap-provider
-  → entries: 0  (no swaps active, no secrets persisted)
-```
-
-## Proposed design (for review, not implementation)
+## Part 3: Proposed design (Option B — both secrets HSM-derived)
 
 ### Claim key derivation
 
-At swap creation, instead of `privkey = os.urandom(32)`:
-
 ```python
-# derive from the HSM using the payment hash as the unique label
-claim_privkey = derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
+# At swap creation (new code):
+claim_privkey = derive_secret(f"swap-claim-{payment_hash.hex()}")
 claim_pubkey = ECPrivkey(claim_privkey).get_public_key_bytes(compressed=True)
+# Store: claim_pubkey (public), payment_hash (public)
+# DON'T store: claim_privkey (re-derive at claim time)
+
+# At claim time:
+privkey = derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
+signature = sign(tx_hash, privkey)
 ```
 
-The privkey is NEVER stored. The pubkey is stored (it's public). The
-claim path re-derives the key at sign time:
+### Preimage derivation (the chicken-and-egg resolution)
+
+The payment_hash IS sha256(preimage) — we can't use the payment_hash as
+a label to derive a preimage we haven't generated yet. Resolution: a
+random SEED breaks the circularity.
 
 ```python
-async def _create_and_sign_claim_tx(self, txin, swap):
-    # re-derive from HSM at sign time — never stored
-    privkey = derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
-    signature = sign(tx_hash, privkey)
-    ...
+# At swap creation:
+seed = os.urandom(16)  # random, safe to store
+preimage = derive_secret(f"swap-preimage-{seed.hex()}")
+payment_hash = sha256(preimage)
+# Store: seed (safe), payment_hash (public)
+# DON'T store: preimage (re-derive from seed + HSM)
+
+# At claim time:
+preimage = derive_secret(f"swap-preimage-{swap.preimage_seed.hex()}")
 ```
 
-### Preimage derivation (the harder case)
+### What the datastore looks like (before vs after)
 
-The preimage CANNOT be derived from the HSM — it must be revealed in
-the claim witness, which means it must be known before the claim.
-Options:
-
-**Option A: Keep preimage in datastore, move only the privkey.**
-- The preimage is still readable via datastore, but without the
-  privkey, it can't be used to construct a claim. Partial fix.
-- The preimage alone gives you the hash preimage (useful for settling
-  hold invoices, not for claiming onchain).
-
-**Option B: Derive the preimage from the HSM too.**
-- `preimage = derive_secret(f"swap-preimage-{payment_hash}")`
-- But wait — the payment_hash IS sha256(preimage). If the preimage is
-  derived from a label that includes the payment_hash, we have a
-  chicken-and-egg: we need the payment_hash to derive the preimage,
-  but the payment_hash IS the hash of the preimage.
-- **Fix:** derive the preimage FIRST from a random label, then compute
-  the payment_hash from it:
-  ```python
-  seed = os.urandom(16)  # random, stored in the swap record (public-safe)
-  preimage = derive_secret(f"swap-preimage-{seed.hex()}")
-  payment_hash = sha256(preimage)
-  # store: seed (in datastore), payment_hash (in datastore)
-  # DON'T store: preimage (re-derive from HSM + seed at claim time)
-  ```
-- The seed is safe to store in the datastore — it's only useful with
-  the HSM.
-
-**Option C: PTLC/adaptor signatures (the structural fix).**
-- The preimage doesn't exist until the payment succeeds.
-- This is the #40 research item — beyond this study.
-
-### Recommended: Option B (both privkey and preimage HSM-derived)
-
-| Secret | Current storage | Proposed storage | Re-derivation |
-|---|---|---|---|
-| Claim privkey | plaintext in datastore | HSM-derived, never stored | `makesecret("swap-claim-{payment_hash}")` |
-| Preimage | plaintext in datastore | HSM-derived from stored seed | `makesecret("swap-preimage-{seed}")` |
-| Pubkey | datastore (already public) | unchanged | N/A |
-| Payment hash | datastore (already public) | unchanged | N/A |
-| Seed | N/A (doesn't exist today) | datastore (safe without HSM) | N/A |
-
-### Migration path for existing swaps
-
-Existing swaps have plaintext privkeys/preimages in the datastore. A
-one-time migration at startup:
-
-```python
-for swap in self.swaps.values():
-    if hasattr(swap, 'privkey') and swap.privkey:
-        # old-format swap: derive the HSM version, verify it matches
-        # (it won't — different derivation), so we need to:
-        # 1. Generate a new seed
-        # 2. Derive the preimage from the HSM with the new seed
-        # 3. Verify sha256(derived_preimage) == swap.payment_hash
-        #    (it WON'T match — different preimage!)
-        # FAIL: existing swaps' preimages can't be re-derived from the
-        # HSM because they were randomly generated, not HSM-derived.
-        #
-        # MIGRATION STRATEGY: keep old swaps' secrets in the datastore
-        # (with a migration warning), only NEW swaps use HSM derivation.
-        pass
+**Before (current):**
+```json
+{
+  "privkey": "0123456789abcdef...",  // THE SECRET — readable by anyone with datastore access
+  "preimage": "fedcba9876543210...",  // THE SECRET — enables claim construction
+  "lockup_address": "bcrt1q...",
+  "payment_hash": "abc123..."
+}
 ```
 
-**The migration is one-directional:** new swaps use HSM derivation,
-old swaps keep their plaintext secrets until they expire/complete.
-This is acceptable because:
-- Old swaps have bounded lifetimes (locktime + cleanup)
-- The number of old swaps is small
-- A future cleanup pass can purge expired old-format records
+**After (HSM-split):**
+```json
+{
+  "claim_pubkey": "03fedb86ae...",    // public — safe
+  "payment_hash": "abc123...",         // public — safe
+  "preimage_seed": "0123456789abcdef", // safe: useless without HSM access
+  "lockup_address": "bcrt1q..."       // public — safe
+}
+```
 
-### Security properties (what changes)
+## Part 4: Threat model comparison
 
-| Attacker capability | Before (current) | After (HSM-split) |
+| Attacker | Before (current) | After (HSM-split) |
 |---|---|---|
-| Read datastore → get sweep kit | ✅ Full (privkey + preimage) | ❌ No secrets (seed only, useless without HSM) |
-| CLN RPC → makesecret → get keys | ❌ Not possible | ⚠️ Possible if you know the derivation label |
-| Read CLN log → get secrets | ✅ If debug enabled | ❌ Never logged |
-| Compromise HSM | N/A | ✅ Complete compromise (but HSM is CLN's security boundary) |
+| Read datastore (`datastore` RPC or SQLite file) | ✅ Full sweep kit (privkey + preimage) | ❌ Gets public data + seed (useless without HSM) |
+| Read CLN log (debug or error-replay) | ✅ If secrets logged (fixed: size-only logging) | ❌ Never logged |
+| Filesystem access to `lightningd.sqlite` | ✅ Full sweep kit | ❌ Same as datastore read |
+| CLN RPC access (any command) | ✅ Can call `datastore` to read secrets | ⚠️ Can call `makesecret` with our labels IF they know the format |
+| Compromise `hsm_secret` file | ✅ Already game over (all funds) | ✅ Already game over (all funds) |
+| Read backup of `lightningd.sqlite` | ✅ Full sweep kit | ❌ Seed only |
 
-The `makesecret` RPC is the remaining surface: anyone with CLN RPC can
-call `makesecret("swap-claim-{payment_hash}")` and get the claim key.
-But this is the same security level as CLN's own key material — if an
-attacker has RPC access, they can already drain the wallet. The HSM
-doesn't protect against RPC compromise; it protects against datastore
-reads (filesystem, backup leakage) and log exposure.
+The **key change**: datastore/backup/log reads go from "complete sweep kit" to "useless without HSM." The remaining surface (RPC access) is within CLN's existing security boundary.
 
-### Unit test approach (validated)
+## Part 5: Migration path
 
-```python
-def test_hsm_derivation_produces_valid_key():
-    """The makesecret output must be a valid secp256k1 private key."""
-    secret = bytes.fromhex("8d372130d0e6fa5723108a958175caf0aec5aebdc6b8e3ead95c7c03c166c79e")
-    assert len(secret) == 32
-    assert secret != b'\x00' * 32
-    order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    assert 0 < int.from_bytes(secret, 'big') < order
+### Strategy: per-swap, one-directional
 
-def test_hsm_derivation_deterministic():
-    """Same label → same secret (verified live on production signet)."""
-    # this is a structural property of CLN's HSM; the test validates
-    # our derivation wrapper, not CLN's internals
-    ...
+```
+At plugin startup:
+  for each swap in self.swaps.values():
+    if swap has 'privkey' field:
+      # old-format swap (pre-HSM-split)
+      # KEEP plaintext secrets (they can't be re-derived from HSM)
+      # These swaps have bounded lifetimes (locktime + cleanup)
+      log.warning(f"old-format swap {swap.payment_hash.hex()[:8]}: "
+                  f"plaintext secrets retained until expiry")
+    else:
+      # new-format swap (post-HSM-split)
+      # Secrets are HSM-derived; nothing to do
+      pass
 ```
 
-## What we need before implementation (per owner directive)
+### Why old swaps can't be migrated
 
-1. ✅ makesecret is deterministic — verified live
-2. ✅ makesecret output is a valid secp256k1 key — verified mathematically
-3. ✅ The plugin already uses derive_secret for other secrets
-4. 🔲 Decide: Option A (privkey only) vs Option B (privkey + preimage)
-5. 🔲 Design the migration path for existing swaps
-6. 🔲 Accept the makesecret RPC surface as within CLN's security boundary
-7. 🔲 Owner approval to implement
+Old swaps' preimages were `os.urandom(32)` — randomly generated, not
+HSM-derived. Even if we know the payment_hash, HSM derivation produces
+a DIFFERENT preimage (not the one that was actually used). We verified
+this in `TestMigrationEdgeCases::test_old_swap_preimage_cannot_be_hsm_rederived`.
+
+### Cleanup
+
+Old-format swaps expire via their locktime (70 blocks). The existing
+`delete_finished_reverse_swap` / `_fail_swap` paths clean them up. Once
+all old-format swaps are gone, the migration is complete.
+
+## Part 6: Unit test coverage (22 tests, all passing)
+
+| Test class | Tests | What they validate |
+|---|---|---|
+| `TestHkdfDerivation` | 5 | Determinism, label uniqueness, hardening, cross-node uniqueness, full-chain determinism |
+| `TestSecp256k1Validity` | 5 | 32 bytes, non-zero, < curve order, pubkey derivable, live-verified output |
+| `TestSeedBasedPreimageScheme` | 4 | Chicken-and-egg chain, no seed collisions, seed-alone insufficiency, claim key label |
+| `TestDatastoreCleanliness` | 2 | Post-split record has no secrets, old-format record does |
+| `TestMigrationEdgeCases` | 3 | New swaps use HSM, old preimages can't be re-derived, no label collisions |
+| `TestSecurityProperties` | 3 | Datastore leak gives no secrets, RPC access can derive (documented), hardening across swaps |
+
+The test file uses a local `hkdf_sha256` implementation (mirroring
+CLN's ccan/crypto/hkdf_sha256) so all tests run without a CLN node.
+
+## Part 7: Implementation checklist (for when the owner approves)
+
+- [ ] Add `preimage_seed` field to `SwapData` (replaces `preimage` for new swaps)
+- [ ] Add `claim_pubkey` field to `SwapData` (replaces `privkey` for new swaps)
+- [ ] Modify `create_reverse_swap`: use `derive_secret` for both secrets
+- [ ] Modify `_create_and_sign_claim_tx`: re-derive keys at sign time
+- [ ] Modify `server_create_normal_swap`: return HSM-derived pubkey
+- [ ] Add startup migration check: log old-format swaps with warning
+- [ ] Verify datastore: `assert 'privkey' not in serialized_json` (add to test)
+- [ ] Live test: swap end-to-end on regtest with HSM-derived keys
+- [ ] Live test: restart plugin → same keys re-derived → claim succeeds
+- [ ] Live test: read datastore → no secrets present
+- [ ] Update README security section
+- [ ] Deploy to signet/mutinynet
 
 ## References
 
 - Issue #36 (this research's tracking issue)
 - Issue #13 (the original secrets-exposure finding)
-- docs/security-analysis-2026-08-30.md (Section 5: the enabler)
-- CLN docs: `makesecret` RPC (HSM-derived, deterministic, per-node)
-- Our existing pattern: `plugin_config.py:51` (nostr secret via makesecret)
+- CLN source: `hsmd/libhsmd.c:312-325` (handle_derive_secret)
+- CLN source: `hsmd/hsmd.c` (populate_secretstuff, node_key)
+- CLN docs: https://docs.corelightning.org/reference/makesecret
+- CLN docs: https://docs.corelightning.org/docs/hsm-secret
+- CLN docs: https://docs.corelightning.org/docs/securing-keys
+- RFC 5869 (HKDF): https://tools.ietf.org/html/rfc5869
+- Our existing pattern: `plugin_config.py:51` (nostr secret via derive_secret)
+- Test file: `tests/test_hsm_split_design.py` (22 tests)
