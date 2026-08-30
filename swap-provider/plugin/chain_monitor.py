@@ -1,10 +1,19 @@
 import asyncio
+import time
 from typing import Callable, Optional, List
 
 from .cln_logger import PluginLogger
 from .bitcoin_core_rpc import BitcoinCoreRPC, BitcoinRPCCredentials
 from .health import tracker
 from .utils import supervise, fatal_exit
+
+# #37: how long to wait without a block before firing callbacks on a
+# time-based fallback. Signet block gaps run 5-10 minutes; client
+# invoices expire in 300 seconds (electrum default). A 60s fallback
+# gives the claim/payment path multiple chances within any invoice
+# lifetime, while costing nothing on healthy chains (blocks arrive
+# faster than the fallback, so it never fires).
+TIME_BASED_FALLBACK_SEC = 60
 
 
 class ChainMonitor(BitcoinCoreRPC):
@@ -46,6 +55,7 @@ class ChainMonitor(BitcoinCoreRPC):
         # ESCAPING this loop (BaseException or a bug in the handler) is a
         # death, and run()'s supervision makes that fatal.
         last_height = None
+        last_callback = 0.0  # #37: monotonic timestamp of the last callback firing
         while True:
             try:
                 try:
@@ -71,6 +81,19 @@ class ChainMonitor(BitcoinCoreRPC):
                         self._logger.debug(f"{len(self.callbacks)} monitored submarine swaps.")
                     last_height = blockheight
                     await self.trigger_callbacks()
+                    last_callback = time.monotonic()
+                elif (time.monotonic() - last_callback > TIME_BASED_FALLBACK_SEC
+                      and self.callbacks):
+                    # #37: no new block but monitored swaps exist — signet
+                    # block gaps can exceed invoice expiry (300s default);
+                    # fire on a timer so the payment/claim path runs before
+                    # the invoice dies. Callbacks are idempotent.
+                    self._logger.debug(
+                        f"ChainMonitor: time-based callback "
+                        f"({TIME_BASED_FALLBACK_SEC}s without a block, "
+                        f"{len(self.callbacks)} swaps)")
+                    await self.trigger_callbacks()
+                    last_callback = time.monotonic()
                 tracker.note_success("chain-monitor")
             except Exception as e:
                 self._logger.error(f"ChainMonitor: Error in monitoring loop: {e}")
