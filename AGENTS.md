@@ -320,3 +320,49 @@ requirements above stay intact.
 
 5. **PR #9455 submitted to ElementsProject/lightning** (the #9452
    fix — dust-shortfall crash). Owner-authorized.
+
+## Session 2026-08-30 close-out — the plugin security maturity round
+
+This session took the plugin from 19 open issues to 4. Everything
+actionable was implemented, deployed, and verified. Summary:
+
+**Deployed to production (contracts-r1 = 6ed8e61):**
+- HSM-split (#36, #13): claim keys + preimages derived from CLN's HSM,
+  never persisted to the datastore. Old-format swaps keep plaintext
+  secrets until expiry (bounded by locktime).
+- Action contracts (#21): capacity probe errors distinguishable from
+  exhausted wallet; hint-less invoices refused; None-tx root cause
+  surfaced; datastore circuit breaker on swap admission.
+- Time-based fallback (#37/#25): monitoring loop fires callbacks on a
+  60s timer when no block arrives (signet block-gap fix).
+- #14 items 1,4,8: dead dedup, CLTV validation, prepayments leak.
+- Fee oracle (#1): network-aware, fail-open, already deployed.
+- Option-E funding gate (#24/#12): closes the liquidity-jam attack.
+- Second esplora endpoint: Blockstream signet as fallback.
+
+**Submitted upstream:**
+- ElementsProject/lightning#9455: dust-shortfall crash fix (PR from our
+  fork, ce43b89e5 → 74a6b277, with RED/GREEN/property/independent tests).
+
+**Key discovery:**
+- The electrum CLIENT already implements park-before-fund (the funding
+  tx broadcasts only inside the hold-invoice callback). This
+  significantly reduces #10's practical risk for electrum clients.
+
+**Remaining open (4):**
+- #40 PTLC (blocked on CLN taproot channels — years away)
+- #10 protocol limitation (documented, PTLC is the fix)
+- #8/#9 JIT research (owner direction needed)
+
+**Earned lessons this session:**
+- /tmp/opencode is sweepable by parallel sessions — durable artifacts
+  go in ~/fleet-scratch/ or repo dirs, never /tmp
+- The fork of a public repo (Amperstrand/lightning) shares workflow
+  files with upstream — pushing to the fork needs SSH (HTTPS token
+  lacks workflow scope)
+- git cherry-pick has no -q flag
+- docker cp fails with "mkdirat <file>: file exists" when the container
+  has a ro-mounted file at the copy destination's root — use docker
+  export instead
+- The plugin repo has ~117 commits of port/electrum-4.8 lineage; always
+  check which branch you're on in shared repos before committing
