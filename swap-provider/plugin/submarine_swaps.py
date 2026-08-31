@@ -1103,12 +1103,24 @@ class SwapManager:
     def _require_fresh_payment_hash(self, payment_hash: bytes) -> None:
         """AUDIT A3: electrum's three duplicate-hash guards — a client
         replaying the same preimageHash clobbers swap state / hold
-        invoices without them."""
+        invoices without them.
+        #81 §1.4-3 (2026-08-31), third domain — tombstones: a COMPLETED
+        or expired d1 swap de-indexes from self.swaps, and its client-
+        held preimage never enters lnworker._preimages (it is extracted
+        only into the swap record, which is then removed), so both
+        original domains went blind exactly when the hash became PUBLIC
+        (the claim witness publishes the preimage onchain). A replayed
+        completed hash would mint a second swap on a known preimage —
+        and a bookkeeping-honest client (e.g. CLBOSS's comp_onchain,
+        payment_hash UNIQUE + INSERT OR IGNORE) would silently drop the
+        second completion."""
         key = payment_hash.hex()
         if key in self.swaps:
             raise RequestFieldError('payment_hash already in use')
         if self.lnworker.get_preimage(payment_hash) is not None:
             raise RequestFieldError('payment_hash already in use')
+        if self.lnworker.is_tombstoned(payment_hash):
+            raise RequestFieldError('payment_hash already used (tombstoned hold)')
 
     async def create_normal_swap(self, *, lightning_amount_sat: int, payment_hash: bytes, their_pubkey: bytes = None,
                                  requester_npub: Optional[str] = None):

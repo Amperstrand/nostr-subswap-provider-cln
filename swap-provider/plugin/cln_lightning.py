@@ -712,6 +712,18 @@ class CLNLightning:
             raise InvalidPreimageFoundError("found incorrect preimage for payment_hash")
         return preimage_hex
 
+    def is_tombstoned(self, payment_hash: Union[bytes, str]) -> bool:
+        """#81 §1.4-3 (2026-08-31): True if this hash was ever committed
+        to a hold invoice that has since been deleted (completed,
+        expired, or cancelled). A completed d1 swap's preimage is PUBLIC
+        (published in the claim-tx witness) and its hash never enters
+        _preimages (client-held, only extracted into the swap record
+        before that record de-indexes) — the tombstone set is the only
+        persisted memory that the hash is spent."""
+        if isinstance(payment_hash, bytes):
+            payment_hash = payment_hash.hex()
+        return payment_hash in self._tombstones
+
     def num_sats_can_receive(self) -> int:
         """returns max inbound capacity; raises CapacityProbeError on RPC
         failure (#21 contract 1) so callers can distinguish outage from

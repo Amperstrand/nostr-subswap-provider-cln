@@ -189,6 +189,7 @@ def _sm(**attrs) -> SwapManager:
     sm.lnwatcher.register_address = AsyncMock()
     sm.lnworker = MagicMock()
     sm.lnworker.get_preimage = MagicMock(return_value=None)
+    sm.lnworker.is_tombstoned = MagicMock(return_value=False)
     for k, v in attrs.items():
         setattr(sm, k, v)
     return sm
