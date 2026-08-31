@@ -248,3 +248,38 @@ class TestParkBeforeClaim:
         src = (_plugin / "submarine_swaps.py").read_text()
         assert re.search(r"parked", src), (
             "_claim_swap's onchain_to_ln branch must gate on parking (received >= amount)")
+
+
+class TestMinFinalCltvKnob:
+    """2026-08-31 production outage: contracts-r1's #14-item-4 guard
+    (min_final_cltv_expiry >= 144) rejected EVERY client hold invoice —
+    the hub hold plugin hardcodes 80 (encoder.rs
+    DEFAULT_MIN_FINAL_CLTV_EXPIRY_DELTA) with no JSON-RPC knob, so the
+    whole onchain_to_ln lane failed at addswapinvoice the moment the
+    guard shipped. The knob: config/env MIN_FINAL_CLTV_ACCEPTED, default
+    the constant 144 (safe-by-default); testnet deployments opt down to
+    80 until the hold-plugin fork (default-bump) lands."""
+
+    def test_default_is_the_constant(self):
+        # PluginConfig.__init__ eagerly builds an RPC client (needs a full
+        # cln_configuration) — pin the default by contract instead: the
+        # attribute must default to the CONSTANT, never a bare literal
+        from plugin.constants import MIN_FINAL_CLTV_DELTA_ACCEPTED
+        src = (_plugin / "plugin_config.py").read_text()
+        assert re.search(
+            rf"self\.min_final_cltv_accepted:\s*int\s*=\s*MIN_FINAL_CLTV_DELTA_ACCEPTED", src), (
+            f"default must be the constant ({MIN_FINAL_CLTV_DELTA_ACCEPTED}), not a literal")
+
+    def test_guard_reads_the_knob_not_the_bare_constant(self):
+        # source contract: the addswapinvoice guard must consult
+        # self.config.min_final_cltv_accepted (getattr with the constant
+        # as fallback) — a bare constants read is the shipped-bug shape
+        src = (_plugin / "submarine_swaps.py").read_text()
+        assert re.search(
+            r"getattr\(self\.config,\s*'min_final_cltv_accepted',\s*constants\.MIN_FINAL_CLTV_DELTA_ACCEPTED\)",
+            src), "guard must read the config knob"
+
+    def test_env_wiring(self):
+        src = (_plugin / "plugin_config.py").read_text()
+        assert "MIN_FINAL_CLTV_ACCEPTED" in src, (
+            "from_chln_and_env must honor the MIN_FINAL_CLTV_ACCEPTED env override")

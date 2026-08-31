@@ -10,7 +10,7 @@ from .lnutil import hex_to_bytes, bytes_to_hex
 from .json_db import StoredObject
 from .cln_logger import PluginLogger
 from . import constants
-from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT, INVOICE_EXPIRY_SECONDS_DEFAULT
+from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT, INVOICE_EXPIRY_SECONDS_DEFAULT, MIN_FINAL_CLTV_DELTA_ACCEPTED
 
 
 class PluginConfig:
@@ -32,6 +32,12 @@ class PluginConfig:
         self.funding_gate_timeout_blocks: int = FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT
         self.funding_gate_on_timeout: str = "fail"
         self.invoice_expiry_seconds: int = INVOICE_EXPIRY_SECONDS_DEFAULT
+        # 2026-08-31 outage knob: the hub hold plugin hardcodes
+        # min_final 80 into every holdinvoice (JSON-RPC surface has no
+        # cltv param); the #14 guard at 144 rejected every client hold.
+        # Default stays 144 (safe); testnet deployments opt down via
+        # MIN_FINAL_CLTV_ACCEPTED until the hold-plugin fork lands.
+        self.min_final_cltv_accepted: int = MIN_FINAL_CLTV_DELTA_ACCEPTED
         # issue #24 r8 traffic attribution: normalized hex pubkeys of
         # OUR OWN test clients (TEST_NPUBS env, npub… or 64-hex, csv).
         # Empty registry is honest: every known requester then reads
@@ -112,6 +118,9 @@ class PluginConfig:
         # `swapclient-*` RPCs drive the reverse-swap lifecycle. Default
         # remains the provider (server) mode this plugin has always been.
         config.swap_mode = os.getenv("SWAP_MODE", "server").strip().lower()
+
+        if cltv_str := os.getenv("MIN_FINAL_CLTV_ACCEPTED"):
+            config.min_final_cltv_accepted = int(cltv_str.strip())
         if config.swap_mode not in ("server", "client"):
             raise Exception(f"SWAP_MODE must be server|client, got {config.swap_mode!r}")
 

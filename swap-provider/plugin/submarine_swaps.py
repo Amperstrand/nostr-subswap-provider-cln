@@ -1414,10 +1414,12 @@ class SwapManager:
             cltv_delta = invoice._lnaddr.get_min_final_cltv_delta()
         except Exception:
             cltv_delta = None
-        if cltv_delta is not None and cltv_delta < constants.MIN_FINAL_CLTV_DELTA_ACCEPTED:
+        cltv_floor = getattr(self.config, 'min_final_cltv_accepted',
+                             constants.MIN_FINAL_CLTV_DELTA_ACCEPTED)
+        if cltv_delta is not None and cltv_delta < cltv_floor:
             raise RequestFieldError(
                 f'invoice min_final_cltv_expiry {cltv_delta} < '
-                f'{constants.MIN_FINAL_CLTV_DELTA_ACCEPTED} — the LN leg '
+                f'{cltv_floor} — the LN leg '
                 f'would die before our refund unlock')
         swap.registered = True
         # issue #24 r8 late fill: a record whose phase-1 DM carried no
