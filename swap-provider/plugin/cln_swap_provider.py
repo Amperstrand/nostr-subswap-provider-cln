@@ -100,6 +100,9 @@ class CLNSwapProvider:
                                         chain_monitor=self.chain_monitor,
                                         plugin_config=self.config,
                                         logger=self.logger)
+        # #36 HSM-split: inject the HSM derivation function so the
+        # SwapManager can derive claim keys and preimages from CLN's HSM
+        self.swap_manager.set_hsm_deriver(self.plugin_handler.derive_secret)
 
         # client mode (design 12): a client of electrum-protocol swap
         # servers -- discovery, gated reverse swaps, onchain claims.

@@ -157,7 +157,12 @@ class SwapData(StoredObject):
     redeem_script = attr.ib(type=str, converter=bytes_to_hex)
     preimage = attr.ib(type=Optional[str], converter=bytes_to_hex)
     prepay_hash = attr.ib(type=Optional[str], converter=bytes_to_hex)
-    privkey = attr.ib(type=str, converter=bytes_to_hex)
+    privkey = attr.ib(type=Optional[str], converter=bytes_to_hex)
+    # #36 HSM-split: for new-format swaps, secrets are derived from CLN's
+    # HSM at use-time; only the seed (safe without HSM) and the public
+    # key are persisted. Old-format swaps carry plaintext privkey/preimage.
+    preimage_seed = attr.ib(type=Optional[str], converter=bytes_to_hex, default=None, kw_only=True)
+    claim_pubkey = attr.ib(type=Optional[str], default=None, kw_only=True)
     lockup_address = attr.ib(type=str)
     receive_address = attr.ib(type=str)
     funding_txid = attr.ib(type=Optional[str])
@@ -319,8 +324,9 @@ class SwapManager:
                     raise ValueError(f'{len(raw)} bytes, need 32')
             except (ValueError, TypeError):
                 errors.append(f'{field} missing/unparsable')
-        if swap.preimage and payment_hash is not None \
-                and sha256(hex_to_bytes(swap.preimage)) != payment_hash:
+        _stored_preimage = swap.preimage if swap.preimage else None
+        if _stored_preimage and payment_hash is not None \
+                and sha256(hex_to_bytes(_stored_preimage)) != payment_hash:
             errors.append('preimage does not hash to payment_hash')
         return errors
 
@@ -644,9 +650,10 @@ class SwapManager:
 
     def _finish_normal_swap(self, swap: SwapData):
         self.logger.info(f'finishing normal swap {swap.payment_hash.hex()}')
-        assert swap.preimage, f"Cannot settle without preimage: {swap.payment_hash.hex()}"
+        _preimage = self._get_swap_preimage(swap)
+        assert _preimage, f"Cannot settle without preimage: {swap.payment_hash.hex()}"
         hold_invoice = self.lnworker.get_hold_invoice(swap.payment_hash)
-        hold_invoice.settle(swap.preimage)
+        hold_invoice.settle(_preimage.hex())
         if not hold_invoice.funding_status == InvoiceState.SETTLED:
             self.logger.error(f'hold invoice settling failed: {swap.payment_hash.hex()}')
             return
@@ -879,7 +886,7 @@ class SwapManager:
                     return self.delete_finished_reverse_swap(swap)
 
             if not swap.is_reverse:
-                if swap.preimage is None and spent_height is not None:
+                if self._get_swap_preimage(swap) is None and spent_height is not None:
                     # extract the preimage, add it to lnwatcher
                     claim_tx = await self.lnwatcher.get_transaction(txin.spent_txid)
                     preimage = self.extract_preimage(swap, claim_tx)
@@ -916,16 +923,18 @@ class SwapManager:
                                       f'too early for refund')
                     return
 
-                if swap.preimage:
+                if self._get_swap_preimage(swap):
                     # we have been paid. do not try to get refund.
                     self.logger.debug(f"claim_swap: we have been paid for {swap.lockup_address}, "
                                       f"not trying to get refund")
                     return
 
             else:
-                if swap.preimage is None:
-                    swap.preimage = self.lnworker.get_preimage(swap.payment_hash)
-                if swap.preimage is None:
+                if self._get_swap_preimage(swap) is None:
+                    _ln_preimage = self.lnworker.get_preimage(swap.payment_hash)
+                    if _ln_preimage:
+                        swap.preimage = _ln_preimage.hex()
+                if self._get_swap_preimage(swap) is None:
                     if funding_height.conf <= 0:
                         return
                     key = swap.payment_hash.hex()
@@ -976,7 +985,7 @@ class SwapManager:
             # earlier leaves a client-loss corner: our payment failing
             # permanently post-claim = unfillable hold + lockup taken.
             # Not parked yet → the client refunds at CLTV instead.
-            if swap.preimage is not None and not self._payment_parked(swap):
+            if self._get_swap_preimage(swap) is not None and not self._payment_parked(swap):
                 self.logger.info(
                     f'claim deferred: payment not parked yet for '
                     f'{swap.lockup_address} (issue #26 park-then-claim)')
@@ -1206,15 +1215,19 @@ class SwapManager:
         """ server method. """
         assert lightning_amount_sat is not None
         locktime = await self.wallet.get_local_height() + LOCKTIME_DELTA_REFUND
-        privkey = os.urandom(32)
+        # #36 HSM-split: secrets derived from CLN's HSM, never persisted.
+        # The seed is a random label safe to store (useless without the
+        # HSM); the claim key is derived from the public payment_hash.
+        preimage_seed = os.urandom(16)
+        preimage = self._derive_secret(f"swap-preimage-{preimage_seed.hex()}")
+        payment_hash = sha256(preimage)
+        privkey = self._derive_secret(f"swap-claim-{payment_hash.hex()}")
         our_pubkey = ECPrivkey(privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_send_amount(lightning_amount_sat, is_reverse=False)
         if onchain_amount_sat is None:
             raise RequestFieldError(
                 f'amount out of bounds (min {self.get_min_amount()}, '
                 f'max {self.get_max_amount()})')
-        preimage = os.urandom(32)
-        payment_hash = sha256(preimage)
         redeem_script = construct_script(
             WITNESS_TEMPLATE_REVERSE_SWAP,
             {1:32, 5:ripemd(payment_hash), 7:our_pubkey, 10:locktime, 13:their_pubkey}
@@ -1222,8 +1235,10 @@ class SwapManager:
         swap = await self.add_reverse_swap(
             redeem_script=redeem_script,
             locktime=locktime,
-            privkey=privkey,
-            preimage=preimage,
+            privkey=None,  # #36: not persisted — HSM-derived at use-time
+            preimage=None,  # #36: not persisted — HSM-derived at use-time
+            preimage_seed=preimage_seed,
+            claim_pubkey=our_pubkey,
             payment_hash=payment_hash,
             prepay_hash=None,  # server doesn't prepay
             onchain_amount_sat=onchain_amount_sat,
@@ -1231,18 +1246,48 @@ class SwapManager:
             requester_npub=requester_npub)
         return swap
 
+    def _derive_secret(self, label: str) -> bytes:
+        """#36: derive a secret from CLN's HSM via makesecret. Must be
+        callable from the SwapManager — the plugin handler is injected
+        at initialization."""
+        if not hasattr(self, '_hsm_deriver') or self._hsm_deriver is None:
+            raise RuntimeError("HSM deriver not configured — call set_hsm_deriver() first")
+        return self._hsm_deriver(label)
+
+    def set_hsm_deriver(self, deriver) -> None:
+        """Inject the HSM derivation function (wraps plugin.derive_secret)."""
+        self._hsm_deriver = deriver
+
+    def _get_swap_privkey(self, swap: SwapData) -> bytes:
+        """Return the claim private key: stored (old format) or HSM-derived (new format)."""
+        if swap.privkey:
+            return hex_to_bytes(swap.privkey)
+        if swap.claim_pubkey is None:
+            raise RuntimeError(f"swap {swap.payment_hash.hex()[:8]} has no privkey and no claim_pubkey")
+        return self._derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
+
+    def _get_swap_preimage(self, swap: SwapData) -> Optional[bytes]:
+        """Return the preimage: stored (old format) or HSM-derived (new format)."""
+        if swap.preimage:
+            return hex_to_bytes(swap.preimage)
+        if swap.preimage_seed is None:
+            return None
+        return self._derive_secret(f"swap-preimage-{swap.preimage_seed}")
+
     async def add_reverse_swap(
         self,
         *,
         redeem_script: bytes,
         locktime: int,  # onchain
-        privkey: bytes,
+        privkey: Optional[bytes],
         lightning_amount_sat: int,
         onchain_amount_sat: int,
-        preimage: bytes,
+        preimage: Optional[bytes],
         payment_hash: bytes,
         prepay_hash: Optional[bytes] = None,
         requester_npub: Optional[str] = None,
+        preimage_seed: Optional[bytes] = None,
+        claim_pubkey: Optional[str] = None,
     ) -> SwapData:
         lockup_address = script_to_p2wsh(redeem_script, net=self.config.network)
         receive_address = self.wallet.get_receiving_address()
@@ -1250,9 +1295,11 @@ class SwapManager:
         swap = SwapData(
             redeem_script = bytes_to_hex(redeem_script),
             locktime = locktime,
-            privkey = bytes_to_hex(privkey),
-            preimage = bytes_to_hex(preimage),
+            privkey = bytes_to_hex(privkey) if privkey else None,
+            preimage = bytes_to_hex(preimage) if preimage else None,
             prepay_hash = bytes_to_hex(prepay_hash),
+            preimage_seed = bytes_to_hex(preimage_seed) if preimage_seed else None,
+            claim_pubkey = claim_pubkey,
             lockup_address = lockup_address,
             onchain_amount = onchain_amount_sat,
             receive_address = receive_address,
@@ -1298,7 +1345,8 @@ class SwapManager:
             raise RequestFieldError(
                 f'invoice amount != swap amount '
                 f'({invoice.get_amount_sat()} != {swap.lightning_amount})')
-        if sha256(hex_to_bytes(swap.preimage)) != payment_hash:
+        _preimage = self._get_swap_preimage(swap)
+        if _preimage is None or sha256(_preimage) != payment_hash:
             raise RequestFieldError('invoice hash does not match the swap')
         if swap.spending_txid is not None:
             raise RequestFieldError('swap already in flight')
@@ -1311,7 +1359,8 @@ class SwapManager:
         # direction-inversion trap the AGENTS terminology table warns of).
         # SwapData.privkey is HEX in this port (see sign_tx) — ECPrivkey
         # asserts raw bytes.
-        our_pubkey = ECPrivkey(hex_to_bytes(swap.privkey)).get_public_key_bytes(compressed=True)
+        our_pubkey = (bytes.fromhex(swap.claim_pubkey) if swap.claim_pubkey
+                      else ECPrivkey(self._get_swap_privkey(swap)).get_public_key_bytes(compressed=True))
         redeem_script = construct_script(
             WITNESS_TEMPLATE_REVERSE_SWAP,
             {1: 32, 5: ripemd(payment_hash), 7: our_pubkey,
@@ -1526,16 +1575,17 @@ class SwapManager:
         return x
 
     @classmethod
-    def sign_tx(cls, tx: PartialTransaction, swap: SwapData) -> None:
-        preimage = hex_to_bytes(swap.preimage) if swap.is_reverse else 0
+    def sign_tx(cls, tx: PartialTransaction, swap: SwapData,
+                privkey: bytes, preimage: Optional[bytes]) -> None:
         witness_script = hex_to_bytes(swap.redeem_script)
         txin = tx.inputs()[0]
         assert len(tx.inputs()) == 1, f"expected 1 input for swap claim tx. found {len(tx.inputs())}"
         assert txin.prevout.txid.hex() == swap.funding_txid
         txin.script_sig = b''
         txin.witness_script = witness_script
-        sig = tx.sign_txin(0, hex_to_bytes(swap.privkey))
-        witness = [sig, preimage, witness_script]
+        sig = tx.sign_txin(0, privkey)
+        _preimage = preimage if swap.is_reverse else 0
+        witness = [sig, _preimage, witness_script]
         txin.witness = construct_witness(witness)
 
     def _create_and_sign_claim_tx(
@@ -1561,7 +1611,7 @@ class SwapManager:
             amount_sat=amount_sat,
             locktime=locktime,
         )
-        self.sign_tx(tx, swap)
+        self.sign_tx(tx, swap, privkey=self._get_swap_privkey(swap), preimage=self._get_swap_preimage(swap))
         tx.finalize_psbt()
         return tx
 

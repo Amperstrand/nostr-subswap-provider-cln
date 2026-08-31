@@ -46,6 +46,9 @@ def _manager():
     sm.lnworker.register_hold_invoice_callback = MagicMock()
     sm.config = MagicMock()
     sm.config.network = _constants.BitcoinRegtest
+    # #36: mock HSM deriver (deterministic per-label, like makesecret)
+    import hmac, hashlib
+    sm.set_hsm_deriver(lambda label: hmac.new(b'test-root', label.encode(), hashlib.sha256).digest())
     return sm
 
 
@@ -57,17 +60,19 @@ class TestUniqueScriptPerSwap:
                                          their_pubkey=b"\x02" + b"\xab" * 32)
         b = await sm.create_reverse_swap(lightning_amount_sat=25_000,
                                          their_pubkey=b"\x02" + b"\xab" * 32)
-        assert a.preimage != b.preimage
-        assert a.privkey != b.privkey
+        # #36: preimage is None in the record; derive via HSM to compare
+        sm._get_swap_preimage(a) != sm._get_swap_preimage(b)
+        assert sm._get_swap_privkey(a) != sm._get_swap_privkey(b)
         assert a.redeem_script != b.redeem_script
         assert a.lockup_address != b.lockup_address
         assert a.payment_hash != b.payment_hash
 
     @pytest.mark.asyncio
     async def test_source_has_no_deterministic_derivation(self):
-        # contract: swap material comes from os.urandom per create —
-        # any deterministic derivation (hash of client inputs) would
-        # be a trustless violation (cross-swap preimage satisfaction)
+        # #36 HSM-split: per-swap uniqueness now comes from the random
+        # preimage_seed (os.urandom(16)) — the key material is HSM-derived
+        # from the seed, so different seeds → different keys (same property
+        # as the old os.urandom(32), but the secrets are never stored)
         src = (_plugin / "submarine_swaps.py").read_text()
         import re
         creates = re.findall(
@@ -75,6 +80,9 @@ class TestUniqueScriptPerSwap:
             src, re.S)
         assert creates, "creation functions not found"
         for fn in creates:
-            assert "os.urandom(32)" in fn, (
-                "per-swap material must come from os.urandom, not "
-                "deterministic derivation")
+            if "create_reverse_swap" in fn:
+                assert "os.urandom(16)" in fn, (
+                    "d2 per-swap uniqueness must come from the random preimage seed")
+            else:
+                assert "os.urandom(32)" in fn, (
+                    "d1 per-swap material must come from os.urandom")
