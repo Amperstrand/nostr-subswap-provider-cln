@@ -649,8 +649,10 @@ class CLNLightning:
         try:
             available_channels = self._rpc.listpeerchannels()["channels"]
         except Exception as e:
+            # #21 contract 2: an RPC failure must not silently produce a
+            # hint-less invoice that is unroutable on private-channel nodes
             self._logger.error(f"_get_route_hints rpc failed: {e}")
-            return []
+            raise RouteHintUnavailableError(f"cannot probe channels for route hints: {e}") from e
 
         suitable_channels = filter_suitable_recv_chans(amount_msat,
                                                             available_channels)
@@ -711,26 +713,27 @@ class CLNLightning:
         return preimage_hex
 
     def num_sats_can_receive(self) -> int:
-        """returns max inbound capacity"""
+        """returns max inbound capacity; raises CapacityProbeError on RPC
+        failure (#21 contract 1) so callers can distinguish outage from
+        actual zero capacity."""
         inbound_capacity_sat = 0
         try:
             available_channels = self._rpc.listfunds()["channels"]
         except Exception as e:
-            self._logger.error(f"num_sats_can_receive: listfunds rpc failed: {e}")
-            return 0
+            raise CapacityProbeError(f"listfunds rpc failed: {e}") from e
         for channel in available_channels:
             if channel["connected"]:
                 inbound_capacity_sat += (channel["amount_msat"] - channel["our_amount_msat"]) / 1000
         return int(inbound_capacity_sat * self.INBOUND_LIQUIDITY_FACTOR)
 
     def num_sats_can_send(self) -> int:
-        """returns max outbound capacity"""
+        """returns max outbound capacity; raises CapacityProbeError on RPC
+        failure (#21 contract 1)."""
         outbound_capacity_sat = 0
         try:
             available_channels = self._rpc.listfunds()["channels"]
         except Exception as e:
-            self._logger.error(f"num_sats_can_send: listfunds rpc failed: {e}")
-            return 0
+            raise CapacityProbeError(f"listfunds rpc failed: {e}") from e
         for channel in available_channels:
             if channel["connected"]:
                 outbound_capacity_sat += channel["our_amount_msat"] / 1000
@@ -747,6 +750,17 @@ class ClnRpcError(Exception):
     pass
 
 class InvalidPreimageSavedError(Exception):
+    pass
+
+class CapacityProbeError(Exception):
+    """#21 contract 1: RPC failure during capacity probing — the server
+    must not present an outage as an exhausted-wallet business answer."""
+    pass
+
+class RouteHintUnavailableError(Exception):
+    """#21 contract 2: route hints cannot be built (RPC failure) and the
+    node has private channels — issuing a hint-less invoice would be
+    unroutable; refuse instead."""
     pass
 
 class Bolt11InvoiceCreationError(Exception):

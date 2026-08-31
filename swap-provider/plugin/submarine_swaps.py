@@ -102,7 +102,7 @@ from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .cln_chain import CLNChainWallet
-    from .cln_lightning import CLNLightning
+    from .cln_lightning import CLNLightning, CapacityProbeError
     from .chain_monitor import ChainMonitor
 from .plugin_config import PluginConfig
 from .cln_logger import PluginLogger
@@ -1077,6 +1077,14 @@ class SwapManager:
         if swap.funding_txid is None:
             try:
                 tx = self.create_funding_tx(swap=swap)
+                if tx is None:
+                    # #21 contract 3: create_transaction returned None
+                    # (fundpsbt/signpsbt failure) — surface the root cause
+                    # instead of letting broadcast_funding_tx crash on None
+                    raise RuntimeError(
+                        f'funding tx construction returned None for {key[:10]} '
+                        f'(fundpsbt/signpsbt failure — check wallet balance '
+                        f'and emergency reserve)')
                 self.broadcast_funding_tx(swap, tx)
             except Exception as e:
                 self.logger.error(f'funding tx failed, failing swap {key[:10]}: {e}')
@@ -1245,6 +1253,18 @@ class SwapManager:
             lightning_amount_sat=lightning_amount_sat,
             requester_npub=requester_npub)
         return swap
+
+    def _datastore_healthy(self) -> bool:
+        """#21 contract 4: True if the last successful datastore write was
+        within the freshness window (or if no write has been attempted yet,
+        meaning the plugin just started). Circuit breaker for swap admission."""
+        if not hasattr(self, 'db') or self.db is None:
+            return True  # no db configured — can't check
+        last = getattr(self.db, 'last_write_monotonic', None)
+        if not isinstance(last, (int, float)):
+            return True  # fresh start or mock/uninitialized — treat as healthy
+        import time as _time
+        return (_time.monotonic() - last) < 300
 
     def _derive_secret(self, label: str) -> bytes:
         """#36: derive a secret from CLN's HSM via makesecret. Must be
@@ -1632,12 +1652,22 @@ class SwapManager:
 
     async def server_create_normal_swap(self, request):
         # normal for client, reverse for server
+        # #21 contract 4: circuit breaker — refuse new swaps while the
+        # datastore is unhealthy (the swap record cannot be persisted)
+        if not self._datastore_healthy():
+            return {'error': 'datastore unhealthy — try again shortly'}
+
         #request = await r.json()
         lightning_amount_sat = self._require_amount(request['invoiceAmount'])
         their_pubkey = self._parse_client_key('refundPublicKey', request['refundPublicKey'], 33)
         assert len(their_pubkey) == 33
-        if self.lnworker.num_sats_can_send() < lightning_amount_sat:
-            self.logger.warning(f'not enough outgoing capacity to satisfy swap: {self.lnworker.num_sats_can_send()} sat,'
+        try:
+            _send_capacity = self.lnworker.num_sats_can_send()
+        except CapacityProbeError as e:
+            self.logger.error(f'capacity probe failed (RPC outage): {e}')
+            return {'error': 'capacity probe failed — try again shortly'}
+        if _send_capacity < lightning_amount_sat:
+            self.logger.warning(f'not enough outgoing capacity: {_send_capacity} sat,'
                                 f' rejecting swap for {lightning_amount_sat} sat')
             return {'error': 'not enough outgoing capacity'}
         swap = await self.create_reverse_swap(
@@ -1662,6 +1692,9 @@ class SwapManager:
         #request = await r.json()
         req_type = request['type']
         assert request['pairId'] == 'BTC/BTC'
+        # #21 contract 4: circuit breaker
+        if not self._datastore_healthy():
+            return {'error': 'datastore unhealthy — try again shortly'}
         if req_type == 'reversesubmarine':
             lightning_amount_sat=self._require_amount(request['invoiceAmount'])
             payment_hash=self._parse_client_key('preimageHash', request['preimageHash'], 32)
@@ -1669,9 +1702,13 @@ class SwapManager:
             self._require_fresh_payment_hash(payment_hash)
             assert len(payment_hash) == 32
             assert len(their_pubkey) == 33
-            if self.lnworker.num_sats_can_receive() < lightning_amount_sat:
-                self.logger.warning(f'not enough incoming capacity to receive swap: '
-                                    f'{self.lnworker.num_sats_can_receive()}, '
+            try:
+                _recv_capacity = self.lnworker.num_sats_can_receive()
+            except CapacityProbeError as e:
+                self.logger.error(f'capacity probe failed (RPC outage): {e}')
+                return {'error': 'capacity probe failed — try again shortly'}
+            if _recv_capacity < lightning_amount_sat:
+                self.logger.warning(f'not enough incoming capacity: {_recv_capacity}, '
                                     f'rejecting swap for {lightning_amount_sat}sat')
                 return {'error': 'not enough incoming capacity, please open channel'}
             # issue #31: reserve-aware gate — reject BEFORE the payer
