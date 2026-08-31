@@ -680,26 +680,44 @@ class SwapManager:
             self.swaps.pop(swap.payment_hash.hex(), None)
         self.db.write()
 
-    def _payment_parked(self, swap: SwapData) -> bool:
-        """True when OUR payment of the client's hold has committed
-        HTLCs parked at the receiver — the #26 ordering gate signal.
-
-        PAYER-SIDE TRUTH (live-earned 2026-08-24, jitlab, twice): the
-        hold invoice lives at the CLIENT — the server can never query
-        its received amount, and a bolt11-keyed listpays returns
-        {'pays': [...]} whose unwrapped status is None. The PROVEN
-        query is listpays(payment_hash=...): 'pending' = HTLCs parked,
-        'complete' = settled, no entry = never started (fail closed)."""
+    def _payment_parked_state(self, swap: SwapData) -> str:
+        """Tri-state for the #26 park gate and the #42 terminal expiry:
+        'parked' (HTLCs parked or settled), 'absent' (listpays ANSWERED
+        — the payment definitively never parked/never started), 'unknown'
+        (RPC failed — fail closed, must not drive any terminal action).
+        PAYER-SIDE TRUTH: listpays(payment_hash=...); see _payment_parked."""
         try:
             out = self.lnworker._rpc.listpays(
                 payment_hash=swap.payment_hash.hex())
             entries = out.get('pays', out) if isinstance(out, dict) else []
             if isinstance(entries, dict):
                 entries = [entries]
-            return any(p.get('status') in ('pending', 'complete')
-                       for p in entries)
+            if any(p.get('status') in ('pending', 'complete') for p in entries):
+                return 'parked'
+            return 'absent'
         except Exception:
-            return False
+            return 'unknown'
+
+    def _payment_parked(self, swap: SwapData) -> bool:
+        return self._payment_parked_state(swap) == 'parked'
+
+    def _expire_never_parked_swap(self, swap: SwapData) -> None:
+        """#42: a funded swap whose LN leg was committed but DEFINITIVELY
+        never parked is past its claim window (locktime +
+        SWEEP_GRACE_BLOCKS): the lockup stays client-refundable forever
+        (the refund branch has no expiry), our claim is forfeit by
+        policy (#26 never-claim-unparked), so the record — which in the
+        old format still carries plaintext secrets — is dead bookkeeping.
+        Stop watching, drop the record; NEVER touch the payment layer
+        (parked HTLCs ride to their own expiry — the #13 funds guard)."""
+        key = swap.payment_hash.hex()
+        self.logger.error(
+            f'policy: expiring never-parked swap {key} past claim window '
+            f'(locktime={swap.locktime}, lockup={swap.lockup_address} left '
+            f'client-refundable; record dropped — secrets age out)')
+        self.lnwatcher.remove_callback(swap.lockup_address)
+        self.swaps.pop(key, None)
+        self.db.write()
 
     def _has_ln_commitment(self, swap: SwapData) -> bool:
         """True if the client committed to the LN leg of this reverse swap:
@@ -986,6 +1004,15 @@ class SwapManager:
             # permanently post-claim = unfillable hold + lockup taken.
             # Not parked yet → the client refunds at CLTV instead.
             if self._get_swap_preimage(swap) is not None and not self._payment_parked(swap):
+                # #42: definitively never-parked past the claim window is
+                # terminal — the deferred state has no other exit (live:
+                # 21b4256e deferred every pass for 300+ blocks, secrets
+                # riding in the datastore). 'unknown' (RPC outage) and
+                # pre-grace keep the deferral.
+                if (self._payment_parked_state(swap) == 'absent'
+                        and current_height > swap.locktime + self.config.sweep_grace_blocks):
+                    self._expire_never_parked_swap(swap)
+                    return
                 self.logger.info(
                     f'claim deferred: payment not parked yet for '
                     f'{swap.lockup_address} (issue #26 park-then-claim)')
