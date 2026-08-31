@@ -162,7 +162,7 @@ class SwapData(StoredObject):
     # HSM at use-time; only the seed (safe without HSM) and the public
     # key are persisted. Old-format swaps carry plaintext privkey/preimage.
     preimage_seed = attr.ib(type=Optional[str], converter=bytes_to_hex, default=None, kw_only=True)
-    claim_pubkey = attr.ib(type=Optional[str], default=None, kw_only=True)
+    claim_pubkey = attr.ib(type=Optional[str], converter=bytes_to_hex, default=None, kw_only=True)
     lockup_address = attr.ib(type=str)
     receive_address = attr.ib(type=str)
     funding_txid = attr.ib(type=Optional[str])

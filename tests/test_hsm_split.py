@@ -140,6 +140,29 @@ class TestHsmDerivation:
         preimage2 = sm._derive_secret(f"swap-preimage-{seed.hex()}")
         assert sha256(preimage2).hexdigest() == payment_hash
 
+    def test_bytes_claim_pubkey_normalized_and_patch_serializable(self):
+        """Production crash 2026-08-31 (contracts-r1): create_reverse_swap
+        passed claim_pubkey as raw BYTES into SwapData; to_json() left them
+        bytes; JsonDB.add_patch's json.dumps crashed (under pyln's patched
+        JSONEncoder.default the TypeError is the confusing
+        'JSONEncoder.default() missing 1 required positional argument').
+        Every onchain_to_ln createswap failed 'internal error serving
+        createnormalswap' on both cln providers. Contract: the claim_pubkey
+        FIELD is always a 66-hex string, so every datastore patch is
+        natively JSON-serializable. Unit tests missed this because detached
+        SwapData objects (no live JsonDB) never fire add_patch."""
+        from plugin.json_db import JsonDB
+        db = JsonDB(s='{}', storage=MagicMock(), logger=MagicMock())
+        # exactly what create_reverse_swap passed at the crash site
+        swap = _swap(claim_pubkey=b'\x02' + b'\xab' * 32)
+        assert swap.claim_pubkey == '02' + 'ab' * 32, \
+            'converter must normalize bytes to hex at construction'
+        db.data['submarine_swaps'] = {}
+        db.data['submarine_swaps']['aa' * 32] = swap  # fires add_patch
+        assert db.pending_changes, 'storing a swap must produce a datastore patch'
+        for p in db.pending_changes:
+            json.loads(p)  # pre-fix: TypeError serializing raw bytes
+
     def test_missing_hsm_deriver_raises(self):
         """Calling _derive_secret without set_hsm_deriver is a loud failure."""
         sm = object.__new__(SwapManager)
