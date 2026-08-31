@@ -9,12 +9,29 @@ audit standard (no severity without a path).
 
 ## Hunter 1 — HSM-split secret handling (#36/#13)
 
-- **[HIGH, code-confirmed] d1 refund key still plaintext in datastore —
-  the HSM-split covers only d2.** `submarine_swaps.py:1130`
-  (`os.urandom(32)`) → `:1213` (`privkey=our_privkey.hex()` → datastore).
-  Datastore-read RPC + lockup_address + locktime = refund-to-self for
-  any unclaimed d1 swap after locktime (the #13 sweep-kit class, half
-  closed). Tests pin only the reverse direction.
+**Post-audit correction (same day):** the headline below was recorded
+against STALE line-memory — commit `4f63405` (2026-08-31 17:13Z, #43:
+d1 HSM-split) had already landed BEFORE the hunter ran (17:40Z) and
+the current tree derives the d1 refund key from the HSM
+(`swap-claim-{payment_hash}` label, `privkey=null` + `claim_pubkey`
+only). Verified current-tree: no `os.urandom(32)` privkey generation
+remains; only the 16-byte `preimage_seed` (:1277). F1 is OBSOLETE —
+kept below struck for the record. Likewise hunter-3's minor
+`_payment_parked` note is superseded by `5dbef0b` (#42: tri-state
+parked/absent/unknown, fail-closed). All OTHER load-bearing findings
+re-verified line-by-line against the CURRENT tree (containment gap,
+breaker None-hole at :1311-1315, catch-mismatch at :1056-1058,
+`_convert_dict` guard gap, 0-conf payment queueing at ~:970-976,
+200-page bail at bitcoin_core_rpc.py:406) — they HOLD.
+
+- ~~**[HIGH, code-confirmed] d1 refund key still plaintext in
+  datastore — the HSM-split covers only d2.**~~ **OBSOLETE: fixed by
+  4f63405 (#43) pre-audit.** Original claim (for the record):
+  `submarine_swaps.py:1130` (`os.urandom(32)`) → `:1213`
+  (`privkey=our_privkey.hex()` → datastore). Residual truth: OLD-format
+  records keep stored plaintext until expiry (backward compat, bounded
+  by locktime — unchanged, and `5dbef0b` now ages out never-parked
+  ones).
 - **[MEDIUM] derived privkey never checked against stored
   `claim_pubkey`** (`:1293-1299` returns makesecret output
   unconditionally; `:1648` signs blind) — hsm_secret rotation (node
@@ -117,9 +134,11 @@ audit standard (no severity without a path).
 
 1. listtransactions exhaustion (lab PoC first — the only funds-loss
    candidate; then per-address scoping or utxo-based reconciliation).
-2. d1 refund key HSM coverage (scope completion of #36).
-3. `_remember_event` containment + breaker None-hole + option-E
+2. `_remember_event` containment + breaker None-hole + option-E
    0-conf discharge (three availability/DoS fixes, small diffs).
-4. exception-type + reentrancy-lock + async oracle (claim-path
+3. exception-type + reentrancy-lock + async oracle (claim-path
    hygiene bundle).
-5. R8-analog load guard for the swaps section.
+4. R8-analog load guard for the swaps section.
+5. (was: d1 refund key HSM coverage — CLOSED by 4f63405/#43 pre-audit;
+   the derived-vs-claim_pubkey canary check from hunter-1 F2 remains
+   open and pairs naturally with it.)
