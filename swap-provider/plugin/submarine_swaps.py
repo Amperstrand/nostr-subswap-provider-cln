@@ -1154,7 +1154,13 @@ class SwapManager:
         """ server method """
         assert lightning_amount_sat
         locktime = await self.wallet.get_local_height() + LOCKTIME_DELTA_REFUND
-        our_privkey = os.urandom(32)
+        # #43: HSM-derived refund key, never persisted. The label is the
+        # client-chosen payment_hash — safe because _derive_secret is
+        # HSM-bound (knowing the label reveals nothing without
+        # hsm_secret) and duplicate hashes are rejected upstream by
+        # _require_fresh_payment_hash, so in-flight labels cannot
+        # collide. Same derivation and reader path as d2 (#36).
+        our_privkey = self._derive_secret(f"swap-claim-{payment_hash.hex()}")
         our_pubkey = ECPrivkey(our_privkey).get_public_key_bytes(compressed=True)
         onchain_amount_sat = self._get_recv_amount(lightning_amount_sat, is_reverse=True) # what the client is going to receive
         if onchain_amount_sat is None:
@@ -1173,7 +1179,8 @@ class SwapManager:
             onchain_amount_sat=onchain_amount_sat,
             lightning_amount_sat=lightning_amount_sat,
             payment_hash=payment_hash,
-            our_privkey=our_privkey,
+            our_privkey=None,  # #43: not persisted — HSM-derived at use-time
+            claim_pubkey=our_pubkey,
             prepay=True,
             requester_npub=requester_npub,
         )
@@ -1189,10 +1196,11 @@ class SwapManager:
             onchain_amount_sat: int,
             lightning_amount_sat: int,
             payment_hash: bytes,
-            our_privkey: bytes,
+            our_privkey: Optional[bytes],
             prepay: bool,
             min_final_cltv_expiry_delta: Optional[int] = None,
             requester_npub: Optional[str] = None,
+            claim_pubkey: Optional[str] = None,
     ) -> Tuple[SwapData, str, Optional[str]]:
         """creates a hold invoice"""
         if prepay:
@@ -1237,7 +1245,8 @@ class SwapManager:
         swap = SwapData(
             redeem_script=redeem_script.hex(),
             locktime = locktime,
-            privkey = our_privkey.hex(),
+            privkey = bytes_to_hex(our_privkey) if our_privkey else None,
+            claim_pubkey = claim_pubkey,
             preimage = None,
             prepay_hash = prepay_hash.hex(),
             lockup_address = lockup_address,

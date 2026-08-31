@@ -2,7 +2,11 @@
 lightning-playground docs/research/UNIQUE-SCRIPT-PER-SWAP.md):
 preimage cross-satisfaction, watcher ambiguity, refund mis-binding,
 linkability. Both creation paths must derive fresh material per swap —
-never deterministic from client-visible inputs.
+client-visible inputs alone never determine key material: #36/#43
+derivation runs through the HSM (hsm_secret is a second, secret
+input), and per-swap uniqueness additionally rides on the payment-hash
+freshness domains (live swap / known preimage / tombstone — pinned
+below).
 
 Live-verified on the jitlab 2026-08-24: two identical createnormalswap
 bodies (same refund key, same amount) produced distinct address /
@@ -84,8 +88,17 @@ class TestUniqueScriptPerSwap:
                 assert "os.urandom(16)" in fn, (
                     "d2 per-swap uniqueness must come from the random preimage seed")
             else:
-                assert "os.urandom(32)" in fn, (
-                    "d1 per-swap material must come from os.urandom")
+                # #43 d1 HSM-split: the refund key derives from the
+                # client-chosen payment_hash label THROUGH the HSM — the
+                # label alone determines nothing (hsm_secret is the
+                # secret input), same reader path as d2's
+                # payment_hash-derived privkey (#36). Uniqueness rides on
+                # the freshness domains (see test_payment_hash_freshness_
+                # domains + the end-to-end replay test below).
+                assert "os.urandom(32)" not in fn, (
+                    "d1 must not mint a raw-urandom plaintext privkey (#43)")
+                assert '_derive_secret(f"swap-claim-{payment_hash.hex()}")' in fn, (
+                    "d1 refund key must be HSM-derived from the swap-claim label")
 
     @pytest.mark.asyncio
     async def test_two_d1_creates_yield_distinct_material(self):

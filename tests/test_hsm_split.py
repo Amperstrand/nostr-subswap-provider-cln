@@ -216,3 +216,71 @@ class TestDatastoreCleanliness:
         # No 64-char hex strings that could be privkeys
         hex64 = re.findall(r'"[0-9a-f]{64}"', cleaned)
         assert len(hex64) == 0, f"found potential secrets: {hex64}"
+
+
+class TestD1HsmSplit:
+    """#43: the d1 path (create_normal_swap) still persisted the server
+    refund privkey in plaintext (os.urandom → privkey=hex). Live
+    evidence 2026-08-31: two same-day d1 records carried privkey=SET.
+    Contract: a new d1 record stores NO plaintext privkey — the key is
+    HSM-derived from the swap-claim-{payment_hash} label (the label is
+    client-influenceable but _derive_secret is HSM-bound; duplicate
+    hashes are rejected by _require_fresh_payment_hash), the record
+    carries only claim_pubkey, and the existing reader re-derives the
+    SAME key (writer-reader invariant)."""
+
+    def _d1_manager(self):
+        import asyncio  # noqa: F401  (kept for the runner below)
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from plugin.json_db import JsonDB
+        from plugin.constants import BitcoinRegtest
+        sm = SwapManager.__new__(SwapManager)
+        sm.set_hsm_deriver(_hsm_deriver)
+        sm.logger = MagicMock()
+        sm.db = JsonDB(s='{}', storage=MagicMock(), logger=MagicMock())
+        sm.db.data['submarine_swaps'] = {}
+        sm.swaps = sm.db.data['submarine_swaps']
+        sm._swaps_by_funding_outpoint = {}
+        sm._swaps_by_lockup_address = {}
+        sm.wallet = MagicMock()
+        sm.wallet.get_local_height = AsyncMock(return_value=320000)
+        sm.wallet.get_receiving_address = MagicMock(return_value='bcrt1qfake')
+        sm._get_recv_amount = MagicMock(return_value=19700)
+        sm.config = SimpleNamespace(network=BitcoinRegtest())
+        sm.lnworker = MagicMock()
+        sm.lnworker.b11invoice_from_hash = MagicMock(
+            return_value=types.SimpleNamespace(bolt11='lntbs1fake'))
+        sm.lnworker.create_payment_info = MagicMock(return_value=b'\xbb' * 32)
+        sm.lnworker.get_preimage = MagicMock(return_value=None)
+        sm.prepayments = {}
+        sm.get_claim_fee = MagicMock(return_value=37)
+        sm.lnwatcher = MagicMock()
+        sm.lnwatcher.register_address = AsyncMock(return_value=None)
+        sm.add_lnwatcher_callback = MagicMock()
+        return sm
+
+    def test_d1_record_clean_and_reader_rederives(self):
+        import asyncio
+        from electrum_ecc import ECPrivkey
+        sm = self._d1_manager()
+        swap, _invoice, _prepay = asyncio.run(sm.create_normal_swap(
+            lightning_amount_sat=20000, payment_hash=b'\xaa' * 32,
+            their_pubkey=b'\x02' + b'\x03' * 31, requester_npub=None))
+        record = sm.swaps['aa' * 32]
+        assert record.is_reverse is False
+        assert record.privkey is None, \
+            'd1 record must not persist the refund privkey in plaintext (#43)'
+        expected = ECPrivkey(
+            _hsm_deriver(f"swap-claim-{'aa' * 32}")
+        ).get_public_key_bytes(compressed=True)
+        assert record.claim_pubkey == expected.hex(), \
+            'writer must derive the refund key from the HSM label'
+        assert expected.hex() in record.redeem_script, \
+            'the lockup script must bind the derived key'
+        reread = ECPrivkey(sm._get_swap_privkey(record)
+                           ).get_public_key_bytes(compressed=True)
+        assert reread == expected, \
+            'reader must re-derive the SAME key the writer used'
+        for p in sm.db.pending_changes:
+            json.loads(p)
