@@ -160,7 +160,11 @@ full suite green):
   now disambiguated by `CLNStorage.failed_writes` (incremented on every
   failed write/append attempt): never-succeeded + any-failed = fail
   closed; never-attempted = healthy (fresh start); a success stamps the
-  300s freshness window as before.
+  300s freshness window as before. The #47 second half is covered too:
+  `server_add_swap_invoice` (phase 2) is now breaker-gated like the
+  create handlers — during an outage an accepted registration was
+  in-memory-only and stranded a funded client on the grace-hold
+  fail-open claim.
 - option-E 0-conf discharge (lane 2) — the funding gate now discharges
   at >=1 confirmation only; a mempool-visible lockup keeps the gate
   armed (its M-block deadline still bounds the window). The option-E
@@ -189,3 +193,9 @@ full suite green):
 - Lane 3 async-oracle item (fee_oracle sync httpx in the event loop) —
   wide blast radius (every fee call), own session.
 - Lane 5 canary check (derived privkey vs stored claim_pubkey at startup).
+
+**Deployment status:** these fixes are on `port/electrum-4.8` @
+7e816c6+ but NOT yet shipped — the inr2 image predates them. Next
+deploy window must include this ref (build → scp → compose up, per
+AGENTS.md Deployment; coordinate with the parallel session that owns
+the box).

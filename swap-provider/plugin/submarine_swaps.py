@@ -1447,6 +1447,15 @@ class SwapManager:
         return swap
 
     def server_add_swap_invoice(self, request: dict) -> dict:
+        # SECURITY-REVIEW 2026-08-31 (#47 second half): phase 2 must be
+        # breaker-gated like the create handlers — during a datastore
+        # outage an accepted registration is in-memory-only (registered =
+        # True never persists), so a funded client falls to the
+        # grace-hold fail-open claim at locktime+grace, hours delayed.
+        # Refusing here is the clean 'try again' the breaker exists for.
+        if not self._datastore_healthy():
+            raise RequestFieldError(
+                'datastore unhealthy — retry addswapinvoice shortly')
         # AUDIT A2: electrum validates far more here — port its checks and
         # reply with clean errors instead of raw asserts. The hash check
         # specifically: an invoice whose rhash != swap hash must NEVER be

@@ -37,7 +37,7 @@ import sys
 if str(_plugin.parent) not in sys.path:
     sys.path.insert(0, str(_plugin.parent))
 
-from plugin.submarine_swaps import SwapManager, SwapData, NostrTransport  # noqa: E402
+from plugin.submarine_swaps import SwapManager, SwapData, NostrTransport, RequestFieldError  # noqa: E402
 from plugin.json_db import JsonDB  # noqa: E402
 from plugin.bitcoin_core_rpc import BitcoinCoreRPCError  # noqa: E402
 from plugin.cln_storage import CLNStorage, StorageReadWriteError  # noqa: E402
@@ -162,6 +162,19 @@ class TestBreakerNoneHole:
         sm = SwapManager.__new__(SwapManager)
         sm.db = SimpleNamespace()
         assert sm._datastore_healthy() is True
+
+    def test_addswapinvoice_is_breaker_gated(self):
+        # #47 second half: phase 2 must refuse during a datastore outage
+        # like the create handlers do — an accepted registration would be
+        # in-memory-only (registered=True never persists), stranding a
+        # funded client on the grace-hold fail-open claim
+        sm = _sm_with_storage(_storage(writer_ok=False))
+        with pytest.raises(StorageReadWriteError):
+            sm.db.storage.write('x')
+        sm.swaps = {}
+        with pytest.raises(RequestFieldError) as exc:
+            sm.server_add_swap_invoice({'invoice': 'lnbc', 'refundPublicKey': ''})
+        assert 'datastore unhealthy' in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
