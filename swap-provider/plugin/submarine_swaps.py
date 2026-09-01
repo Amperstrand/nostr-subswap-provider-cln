@@ -1425,6 +1425,7 @@ class SwapManager:
                 "claim-path pubkey check (fail-closed) and ride to their "
                 "refund paths.")
             return False
+        self.logger.debug("hsm canary: ok (matches the bound digest)")
         return True
 
     def _get_swap_privkey(self, swap: SwapData) -> bytes:
