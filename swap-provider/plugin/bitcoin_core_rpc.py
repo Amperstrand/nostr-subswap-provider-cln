@@ -50,6 +50,11 @@ class BitcoinCoreRPC:
         # set_lookup_mode before _init when running under the plugin
         self._chain_lookup_mode = "txindex"
         self._esplora_urls = []
+        # received-tx outpoint parse cache: {address: {txid: [(vout, value)]}}
+        # — tx outputs are immutable, so entries never invalidate; exists so
+        # dust-decoy storms cannot turn reconciliation into an RPC amplifier
+        # (each pass would otherwise re-fetch every decoy tx)
+        self._addr_outpoint_cache: dict = {}
 
     def note_rpc_failure(self, exc: Exception) -> bool:
         """Count a consecutive Core-RPC failure; rebuild the client
@@ -389,8 +394,75 @@ class BitcoinCoreRPC:
         part_txin.spent_txid = utxo.get('spent_txid', None)
         return part_txin
 
+    async def _received_outpoints(self, received_txids: List[str], locking_addr: str) -> List[dict]:
+        """[(txid, vout, value)] of every output paying locking_addr among
+        received_txids, parsed once and cached (tx outputs are immutable)."""
+        cache = self._addr_outpoint_cache.setdefault(locking_addr, {})
+        for txid in received_txids:
+            if txid in cache:
+                continue
+            tx = await self.get_transaction(txid)
+            if tx is None:
+                cache[txid] = []  # unresolvable now; re-parse skipped until restart
+                continue
+            cache[txid] = [(i, o.value) for i, o in enumerate(tx.outputs())
+                           if o.address == locking_addr and o.value > 0]
+        out = []
+        for txid in received_txids:
+            for vout, value in cache.get(txid, []):
+                out.append({"txid": txid, "vout": vout, "value": value})
+        return out
+
+    async def _fetch_spent_utxos_by_prevout(self, received_txids: List[str],
+                                            spent_amount_sat: int,
+                                            locking_addr: str) -> Optional[List[PartialTxInput]]:
+        """Outpoint-indexed reconciliation via gettxspendingprevout (Core >= 24).
+
+        Immune to the dust-decoy pagination-exhaustion class (security
+        review 2026-08-31: >200 decoy receives to the lockup address
+        pushed the claim 'send' past the legacy walk's 200-page
+        listtransactions bound, permanently blocking preimage extraction
+        — a funds-loss shape for d1 swaps). The batched call costs ONE
+        RPC regardless of decoy count.
+
+        Returns None when the RPC is unavailable (older Core / disabled)
+        so the caller falls back to the legacy walk; returns whatever
+        spends it found otherwise (the caller's amount check stays
+        authoritative)."""
+        outpoints = await self._received_outpoints(received_txids, locking_addr)
+        if not outpoints:
+            return []
+        try:
+            spenders = await self.iface.acall(method="gettxspendingprevout",
+                                              params=[outpoints], timeout=HttpxTimeout(10))
+        except Exception as e:
+            self._logger.debug(f"ChainMonitor: prevout-indexed reconciliation "
+                               f"unavailable ({e}); falling back to the "
+                               f"listtransactions walk")
+            return None
+        spent_utxos = []
+        for op, sp in zip(outpoints, spenders):
+            spender_txid = sp.get("txid")
+            if spender_txid is None:
+                continue
+            utxo = {
+                "txid": op["txid"],
+                "vout": op["vout"],
+                "address": locking_addr,
+                "amount": op["value"] / COIN,
+                "spent_height": sp.get("height") or 0,
+                "spent_txid": spender_txid,
+            }
+            spent_utxos.append(await self._utxo_to_partial_txin(utxo))
+        return spent_utxos
+
     async def _fetch_spent_utxos(self, received_txids: List[str], spent_amount_sat: int,
                                  locking_addr: str) -> List[PartialTxInput]:
+        by_prevout = await self._fetch_spent_utxos_by_prevout(
+            received_txids, spent_amount_sat, locking_addr)
+        if by_prevout is not None:
+            return by_prevout
+
         skip_txs = 0  # amount of transactions to fetch
         spent_utxos = []
 
