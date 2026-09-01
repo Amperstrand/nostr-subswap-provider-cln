@@ -435,12 +435,29 @@ class JsonDB:  # (Logger):
     def _convert_dict(self, path, key, v):
         if key in registered_dicts:
             constructor, _type = registered_dicts[key]
-            if _type == dict:
-                v = dict((k, constructor(**x)) for k, x in v.items())
-            elif _type == tuple:
-                v = dict((k, constructor(*x)) for k, x in v.items())
-            else:
-                v = dict((k, constructor(x)) for k, x in v.items())
+            converted = {}
+            for entry_key, entry in v.items():
+                try:
+                    if _type == dict:
+                        converted[entry_key] = constructor(**entry)
+                    elif _type == tuple:
+                        converted[entry_key] = constructor(*entry)
+                    else:
+                        converted[entry_key] = constructor(entry)
+                except Exception as e:
+                    # R8-analog load guard (SECURITY-REVIEW 2026-08-31):
+                    # one malformed entry used to raise straight through
+                    # StoredDict.__init__ -> JsonDB.__init__ and kept the
+                    # plugin from starting at all, persistently, until
+                    # manual datastore surgery (the swap-record variant of
+                    # the hold-invoice walrus bug, 8697957/be5a97e). Skip +
+                    # purge: the damaged entry is dropped loudly and the
+                    # next write persists the section without it.
+                    self.logger.error(
+                        f"JsonDB: dropping corrupt {key}[{entry_key!r}] entry "
+                        f"(cannot construct "
+                        f"{getattr(constructor, '__name__', constructor)}): {e!r}")
+            v = converted
         if key in registered_dict_keys:
             convert_key = registered_dict_keys[key]
         elif path and path[-1] in registered_parent_keys:

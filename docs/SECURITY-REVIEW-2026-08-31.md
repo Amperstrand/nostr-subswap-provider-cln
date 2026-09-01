@@ -142,3 +142,50 @@ breaker None-hole at :1311-1315, catch-mismatch at :1056-1058,
 5. (was: d1 refund key HSM coverage — CLOSED by 4f63405/#43 pre-audit;
    the derived-vs-claim_pubkey canary check from hunter-1 F2 remains
    open and pairs naturally with it.)
+
+## Fix lane status (2026-09-01, laptop session)
+
+**LANDED** (all with regression pins in
+`tests/test_security_review_lane_20260831.py` + updated option-E matrix;
+full suite green):
+
+- `_remember_event` containment (lane 2) — the DM-id persist write is
+  inside its own guard: a datastore failure logs ERROR and degrades to
+  same-session-only quarantine instead of killing the consumer and
+  re-crashing per relay replay.
+- Breaker None-hole (lane 2) — **worse than reported**: `_datastore_healthy`
+  read `last_write_monotonic` off the JsonDB, but the attribute lives on
+  `db.storage` (CLNStorage) — the breaker was dead code entirely, healthy
+  forever even AFTER successful writes. Fixed to read storage; None is
+  now disambiguated by `CLNStorage.failed_writes` (incremented on every
+  failed write/append attempt): never-succeeded + any-failed = fail
+  closed; never-attempted = healthy (fresh start); a success stamps the
+  300s freshness window as before.
+- option-E 0-conf discharge (lane 2) — the funding gate now discharges
+  at >=1 confirmation only; a mempool-visible lockup keeps the gate
+  armed (its M-block deadline still bounds the window). The option-E
+  test matrix's two mempool-discharge pins were rewritten to the new
+  contract.
+- Claim-broadcast catch-mismatch (lane 3, exception-type item) —
+  catches `(TxBroadcastError, BitcoinCoreRPCError)`; error log names the
+  claim txid (never the raw tx — issue #13).
+- Per-swap `_claim_swap` reentrancy lock (lane 3, reentrancy item) —
+  the three drivers serialize per payment_hash; distinct swaps stay
+  parallel.
+- R8-analog load guard (lane 4) — `json_db._convert_dict` drops a
+  malformed registered-dict entry loudly (ERROR + key named) instead of
+  raising through `JsonDB.__init__` and keeping the plugin from
+  starting; the next write persists the section without the corrupt
+  entry. Generalizes the hold-invoice R8 contract to every registered
+  dict.
+
+**STILL OPEN:**
+
+- Lane 1 listtransactions exhaustion — per the review's own gating this
+  needs the regtest lab PoC before the fix; design direction: per-address
+  scoping (import the lockup descriptor WITH a label, walk
+  `listtransactions <label>` instead of the global `*` stream, keep the
+  global walk as fallback for pre-label imports).
+- Lane 3 async-oracle item (fee_oracle sync httpx in the event loop) —
+  wide blast radius (every fee call), own session.
+- Lane 5 canary check (derived privkey vs stored claim_pubkey at startup).

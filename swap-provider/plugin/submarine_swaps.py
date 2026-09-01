@@ -87,6 +87,7 @@ from .crypto import ripemd, sha256
 from .health import tracker
 from .attribution import attribution_tracker, classify_requester
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
+from .bitcoin_core_rpc import BitcoinCoreRPCError
 from .invoices import Invoice, InvoiceState
 from .json_db import StoredObject, stored_in, JsonDB
 from . import constants
@@ -244,6 +245,12 @@ class SwapManager:
         # silently deleted at startup — it is MOVED here (reason + full
         # record persisted, ERROR-logged) and left unprocessed
         self.quarantined_swaps = self.db.get_dict('quarantined_swaps')
+        # SECURITY-REVIEW 2026-08-31 (hunter-3): _claim_swap has three
+        # concurrent drivers (ChainMonitor timer/block, funding-gate watch
+        # pass, main_loop's initial trigger) — a per-swap lock serializes
+        # them so a second pass re-reads chain state after the first
+        # instead of double build+broadcast on stale outputs.
+        self._claim_swap_locks = {}  # type: Dict[str, asyncio.Lock]
         self._swaps_by_funding_outpoint = {}  # type: Dict[TxOutpoint, SwapData]
         self._swaps_by_lockup_address = {}  # type: Dict[str, SwapData]
         for payment_hash_hex in list(self.swaps.keys()):
@@ -784,9 +791,10 @@ class SwapManager:
                 continue
             self._evaluate_funding_gate(swap, current_height)
             if key in self.invoices_awaiting_funding:
-                # still parked: run the standard claim path so a mempool
-                # lockup discharges the gate immediately (the payment
-                # queues without waiting for a confirmation; the claim
+                # still parked: run the standard claim path so an observed
+                # lockup advances the swap (payment queueing waits for
+                # >=1 confirmation — SECURITY-REVIEW 2026-08-31 supersedes
+                # the old mempool-discharge, an RBF-jam vector; the claim
                 # broadcast itself stays >=1-conf gated, R1)
                 await self._claim_swap(swap)
 
@@ -828,6 +836,19 @@ class SwapManager:
 
     @log_exceptions
     async def _claim_swap(self, swap: SwapData) -> None:
+        """Per-swap serialized entry (SECURITY-REVIEW 2026-08-31,
+        hunter-3): the three drivers (ChainMonitor timer/block,
+        funding-gate watch pass, main_loop initial trigger) can overlap —
+        concurrent passes double build+broadcast on stale outputs and the
+        second tx mempool-conflicts. The lock makes latecomers re-read
+        chain state after the winner instead of racing it."""
+        key = swap.payment_hash.hex()
+        locks = self.__dict__.setdefault('_claim_swap_locks', {})
+        lock = locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            return await self._claim_swap_locked(swap)
+
+    async def _claim_swap_locked(self, swap: SwapData) -> None:
         assert self.lnwatcher
         if not await self.lnwatcher.is_up_to_date():
             self.logger.warning('_claim_swap caled but core node not up to date, skipping')
@@ -970,6 +991,20 @@ class SwapManager:
                 # client's invoice (issue #12)
                 key = swap.payment_hash.hex()
                 if key in self.invoices_awaiting_funding:
+                    if funding_height.conf <= 0:
+                        # SECURITY-REVIEW 2026-08-31 (hunter-2, option-E
+                        # 0-conf discharge): a mempool-visible lockup used
+                        # to discharge the gate and start payment queueing
+                        # here — the client could RBF the funding away
+                        # while our HTLCs park (a free RBF-fee jam per
+                        # swap, #12 residual; the gate cannot re-arm once
+                        # discarded). Discharge at >=1 confirmation only:
+                        # the gate stays armed and its M-block deadline
+                        # still bounds the parking window.
+                        self.logger.info(
+                            f'lockup for swap {key} seen but unconfirmed — '
+                            f'funding gate stays armed until 1 confirmation')
+                        return
                     self.invoices_awaiting_funding.discard(key)
                     self._funding_gate_deadline.pop(key, None)
                     self.logger.info(f'lockup funded for swap {key}, queueing invoice payment')
@@ -1054,8 +1089,16 @@ class SwapManager:
                     self.logger.debug(f'spending claim tx {tx.txid()}')
                     txid = await self.lnwatcher.broadcast_raw_transaction(Transaction.serialize(tx))
                     self.logger.info(f'broadcasted claim tx {txid}')
-                except TxBroadcastError:
-                    self.logger.error(f'error broadcasting claim tx {txin.spent_txid}. Report bug on github.')
+                except (TxBroadcastError, BitcoinCoreRPCError) as _e:
+                    # SECURITY-REVIEW 2026-08-31 (hunter-3, catch-mismatch):
+                    # broadcast_raw_transaction raises BitcoinCoreRPCError
+                    # (bitcoin_core_rpc sendrawtransaction path), NOT
+                    # electrum's TxBroadcastError — the R3 designated error
+                    # path used to be dead code and failures escaped as
+                    # generic callback errors. Both are handled the same
+                    # way: log loud (txid only, no raw tx — witness carries
+                    # the preimage), the block/timer drivers retry.
+                    self.logger.error(f'error broadcasting claim tx {tx.txid()}: {_e!r}')
 
     def get_claim_fee(self):
         return self.get_fee(size_vb=CLAIM_FEE_SIZE)
@@ -1304,13 +1347,29 @@ class SwapManager:
 
     def _datastore_healthy(self) -> bool:
         """#21 contract 4: True if the last successful datastore write was
-        within the freshness window (or if no write has been attempted yet,
-        meaning the plugin just started). Circuit breaker for swap admission."""
+        within the freshness window. Circuit breaker for swap admission.
+
+        SECURITY-REVIEW 2026-08-31 (hunter-2, breaker None-hole): the
+        timestamp lives on self.db.storage (CLNStorage), not on the JsonDB
+        — reading it off self.db returned None forever, so the breaker
+        never tripped at all. And None itself is ambiguous: a fresh
+        process that has simply not written yet is healthy, but one whose
+        writes have all FAILED must fail closed (nothing is persisting;
+        in-memory-only registrations die at restart). failed_writes
+        disambiguates; a later success stamps last_write_monotonic and
+        the freshness window governs again."""
         if not hasattr(self, 'db') or self.db is None:
             return True  # no db configured — can't check
-        last = getattr(self.db, 'last_write_monotonic', None)
+        storage = getattr(self.db, 'storage', None)
+        last = getattr(storage, 'last_write_monotonic', None)
         if not isinstance(last, (int, float)):
-            return True  # fresh start or mock/uninitialized — treat as healthy
+            # never a successful write this session: healthy only while
+            # no write attempt has failed (mocks/uninitialized carry
+            # non-int sentinels — treat as zero, the pre-review contract)
+            failed = getattr(storage, 'failed_writes', 0)
+            if not isinstance(failed, int):
+                failed = 0
+            return failed == 0
         import time as _time
         return (_time.monotonic() - last) < 300
 
@@ -1994,7 +2053,19 @@ class NostrTransport:  # (Logger):
             if created_at < cutoff:
                 self.processed_event_ids.pop(stale_id)
         self.processed_event_ids[event.id] = event.created_at
-        self.sm.db.write()
+        try:
+            self.sm.db.write()
+        except Exception as e:
+            # SECURITY-REVIEW 2026-08-31 (hunter-2): this write sat OUTSIDE
+            # the DM containment — a datastore failure crashed the nostr
+            # consumer + taskgroup, and since the id never persisted, every
+            # relay replay re-crashed: a persistent crash-loop while DMs
+            # arrive. The in-memory quarantine above always applies, so a
+            # persistence failure degrades to same-session-only quarantine
+            # (a restart may re-execute the event) — logged loud, never fatal.
+            self.logger.error(
+                f'could not persist processed-event id {event.id[:8]}… '
+                f'(quarantine is same-session only): {e!r}')
 
     @log_exceptions
     async def handle_request(self, request):

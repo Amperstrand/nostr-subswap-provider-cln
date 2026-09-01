@@ -24,6 +24,12 @@ class CLNStorage:  # (Logger):
         # "datastore last-successful-write" heartbeat)
         self.last_generation = None
         self.last_write_monotonic = None
+        # SECURITY-REVIEW 2026-08-31 (hunter-2, breaker None-hole): a
+        # write that never succeeded leaves last_write_monotonic None —
+        # indistinguishable from "fresh start, all healthy" unless failed
+        # ATTEMPTS are counted separately. Post-restart all-writes-fail
+        # must fail CLOSED (admission gated), not stay open forever.
+        self.failed_writes = 0
         self.raw = self._fetch_db_content(key=self.read_key)
 
     def _fetch_db_content(self, *, key: str) -> str:
@@ -65,8 +71,10 @@ class CLNStorage:  # (Logger):
                            string=data,
                            mode="create-or-replace")
         except Exception as e:
+            self.failed_writes += 1
             raise StorageReadWriteError(f"Failed to write to CLN-DB: {e}")
         if "error" in res:
+            self.failed_writes += 1
             raise StorageReadWriteError(f"CLN DB returned error on write: {res}")
         self._note_write(res)
         self.init_pos = len(data)  # update initial position
@@ -89,8 +97,10 @@ class CLNStorage:  # (Logger):
                                  string=data,
                                  mode="must-append")
         except Exception as e:
+            self.failed_writes += 1
             raise StorageReadWriteError(f"Failed to append data to CLN DB: {e}")
         if "error" in res:
+            self.failed_writes += 1
             raise StorageReadWriteError(f"CLN DB returned error on append: {res}")
         self._note_write(res)
         self.pos += len(data)

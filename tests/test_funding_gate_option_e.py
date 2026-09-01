@@ -1,10 +1,12 @@
 """issue #24 option E (FUNDING-GATE-COMPAT-MEMO, operator-adopted) unit
 matrix: the #12 funding-gate parking is bounded by an M-block timer
-anchored at addswapinvoice, discharged early when the lockup becomes
-visible in MEMPOOL (pay without waiting for a confirmation; the claim
-broadcast stays >=1-conf, R1), ended at M in fail (default) or pay
-(FUNDING_GATE_ON_TIMEOUT_BEHAVIOR) mode, with a dead client invoice
-failing via EXPIRY before any M timeout (#25 ordering).
+anchored at addswapinvoice, discharged early when the lockup reaches
+>=1 CONFIRMATION (SECURITY-REVIEW 2026-08-31 superseded the original
+mempool-discharge: a mempool-visible lockup let a client RBF the funding
+away while our HTLCs park — a free RBF-fee jam per swap; the claim
+broadcast was already >=1-conf gated, R1), ended at M in fail (default)
+or pay (FUNDING_GATE_ON_TIMEOUT_BEHAVIOR) mode, with a dead client
+invoice failing via EXPIRY before any M timeout (#25 ordering).
 
 The deadlock this resolves (e2e-proof-37.txt section 4 F1): a stock
 electrum client registers a hold invoice and broadcasts its lockup only
@@ -116,15 +118,16 @@ def _manager(swap: SwapData, *, height=4900, conf=0, txins=None,
 
 class TestMempoolDischarge:
     async def test_mempool_lockup_pays_without_waiting_for_confirmation(self):
-        # Option E core: lockup visible in MEMPOOL (conf=0) -> the gate
-        # discharges and the payment is queued immediately; the claim
-        # broadcast itself remains >=1-conf gated (R1 non-regression)
+        # SECURITY-REVIEW 2026-08-31 (supersedes the old mempool
+        # discharge): a conf=0 lockup must NOT discharge the gate or
+        # queue payment — an RBF could replace the funding away while
+        # our HTLCs park. The gate stays armed; nothing is queued.
         swap = _d2_swap()
         sm = _manager(swap, height=4900, conf=0, txins=[_txin(conf=0)],
                       invoice=_expired_invoice(False))
         await sm._funding_gate_watch_pass()
-        assert swap._payment_hash not in sm.invoices_awaiting_funding
-        assert sm.invoices_to_pay[swap._payment_hash] == 0
+        assert swap._payment_hash in sm.invoices_awaiting_funding
+        assert swap._payment_hash not in sm.invoices_to_pay
         sm.lnwatcher.broadcast_raw_transaction.assert_not_called()
 
     async def test_confirmed_lockup_broadcasts_claim(self):
@@ -136,12 +139,26 @@ class TestMempoolDischarge:
         sm.lnwatcher.broadcast_raw_transaction.assert_called_once()
 
     async def test_discharge_survives_repeated_passes(self):
-        # once discharged, further passes neither re-queue nor fail
+        # a 0-conf lockup holds the gate armed across passes; the FIRST
+        # confirmed pass discharges exactly once — further passes neither
+        # re-queue nor fail
         swap = _d2_swap()
         sm = _manager(swap, height=4900, conf=0, txins=[_txin(conf=0)],
                       invoice=_expired_invoice(False))
         for _ in range(3):
             await sm._funding_gate_watch_pass()
+        assert swap._payment_hash in sm.invoices_awaiting_funding
+        assert sm.invoices_to_pay == {}
+        assert swap._payment_hash in sm.swaps
+        # the lockup confirms: gate discharges on this pass
+        sm.lnwatcher.get_addr_outputs = AsyncMock(return_value=[_txin(conf=1)])
+        sm.lnwatcher.get_tx_height = AsyncMock(
+            return_value=SimpleNamespace(conf=1))
+        await sm._funding_gate_watch_pass()
+        assert swap._payment_hash not in sm.invoices_awaiting_funding
+        assert sm.invoices_to_pay[swap._payment_hash] == 0
+        # ...and a further pass neither re-queues nor fails
+        await sm._funding_gate_watch_pass()
         assert sm.invoices_to_pay[swap._payment_hash] == 0
         assert swap._payment_hash in sm.swaps
 
