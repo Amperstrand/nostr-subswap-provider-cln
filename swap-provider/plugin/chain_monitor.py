@@ -56,6 +56,7 @@ class ChainMonitor(BitcoinCoreRPC):
         # death, and run()'s supervision makes that fatal.
         last_height = None
         last_callback = 0.0  # #37: monotonic timestamp of the last callback firing
+        degraded_passes = 0  # #44: outage length — drives the recovery WARN
         while True:
             try:
                 try:
@@ -69,6 +70,14 @@ class ChainMonitor(BitcoinCoreRPC):
                             "ChainMonitor: bitcoind RPC client rebuilt "
                             "(#60) — next pass uses a fresh pool")
                     raise
+                if degraded_passes:
+                    # #44 acceptance: a WARN on each side of the outage —
+                    # the per-pass ERRORs mark degradation, this marks the
+                    # resume so a log grep shows both edges
+                    self._logger.warning(
+                        f"ChainMonitor: bitcoind RPC recovered after "
+                        f"{degraded_passes} degraded pass(es) (#44)")
+                    degraded_passes = 0
                 # heartbeat: one beat per pass — a beat that goes stale
                 # means the loop itself is wedged (a hanging RPC without
                 # timeout), which the fatal policy cannot catch
@@ -96,6 +105,7 @@ class ChainMonitor(BitcoinCoreRPC):
                     last_callback = time.monotonic()
                 tracker.note_success("chain-monitor")
             except Exception as e:
+                degraded_passes += 1
                 self._logger.error(f"ChainMonitor: Error in monitoring loop: {e}")
                 # F12: bitcoind down = the r4 RETRY policy in action —
                 # surfaced as a degraded-driving error streak, not a death

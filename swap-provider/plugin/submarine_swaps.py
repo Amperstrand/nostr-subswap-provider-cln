@@ -850,8 +850,19 @@ class SwapManager:
 
     async def _claim_swap_locked(self, swap: SwapData) -> None:
         assert self.lnwatcher
-        if not await self.lnwatcher.is_up_to_date():
-            self.logger.warning('_claim_swap caled but core node not up to date, skipping')
+        try:
+            up_to_date = await self.lnwatcher.is_up_to_date()
+        except Exception as e:
+            # #44 (live 2026-08-31): a bitcoind restart mid-pass raised
+            # here and escaped the monitoring drivers — lightningd killed
+            # the plugin and parked HTLCs rode to CLTV. Unavailability is
+            # not-up-to-date: WARN, skip, retry on the next tick.
+            self.logger.warning(
+                f'_claim_swap: bitcoind RPC unavailable ({e}) — skipping '
+                f'pass, retrying on next tick (#44)')
+            return
+        if not up_to_date:
+            self.logger.warning('_claim_swap called but core node not up to date, skipping')
             return
         current_height = await self.wallet.get_local_height()
         remaining_time = swap.locktime - current_height

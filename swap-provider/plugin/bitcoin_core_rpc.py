@@ -157,8 +157,30 @@ class BitcoinCoreRPC:
                                           "(or set CHAIN_LOOKUP_MODE=esplora)")
         await self._create_or_load_wallet(self._wallet_name)
         await self._validate_wallet_name(self._wallet_name)
-        while not await self.is_up_to_date():
-            self._logger.info("ChainMonitor: Waiting for chain to sync")
+        # #44: bitcoind restarting mid-sync-wait is an operational blip
+        # (the #78 datadir-repair sequence), not an init failure —
+        # is_up_to_date RAISES on connection loss, and letting that
+        # escape _init killed the plugin at startup. Wait the blip out
+        # like an unsynced chain: WARN + retry, wire the #60 streak so a
+        # stale keepalive pool still gets rebuilt.
+        while True:
+            degraded = False
+            try:
+                up_to_date = await self.is_up_to_date()
+                self.note_rpc_success()
+            except Exception as e:
+                degraded = True
+                if self.note_rpc_failure(e):
+                    self._logger.warning(
+                        "ChainMonitor: bitcoind RPC client rebuilt "
+                        "(#60) — next sync-wait pass uses a fresh pool")
+                self._logger.warning(
+                    f"ChainMonitor: bitcoind RPC unavailable during sync "
+                    f"wait (#44): {e} — retrying in 10s")
+            if not degraded:
+                if up_to_date:
+                    break
+                self._logger.info("ChainMonitor: Waiting for chain to sync")
             await asyncio.sleep(10)
         self._logger.debug("Bitcoin Core RPC connection: Initialized")
 
