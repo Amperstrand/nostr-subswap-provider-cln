@@ -148,6 +148,7 @@ class TestOfferCap:
     def _sm(self, balance_sat, reserve_sat):
         sm = SwapManager.__new__(SwapManager)
         sm.logger = MagicMock()
+        sm.swaps = {}  # #55: reservation ledger source (empty = none pending)
         sm.wallet = MagicMock()
         sm.wallet.balance_sat.return_value = balance_sat
         sm.wallet.min_emergency_reserve_sat.return_value = reserve_sat
@@ -186,9 +187,11 @@ class TestAcceptGateContract:
     def test_gate_is_reserve_aware(self):
         """Code contract: the createswap onchain gate must reject on
         spendable capacity (before the payer funds), never on the
-        reserve-blind balance_sat()."""
+        reserve-blind balance_sat(). #55 extension: the comparison
+        subtracts the pending-swap reservation ledger."""
         code = _code_only(PLUGIN_DIR / "submarine_swaps.py")
-        assert "self.wallet.spendable_capacity_sat() < lightning_amount_sat" in code, \
-            "accept gate must compare against reserve-aware capacity"
+        assert "_spendable - _onchain_reserved < lightning_amount_sat" in code, \
+            "accept gate must compare against reserve-aware capacity minus " \
+            "pending-swap reservations (#55 over-commit)"
         assert "self.wallet.balance_sat() < lightning_amount_sat" not in code, \
             "the reserve-blind gate accepted swaps CLN then refused at utxopsbt 313 (live 2026-08-28)"

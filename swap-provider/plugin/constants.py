@@ -54,6 +54,22 @@ FUNDING_GATE_POLL_SECONDS = 5
 # while a payment attempt is in flight (the r4 requeue-backoff contract);
 # swapprovider-health counts these as inflight_payments
 PAYMENT_INFLIGHT_LOCK = 1000000000000
+# #52 (hunter-3): a mempool-stuck claim gets RBF-bumped when its fee
+# drops >10% below the current recommendation. The bump budget caps
+# repeated escalation on an oracle flap / fee spike — past it, recovery
+# is mempool eviction (the preimage is already revealed post-broadcast,
+# so bumping only protects the onchain leg; O2 tradeoff).
+CLAIM_BUMP_MAX = 5
+# BIP-125 rule 4 floor: a replacement must pay at least the minrelay
+# feerate for its own size ON TOP of the replaced tx's fees — the 1.1x
+# underprice heuristic alone under-shoots this and the replacement is
+# rejected with insufficient-fee
+RBF_MIN_INCREMENT_SATVB = 1
+# orphan-HTLC reaper (#44 comment class): scan cadence and the grace
+# window an inbound parked HTLC must age past (no swap record, no hold
+# invoice, no payment_info) before it is reported as an orphan
+ORPHAN_SCAN_SEC = 120
+ORPHAN_GRACE_BLOCKS = 24
 MIN_FINAL_CLTV_DELTA_FOR_CLIENT = 3 * 144  # note: put in invoice, but is not enforced by receiver in lnpeer.py
 
 # the minimum cltv_expiry accepted for newly received HTLCs

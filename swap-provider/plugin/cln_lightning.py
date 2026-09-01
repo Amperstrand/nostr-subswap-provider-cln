@@ -681,6 +681,14 @@ class CLNLightning:
                 int(channel["updates"]["remote"]["fee_proportional_millionths"]),
                 int(channel["updates"]["remote"]["cltv_expiry_delta"]))]))
 
+        if not routing_hints:
+            # #53 (hunter-2, the R9 inversion): RPC-OK with zero usable
+            # channels used to fall through and EMIT a hint-less invoice
+            # — unroutable paper pushed onto the payer. Refuse; the
+            # caller turns this into a typed error reply.
+            raise RouteHintUnavailableError(
+                f"no suitable channels for route hint "
+                f"(0 of {len(available_channels)} channels usable)")
         return routing_hints
 
     def _get_payment_secret(self, payment_hash: Union[str, bytes]) -> bytes:

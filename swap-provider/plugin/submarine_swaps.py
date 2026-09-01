@@ -88,14 +88,25 @@ from .health import tracker
 from .attribution import attribution_tracker, classify_requester
 from .lnutil import hex_to_bytes, REDEEM_AFTER_DOUBLE_SPENT_DELAY, bytes_to_hex
 from .bitcoin_core_rpc import BitcoinCoreRPCError
-from .invoices import Invoice, InvoiceState
+from .invoices import Invoice, InvoiceState, DuplicateInvoiceCreationError
 from .json_db import StoredObject, stored_in, JsonDB
 from . import constants
 from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_DELTA,
                         MIN_FINAL_CLTV_DELTA_FOR_CLIENT, CLAIM_FEE_SIZE, LOCKUP_FEE_SIZE,
                         MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE,
                         PAYMENT_INFLIGHT_LOCK, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT,
-                        FUNDING_GATE_POLL_SECONDS, INVOICE_EXPIRY_SECONDS_DEFAULT)
+                        FUNDING_GATE_POLL_SECONDS, INVOICE_EXPIRY_SECONDS_DEFAULT,
+                        CLAIM_BUMP_MAX, RBF_MIN_INCREMENT_SATVB,
+                        ORPHAN_SCAN_SEC, ORPHAN_GRACE_BLOCKS)
+# #53 (and a live latent NameError): the typed CLN error classes must be
+# RUNTIME imports — they appear in `except` clauses, which evaluate the
+# name only when an exception fires, so a TYPE_CHECKING-only import made
+# the #21 error-distinction handlers raise NameError at exactly the
+# moment an RPC outage hit the probe. cln_lightning has no import-time
+# pyln dependency (its rpc access is instance-level), so this is safe in
+# the pyln-free test env too.
+from .cln_lightning import (CapacityProbeError, RouteHintUnavailableError,
+                            Bolt11InvoiceCreationError)
 # CLN-bound collaborators are import-time-free so the protocol/wire logic
 # (swap scripts, offers, fee math) stays testable without a node — the
 # cln_* classes only appear in annotations; InvoiceNotFoundError is
@@ -103,7 +114,7 @@ from .constants import (MIN_LOCKTIME_DELTA, LOCKTIME_DELTA_REFUND, MAX_LOCKTIME_
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .cln_chain import CLNChainWallet
-    from .cln_lightning import CLNLightning, CapacityProbeError
+    from .cln_lightning import CLNLightning
     from .chain_monitor import ChainMonitor
 from .plugin_config import PluginConfig
 from .cln_logger import PluginLogger
@@ -189,6 +200,16 @@ class SwapData(StoredObject):
     # wall-clock creation time (seconds) for the swapprovider-swaps age
     # column; pre-r8 records carry None -> age_sec null
     created_at = attr.ib(type=Optional[float], default=None)
+    # SECURITY-REVIEW 2026-08-31 hunter-1 (#54): persisted BEFORE the
+    # claim broadcast for crash forensics (the #22 audit F10 contract),
+    # while spending_txid — the 'already in flight' marker consumed by
+    # addswapinvoice — is stamped only on broadcast SUCCESS, so a
+    # witness-invalid retry loop no longer masks the retry state.
+    claim_intent_txid = attr.ib(type=Optional[str], default=None, kw_only=True)
+    # SECURITY-REVIEW 2026-08-31 hunter-2 (#55): terminal marker for the
+    # admission-reservation ledger — a failed swap releases its reserved
+    # capacity. Additive default so pre-#55 records load unchanged.
+    failed = attr.ib(type=bool, default=False)
 
     _funding_prevout = None  # type: Optional[TxOutpoint]  # for RBF
     _payment_hash = None
@@ -303,6 +324,15 @@ class SwapManager:
         # grace-release log line (log-once discipline); memory-only
         self._grace_hold_logged = set()
         self._grace_release_logged = set()
+        # #52 (hunter-3): RBF bumps issued per swap (anti-flap cap) —
+        # memory-only; a restart resets the budget, which is fine (the
+        # cap guards an oracle flap, not funds)
+        self._claim_bump_counts = {}  # type: Dict[str, int]
+        self._bump_capped_logged = set()
+        # reaper (#44 comment class): first-seen height per orphan-candidate
+        # payment_hash; report after ORPHAN_GRACE_BLOCKS. memory-only
+        self._orphan_first_seen = {}  # type: Dict[str, int]
+        self._orphan_reported = set()
 
     @staticmethod
     def _swap_integrity_errors(payment_hash_hex: str, swap: SwapData) -> list:
@@ -494,6 +524,7 @@ class SwapManager:
                     self.lnwatcher.trigger_callbacks(),  # trigger all callbacks once
                     self.pay_pending_ln_invoices(),
                     self.funding_gate_watch_loop(),
+                    self.orphan_htlc_watch_loop(),
                     self.run_nostr_server()
                 ]
 
@@ -619,6 +650,9 @@ class SwapManager:
         if swap is None:
             return
         self.logger.warning(f'failing swap {swap.payment_hash.hex()}: {reason}')
+        # #55: terminal marker — the admission-reservation ledger releases
+        # a failed swap's reserved capacity
+        swap.failed = True
         # R5 + live 2026-08-28 15:26Z (swap cff928cd…, clboss client): the
         # cancel branch below used to be gated on `swap.payment_hash in
         # self.lnworker._hold_invoice_callbacks` — SwapData.payment_hash is
@@ -780,6 +814,71 @@ class SwapManager:
                                   f'block-boundary triggers):\n{traceback.format_exc()}')
                 tracker.note_error('funding-gate-watcher', detail='pass failed')
 
+    async def _scan_orphan_htlcs(self) -> list:
+        """#44-comment reaper, corrected for CLN reality: dev-fail takes
+        a PEER id and fails the WHOLE channel (ElementsProject/lightning
+        peer_control.c json_dev_fail + live `help dev-fail` = "dev-fail
+        id"), so there is NO safe per-HTLC fail RPC — auto-failing an
+        orphan would nuke a healthy channel. Detection only: inbound
+        parked HTLCs (direction in, state RCVD_ADD*) that NO swap
+        record, hold invoice, or payment_info owns, aged past
+        ORPHAN_GRACE_BLOCKS, are ERROR-logged once (with cltv ETA) and
+        surfaced via the swapprovider-orphans RPC. The cltv ride is
+        accepted; bridge-side RIDING classification already turns it
+        into a WARN + ETA for soaks."""
+        htlcs = self.lnworker._rpc.listhtlcs().get('htlcs', [])
+        current_height = await self.wallet.get_local_height()
+        orphans = []
+        for h in htlcs:
+            if h.get('direction') != 'in':
+                continue
+            if not str(h.get('state', '')).startswith('RCVD_ADD'):
+                continue  # being removed / not parked-inbound
+            ph = h['payment_hash']
+            if ph in self.swaps:
+                continue
+            if self.lnworker.get_hold_invoice(bytes.fromhex(ph)) is not None:
+                continue
+            try:
+                if self.lnworker.get_payment_statuses(ph):
+                    continue
+            except Exception:
+                continue  # can't verify ownership — never report blind
+            first_seen = self._orphan_first_seen.setdefault(ph, current_height)
+            if current_height - first_seen < ORPHAN_GRACE_BLOCKS:
+                continue
+            orphans.append({
+                'payment_hash': ph,
+                'amount_msat': h.get('amount_msat'),
+                'short_channel_id': h.get('short_channel_id'),
+                'cltv_expiry': h.get('expiry'),
+                'first_seen_height': first_seen,
+                'height': current_height,
+            })
+            if ph not in self._orphan_reported:
+                self._orphan_reported.add(ph)
+                self.logger.error(
+                    f'ORPHAN inbound HTLC {ph} ({h.get("amount_msat")} msat, '
+                    f'chan {h.get("short_channel_id")}, cltv {h.get("expiry")}) '
+                    f'— no swap/hold/payment record owns it; rides to CLTV '
+                    f'(no safe per-HTLC fail exists in CLN, #44 comment)')
+        return orphans
+
+    async def orphan_htlc_watch_loop(self):
+        """Reaper cadence: scan every ORPHAN_SCAN_SEC; a failed scan
+        degrades to the next scan (logged ERROR + tracker streak, never
+        a death — same pattern as funding_gate_watch_loop)."""
+        while True:
+            await asyncio.sleep(ORPHAN_SCAN_SEC)
+            tracker.beat('orphan-reaper', detail='scan')
+            try:
+                await self._scan_orphan_htlcs()
+                tracker.note_success('orphan-reaper')
+            except Exception:
+                self.logger.error(f'orphan HTLC scan failed (degraded — next '
+                                  f'scan retries):\n{traceback.format_exc()}')
+                tracker.note_error('orphan-reaper', detail='scan failed')
+
     async def _funding_gate_watch_pass(self):
         current_height = await self.wallet.get_local_height()
         for key in list(self.invoices_awaiting_funding):
@@ -919,6 +1018,7 @@ class SwapManager:
             funding_height = await self.lnwatcher.get_tx_height(txin.prevout.txid.hex())
             spent_height = txin.spent_height
             should_bump_fee = False
+            bump_fee_floor = None  # #52: BIP-125 rule-4 fee floor for the replacement
             self.logger.debug(f"claim_swap: Swap funding output has been spent at height "
                               f"{spent_height} in tx {txin.spent_txid}")
             if spent_height is not None:
@@ -965,6 +1065,12 @@ class SwapManager:
                             recommended_fee = self.get_claim_fee()
                             if claim_tx_fee * 1.1 < recommended_fee:
                                 should_bump_fee = True
+                                # #52: the replacement must clear BIP-125
+                                # rule 4 — the 1.1x heuristic alone under-
+                                # shoots minrelay and gets rejected
+                                bump_fee_floor = max(
+                                    recommended_fee,
+                                    claim_tx_fee + RBF_MIN_INCREMENT_SATVB * CLAIM_FEE_SIZE + 1)
                                 self.logger.debug(f'claim tx fee too low {claim_tx_fee} < {recommended_fee}. we will bump the fee')
 
                 if remaining_time > 0:
@@ -997,6 +1103,41 @@ class SwapManager:
                     if key not in self.invoices_to_pay:
                         self.invoices_to_pay[key] = 0
                     return
+                if spent_height == 0:
+                    # #52 (hunter-3): our claim sits in the mempool
+                    # unconfirmed — underpriced reverse claims previously
+                    # had NO bump path (the normal branch's refund bump
+                    # was direction-gated); the only recovery was mempool
+                    # eviction. Mirror the underprice check so the retry
+                    # driver RBF-replaces a stuck claim (claim txs signal
+                    # RBF: TxInput default nsequence 0xfffffffe).
+                    key = swap.payment_hash.hex()
+                    if self._claim_bump_counts.get(key, 0) >= CLAIM_BUMP_MAX:
+                        if key not in self._bump_capped_logged:
+                            self._bump_capped_logged.add(key)
+                            self.logger.error(
+                                f'claim bump cap reached for {key} — stopping '
+                                f'escalation, recovery is mempool eviction (#52)')
+                    else:
+                        our_claim_txid = swap.spending_txid or txin.spent_txid
+                        try:
+                            stuck_tx = await self.lnwatcher.get_transaction(our_claim_txid)
+                            claim_tx_fee = stuck_tx.get_fee()
+                        except Exception as e:
+                            self.logger.warning(
+                                f'claim bump check could not fetch claim tx '
+                                f'{our_claim_txid}: {e!r}')
+                            claim_tx_fee = None
+                        if claim_tx_fee is not None:
+                            recommended_fee = self.get_claim_fee()
+                            if claim_tx_fee * 1.1 < recommended_fee:
+                                should_bump_fee = True
+                                bump_fee_floor = max(
+                                    recommended_fee,
+                                    claim_tx_fee + RBF_MIN_INCREMENT_SATVB * CLAIM_FEE_SIZE + 1)
+                                self.logger.info(
+                                    f'claim tx fee too low {claim_tx_fee} < '
+                                    f'{recommended_fee} — RBF bumping stuck claim (#52)')
                 # the lockup is funded (we only get here with a txin that
                 # paid at least onchain_amount): only now start paying the
                 # client's invoice (issue #12)
@@ -1066,15 +1207,20 @@ class SwapManager:
             if spent_height is not None and not should_bump_fee:
                 return
             try:
-                tx = self._create_and_sign_claim_tx(txin=txin, swap=swap)
+                tx = self._create_and_sign_claim_tx(txin=txin, swap=swap,
+                                                    fee_sat=bump_fee_floor)
             except BelowDustLimit:
                 self.logger.error('_claim_tx: utxo value below dust threshold')
                 return
-            swap.spending_txid = tx.txid()
+            swap.claim_intent_txid = tx.txid()
             # issue #22 (audit F10, extends #14 item 6 to this sibling
             # site): the claim intent must be on disk BEFORE the
             # broadcast — a crash after broadcast but before any later
-            # write left no persisted trace of the spend
+            # write left no persisted trace of the spend. #54 split the
+            # fields: this intent marker persists pre-broadcast for
+            # forensics, while spending_txid (the addswapinvoice
+            # 'already in flight' marker) is stamped only on broadcast
+            # success below
             self.db.write()
             if funding_height.conf > 0: # or (swap.is_reverse and self.wallet.config.LIGHTNING_ALLOW_INSTANT_SWAPS):
                 # Impl-note: HARD REQUIREMENT (swap protocol, not BOLT): only
@@ -1099,6 +1245,17 @@ class SwapManager:
                     # log it (issue #13), the txid identifies it
                     self.logger.debug(f'spending claim tx {tx.txid()}')
                     txid = await self.lnwatcher.broadcast_raw_transaction(Transaction.serialize(tx))
+                    # #54 (hunter-1): the in-flight marker is stamped ONLY
+                    # on a broadcast that landed — an invalid-witness loop
+                    # keeps retrying (spent_height stays None) while
+                    # addswapinvoice used to answer 'already in flight'
+                    # forever, masking the retry state from the client
+                    swap.spending_txid = txid
+                    if should_bump_fee:
+                        key = swap.payment_hash.hex()
+                        self._claim_bump_counts[key] = \
+                            self._claim_bump_counts.get(key, 0) + 1
+                    self.db.write()
                     self.logger.info(f'broadcasted claim tx {txid}')
                 except (TxBroadcastError, BitcoinCoreRPCError) as _e:
                     # SECURITY-REVIEW 2026-08-31 (hunter-3, catch-mismatch):
@@ -1688,7 +1845,11 @@ class SwapManager:
         # never at bare balance_sat().
         self._max_amount = min(
             int(getattr(self.config, "max_swap_amount", 10_000_000)),
-            max(20000, int(self.wallet.spendable_capacity_sat())),
+            # #55: advertise the wallet MINUS pending d1 commitments —
+            # the probe-time gate uses the same ledger, so an offer
+            # written while admissions are outstanding stays honest
+            max(20000, int(self.wallet.spendable_capacity_sat())
+                - self._reserved_d1_onchain_sat()),
             max(20000, int(self.lnworker.num_sats_can_receive())
                 + int(self.lnworker.num_sats_can_send())),
         )
@@ -1808,10 +1969,12 @@ class SwapManager:
         *,
         txin: PartialTxInput,
         swap: SwapData,
+        fee_sat: Optional[int] = None,
     ) -> PartialTransaction:
         # FIXME the mining fee should depend on swap.is_reverse.
         #       the txs are not the same size...
-        amount_sat = txin.value_sats() - self.get_fee(size_vb=CLAIM_FEE_SIZE)
+        fee = fee_sat if fee_sat is not None else self.get_fee(size_vb=CLAIM_FEE_SIZE)
+        amount_sat = txin.value_sats() - fee
         if amount_sat < dust_threshold():
             raise BelowDustLimit()
         if swap.is_reverse:  # successful reverse swap
@@ -1845,6 +2008,45 @@ class SwapManager:
                 f'{field} must be {expected_len * 2} hex chars, got {len(val) * 2}')
         return val
 
+    def _reserved_d1_onchain_sat(self) -> int:
+        """#55 (hunter-2): onchain capacity promised to admitted-but-
+        unfunded d1 swaps (ln_to_onchain — we fund the lockup once the
+        payer's HTLCs park). Serial DM handling kills the TOCTOU, but N
+        sequential admissions each saw the FULL wallet and over-committed;
+        the funding failures then pushed legitimately-funded clients to
+        locktime refunds. Released when funded (listfunds already
+        reflects the spend) or terminal (redeemed/failed)."""
+        total = 0
+        for swap in self.swaps.values():
+            if swap.is_reverse or swap.is_redeemed or swap.failed:
+                continue
+            if swap.funding_txid is not None:
+                continue
+            total += swap.onchain_amount
+        return total
+
+    def _reserved_d2_ln_send_sat(self) -> int:
+        """#55: LN send capacity promised to live d2 swaps (onchain_to_ln
+        — we pay the client's invoice after claiming). Released when the
+        payment becomes observable in channel state (statuses
+        pending/inflight/complete — CLN's spendable_msat already nets
+        in-flight HTLCs) or at terminal states. RPC-unknown keeps the
+        reservation (conservative: under-admit, never over-commit)."""
+        total = 0
+        for swap in self.swaps.values():
+            if not swap.is_reverse or swap.is_redeemed or swap.failed:
+                continue
+            try:
+                statuses = self.lnworker.get_payment_statuses(
+                    swap.payment_hash.hex())
+            except Exception:
+                statuses = ['unknown']  # RPC outage → keep reserved
+            if any(s in ('pending', 'inflight', 'complete')
+                   for s in statuses):
+                continue
+            total += swap.lightning_amount
+        return total
+
     async def server_create_normal_swap(self, request):
         # normal for client, reverse for server
         gated = self._require_swap_mode('onchain_to_ln')
@@ -1864,8 +2066,13 @@ class SwapManager:
         except CapacityProbeError as e:
             self.logger.error(f'capacity probe failed (RPC outage): {e}')
             return {'error': 'capacity probe failed — try again shortly'}
-        if _send_capacity < lightning_amount_sat:
-            self.logger.warning(f'not enough outgoing capacity: {_send_capacity} sat,'
+        # #55: subtract outstanding d2 commitments before gating — the
+        # probe alone re-admits against capacity earlier admissions
+        # already promised away
+        _send_reserved = self._reserved_d2_ln_send_sat()
+        if _send_capacity - _send_reserved < lightning_amount_sat:
+            self.logger.warning(f'not enough outgoing capacity: '
+                                f'{_send_capacity} sat ({_send_reserved} reserved),'
                                 f' rejecting swap for {lightning_amount_sat} sat')
             return {'error': 'not enough outgoing capacity'}
         swap = await self.create_reverse_swap(
@@ -1916,17 +2123,46 @@ class SwapManager:
             # funds (live 2026-08-28: the balance-blind gate accepted a
             # 44,232-sat swap, the payer parked 43,954 sat, THEN the
             # funding failed at utxopsbt 313 min-emergency-msat)
-            if self.wallet.spendable_capacity_sat() < lightning_amount_sat:
+            try:
+                _spendable = self.wallet.spendable_capacity_sat()
+            except Exception as e:
+                # #53 (hunter-2): spendable_capacity_sat's plain
+                # Exception (listfunds RPC outage in balance_sat) sat
+                # OUTSIDE any probe handler and surfaced as 'internal
+                # error serving createswap' — same #21-contract dialect
+                # as the LN probes above
+                self.logger.error(f'onchain capacity probe failed (RPC outage): {e}')
+                return {'error': 'onchain capacity probe failed — try again shortly'}
+            _onchain_reserved = self._reserved_d1_onchain_sat()
+            if _spendable - _onchain_reserved < lightning_amount_sat:
                 self.logger.warning(f'not enough onchain balance to satisfy: '
-                                    f'{self.wallet.spendable_capacity_sat()} sat spendable'
+                                    f'{_spendable} sat spendable '
+                                    f'({_onchain_reserved} reserved by pending swaps)'
                                     f', rejecting swap for {lightning_amount_sat} sat')
                 return {'error': 'not enough onchain balance'}
-            swap, invoice, prepay_invoice = await self.create_normal_swap(
-                lightning_amount_sat=lightning_amount_sat,
-                payment_hash=payment_hash,
-                their_pubkey=their_pubkey,
-                requester_npub=request.get('_requester_npub'),
-            )
+            # #53 (hunter-2): typed invoice-creation failures get their
+            # distinct reply instead of the generic 'internal error
+            # serving createswap' bucket
+            try:
+                swap, invoice, prepay_invoice = await self.create_normal_swap(
+                    lightning_amount_sat=lightning_amount_sat,
+                    payment_hash=payment_hash,
+                    their_pubkey=their_pubkey,
+                    requester_npub=request.get('_requester_npub'),
+                )
+            except RouteHintUnavailableError as e:
+                # includes the RPC-OK-zero-suitable-channels refusal
+                # (the R9 inversion: never emit an unroutable invoice)
+                self.logger.error(f'route hints unavailable: {e}')
+                return {'error': 'no routable channels for this invoice — '
+                                 'try again later'}
+            except DuplicateInvoiceCreationError as e:
+                self.logger.error(f'duplicate invoice creation: {e}')
+                return {'error': 'an invoice already exists for this payment '
+                                 'hash — swap already requested'}
+            except Bolt11InvoiceCreationError as e:
+                self.logger.error(f'invoice signing failed: {e}')
+                return {'error': 'invoice creation failed — try again shortly'}
             response = {
                 'id': payment_hash.hex(),
                 'invoice': invoice,
