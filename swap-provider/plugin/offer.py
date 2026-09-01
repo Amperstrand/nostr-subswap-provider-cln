@@ -57,7 +57,8 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
                         max_reverse_sat: int, relays_csv: str,
                         pow_nonce: int,
                         jit_channel_pct: float = 0.0,
-                        server_version: str = '') -> str:
+                        server_version: str = '',
+                        swap_modes: dict | None = None) -> str:
     """Content JSON exactly as electrum 4.8.1 publishes it (percentage_fee
     is kept as float for <=4.7.1 client compat — same reasoning upstream).
     pow_nonce is hex-encoded, matching electrum's hex(sm.config.…).
@@ -86,6 +87,15 @@ def build_offer_content(*, percentage_fee: float, mining_fee_sat: int,
         offer["server_version"] = server_version
     if jit_channel_pct and jit_channel_pct > 0:
         offer["jit_channel_pct"] = float(jit_channel_pct)
+    # SWAP_MODES: a disabled direction advertises ZERO capacity for that
+    # leg so routing never sends clients to a provider that would refuse
+    # them (the RPC gate stays the enforcement; this is de-advertisement).
+    # Fully-enabled configs leave the offer byte-identical.
+    if swap_modes is not None:
+        if not swap_modes.get("onchain_to_ln", True):
+            offer["max_forward_amount"] = 0
+        if not swap_modes.get("ln_to_onchain", True):
+            offer["max_reverse_amount"] = 0
     return json.dumps(offer)
 
 

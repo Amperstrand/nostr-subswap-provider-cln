@@ -1345,6 +1345,19 @@ class SwapManager:
             requester_npub=requester_npub)
         return swap
 
+    def _require_swap_mode(self, mode: str):
+        """SWAP_MODES gate (design: docs/issue-38-d2-prepayment-design.md).
+        Returns the typed error dict for a DISABLED mode, None when
+        enabled. Must sit FIRST in every swap handler — a disabled mode
+        costs zero side effects (no probes, no freshness reads, no
+        datastore writes). Names are canonical; the electrum-PoV flip
+        (create_normal_swap serves ln_to_onchain) is pinned by tests."""
+        modes = getattr(getattr(self, 'config', None), 'swap_modes', None)
+        if modes is not None and not modes.get(mode, True):
+            self.logger.warning(f'swap mode {mode} disabled by SWAP_MODES — refusing')
+            return {'error': f'swap mode disabled: {mode}'}
+        return None
+
     def _datastore_healthy(self) -> bool:
         """#21 contract 4: True if the last successful datastore write was
         within the freshness window. Circuit breaker for swap admission.
@@ -1493,6 +1506,12 @@ class SwapManager:
         return swap
 
     def server_add_swap_invoice(self, request: dict) -> dict:
+        # SWAP_MODES gate: a disabled direction refuses phase 2 exactly
+        # as it refused phase 1 (same typed error, zero side effects)
+        gated = self._require_swap_mode('onchain_to_ln')
+        if gated is not None:
+            raise RequestFieldError(
+                f"swap mode disabled: onchain_to_ln")
         # SECURITY-REVIEW 2026-08-31 (#47 second half): phase 2 must be
         # breaker-gated like the create handlers — during a datastore
         # outage an accepted registration is in-memory-only (registered =
@@ -1816,6 +1835,9 @@ class SwapManager:
 
     async def server_create_normal_swap(self, request):
         # normal for client, reverse for server
+        gated = self._require_swap_mode('onchain_to_ln')
+        if gated is not None:
+            return gated
         # #21 contract 4: circuit breaker — refuse new swaps while the
         # datastore is unhealthy (the swap record cannot be persisted)
         if not self._datastore_healthy():
@@ -1856,6 +1878,9 @@ class SwapManager:
         #request = await r.json()
         req_type = request['type']
         assert request['pairId'] == 'BTC/BTC'
+        gated = self._require_swap_mode('ln_to_onchain')
+        if gated is not None:
+            return gated
         # #21 contract 4: circuit breaker
         if not self._datastore_healthy():
             return {'error': 'datastore unhealthy — try again shortly'}
@@ -2029,7 +2054,8 @@ class NostrTransport:  # (Logger):
             jit_channel_pct=jit_liquidity_factor(self.sm.lnworker._rpc) * 100,
             # self-ID baked at image build (git describe); stock electrum
             # and third parties do not send this key
-            server_version=os.environ.get('SWAP_PROVIDER_VERSION', 'cln-subswap/dev'))
+            server_version=os.environ.get('SWAP_PROVIDER_VERSION', 'cln-subswap/dev'),
+            swap_modes=getattr(self.sm.config, 'swap_modes', None))
         tags = build_offer_tags(net_name=self.config.net_name)
         event_id = await aionostr._add_event(
             self.relay_manager,

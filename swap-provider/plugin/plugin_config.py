@@ -12,6 +12,39 @@ from .cln_logger import PluginLogger
 from . import constants
 from .constants import AbstractNet, BitcoinMainnet, BitcoinTestnet, BitcoinSignet, BitcoinRegtest, SWEEP_GRACE_BLOCKS_DEFAULT, FUNDING_GATE_TIMEOUT_BLOCKS_DEFAULT, INVOICE_EXPIRY_SECONDS_DEFAULT, MIN_FINAL_CLTV_DELTA_ACCEPTED
 
+# SWAP_MODES feature flags (design: docs/issue-38-d2-prepayment-design.md
+# "Feature-flag system"). Canonical names ONLY — electrum's server-side
+# naming flips the PoV (its create_normal_swap serves ln_to_onchain);
+# do not re-derive the mapping, it is pinned by tests/test_swap_modes.py.
+SWAP_MODE_NAMES = ("ln_to_onchain", "onchain_to_ln")
+
+
+def parse_swap_modes(raw):
+    """SWAP_MODES env: JSON object/array or CSV of ENABLED mode names.
+    Empty/None -> all enabled (existing behavior). Unknown names fail
+    loud at startup — an operator typo must never silently disable (or
+    fail to disable) a money path."""
+    import json as _json
+    modes = {name: True for name in SWAP_MODE_NAMES}
+    if raw is None or raw == "":
+        return modes
+    txt = raw.strip()
+    if txt.startswith("{") or txt.startswith("["):
+        parsed = _json.loads(txt)
+        if isinstance(parsed, dict):
+            enabled = {k for k, v in parsed.items() if v}
+        elif isinstance(parsed, list):
+            enabled = set(parsed)
+        else:
+            raise ValueError(f"SWAP_MODES must be a JSON object/array or CSV, got: {raw!r}")
+    else:
+        enabled = {n.strip() for n in txt.split(",") if n.strip()}
+    unknown = enabled - set(SWAP_MODE_NAMES)
+    if unknown:
+        raise ValueError(f"SWAP_MODES unknown swap mode(s): {sorted(unknown)} "
+                         f"(valid: {list(SWAP_MODE_NAMES)})")
+    return {name: (name in enabled) for name in SWAP_MODE_NAMES}
+
 
 class PluginConfig:
 
@@ -118,6 +151,7 @@ class PluginConfig:
         # `swapclient-*` RPCs drive the reverse-swap lifecycle. Default
         # remains the provider (server) mode this plugin has always been.
         config.swap_mode = os.getenv("SWAP_MODE", "server").strip().lower()
+        config.swap_modes = parse_swap_modes(os.getenv("SWAP_MODES", "").strip() or None)
 
         if cltv_str := os.getenv("MIN_FINAL_CLTV_ACCEPTED"):
             config.min_final_cltv_accepted = int(cltv_str.strip())
