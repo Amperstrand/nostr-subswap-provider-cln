@@ -48,7 +48,8 @@ class CLNSwapProvider:
         # answers lightningd's getmanifest. The handler answers honestly
         # at every stage (parts missing during init report as "starting")
         rpc_methods = [("swapprovider-health", self._swapprovider_health_rpc),
-                       ("swapprovider-swaps", self._swapprovider_swaps_rpc)]
+                       ("swapprovider-swaps", self._swapprovider_swaps_rpc),
+                       ("swapprovider-orphans", self._swapprovider_orphans_rpc)]
         if getattr(PluginConfig, "SWAP_MODE_DEFAULT", None) is None:
             # client RPCs register unconditionally (they no-op with a
             # clean error outside client mode); this keeps getmanifest
@@ -184,6 +185,20 @@ class CLNSwapProvider:
         surface: attribution NEVER gates stranger traffic."""
         from .attribution import list_recent_swaps
         return list_recent_swaps(self, limit=limit)
+
+    async def _swapprovider_orphans_rpc(self, plugin=None, **kwargs) -> dict:
+        """`lightning-cli swapprovider-orphans`: on-demand orphan-HTLC
+        scan (#44 comment class) — inbound parked HTLCs no swap/hold/
+        payment record owns, aged past the grace window. Read-only;
+        detection only (no safe per-HTLC fail exists in CLN — dev-fail
+        kills the whole channel)."""
+        if self.swap_manager is None:
+            return {'error': 'starting'}
+        try:
+            orphans = await self.swap_manager._scan_orphan_htlcs()
+            return {'orphans': orphans, 'count': len(orphans)}
+        except Exception as e:
+            return {'error': f'orphan scan failed: {e!r}'}
 
     async def _pyln_pipe_watchdog(self):
         """#23 pyln pipe late-death detection: if the dispatch thread
