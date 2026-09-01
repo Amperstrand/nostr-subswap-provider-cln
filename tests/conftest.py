@@ -12,3 +12,15 @@ if (_swap_provider / "plugin" / "__init__.py").exists():
     # not executed as a package init; just bind the search path:
     _shim.__path__ = [str(_swap_provider)]
     sys.modules.setdefault("plugin_src", _shim)
+
+# python-bitcoinrpc is a runtime dependency (the plugin's bitcoind
+# transport); individual tests stubbed it ad hoc — since
+# submarine_swaps imports BitcoinCoreRPCError for its claim-broadcast
+# catch (security review 2026-09-01 C1), stub it once for every
+# importer instead of per-file.
+import types as _types  # noqa: E402
+if "bitcoinrpc" not in sys.modules:
+    _btc = _types.ModuleType("bitcoinrpc")
+    _btc.BitcoinRPC = object
+    _btc.RPCError = RuntimeError
+    sys.modules["bitcoinrpc"] = _btc

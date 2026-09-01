@@ -1385,13 +1385,59 @@ class SwapManager:
         """Inject the HSM derivation function (wraps plugin.derive_secret)."""
         self._hsm_deriver = deriver
 
+    def verify_hsm_canary(self) -> bool:
+        """Early-warning canary (security review 2026-08-31 C4): bind the
+        hsm_secret to a stored digest at first use so a CHANGE (node
+        rebuild, hsmtool reseed, future label-scheme drift) is a loud
+        startup alarm instead of per-swap claim failures discovered at
+        broadcast time. First run stores the digest; mismatch logs
+        BROKEN. Fail-open by design: the per-swap claim-path pubkey
+        check is the funds guard; this is the operator alarm."""
+        try:
+            canary = sha256(self._derive_secret("swap-canary")).hex()
+        except Exception as e:
+            self.logger.warning(f"hsm canary: derivation unavailable: {e}")
+            return False
+        stored = self.db.get('hsm_canary_sha')
+        if stored is None:
+            self.db.put('hsm_canary_sha', canary)
+            self.logger.info("hsm canary: bound (first run)")
+            return True
+        if stored != canary:
+            self.logger.error(
+                "HSM CANARY MISMATCH: hsm_secret changed since the swaps "
+                "below were created — every HSM-derived claim key and "
+                "preimage for pre-change swaps is UNDERIVABLE. New swaps "
+                "are fine; pre-change in-flight swaps will fail their "
+                "claim-path pubkey check (fail-closed) and ride to their "
+                "refund paths.")
+            return False
+        return True
+
     def _get_swap_privkey(self, swap: SwapData) -> bytes:
-        """Return the claim private key: stored (old format) or HSM-derived (new format)."""
+        """Return the claim private key: stored (old format) or HSM-derived (new format).
+
+        For derived keys the result is CHECKED against the stored
+        claim_pubkey (the key the redeem script — and the client's
+        lockup — was actually built with). A hsm_secret change (node
+        rebuild, hsmtool) or a derivation-label drift would otherwise
+        sign with the wrong key and surface as an invalid-witness
+        broadcast loop misattributed to a bug (security review
+        2026-08-31 C4); failing loud and closed here turns it into a
+        visible, retryable error with no broadcast."""
         if swap.privkey:
             return hex_to_bytes(swap.privkey)
         if swap.claim_pubkey is None:
             raise RuntimeError(f"swap {swap.payment_hash.hex()[:8]} has no privkey and no claim_pubkey")
-        return self._derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
+        key = self._derive_secret(f"swap-claim-{swap.payment_hash.hex()}")
+        derived_pub = ECPrivkey(key).get_public_key_bytes(compressed=True).hex()
+        if derived_pub != swap.claim_pubkey:
+            raise RuntimeError(
+                f"HSM derivation mismatch on swap {swap.payment_hash.hex()[:8]}: "
+                f"derived pubkey {derived_pub[:16]}… != script's claim_pubkey "
+                f"{swap.claim_pubkey[:16]}… — hsm_secret changed or the "
+                f"derivation scheme drifted; claim refused (fail-closed)")
+        return key
 
     def _get_swap_preimage(self, swap: SwapData) -> Optional[bytes]:
         """Return the preimage: stored (old format) or HSM-derived (new format)."""

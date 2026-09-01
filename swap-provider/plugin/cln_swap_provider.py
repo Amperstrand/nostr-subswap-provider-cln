@@ -103,6 +103,9 @@ class CLNSwapProvider:
         # #36 HSM-split: inject the HSM derivation function so the
         # SwapManager can derive claim keys and preimages from CLN's HSM
         self.swap_manager.set_hsm_deriver(self.plugin_handler.derive_secret)
+        # C4 early warning: bind hsm_secret at startup (loud alarm on
+        # change; the per-swap claim-path pubkey check is the guard)
+        self.swap_manager.verify_hsm_canary()
 
         # client mode (design 12): a client of electrum-protocol swap
         # servers -- discovery, gated reverse swaps, onchain claims.

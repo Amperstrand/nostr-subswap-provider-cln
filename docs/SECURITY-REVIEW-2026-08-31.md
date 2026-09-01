@@ -183,16 +183,30 @@ full suite green):
   entry. Generalizes the hold-invoice R8 contract to every registered
   dict.
 
-**STILL OPEN:**
+**STILL OPEN:** none of the original five — closed 2026-09-01 (PM):
 
-- Lane 1 listtransactions exhaustion — per the review's own gating this
-  needs the regtest lab PoC before the fix; design direction: per-address
-  scoping (import the lockup descriptor WITH a label, walk
-  `listtransactions <label>` instead of the global `*` stream, keep the
-  global walk as fallback for pre-label imports).
-- Lane 3 async-oracle item (fee_oracle sync httpx in the event loop) —
-  wide blast radius (every fee call), own session.
-- Lane 5 canary check (derived privkey vs stored claim_pubkey at startup).
+- Lane 1 listtransactions exhaustion — CLOSED: outpoint-indexed
+  reconciliation via batched `gettxspendingprevout` (Core ≥24; one RPC
+  regardless of decoy count) with the legacy walk kept verbatim as
+  fallback; received-tx outpoints parsed once into an immutable cache
+  so decoys cannot re-amplify. The unit PoC (250-decoy RED:
+  UtxosNotFoundError "Found 0 out of 20340") substitutes for the lab
+  repro the review gated on — the mechanism is fully pinned at the
+  unit boundary; a live-fire regtest repro can still be run at the
+  next deploy-window validation for belt-and-braces. The per-label
+  scoping direction above is superseded (decoys pay the SAME address,
+  so address/label scoping alone never defeated the attack).
+- Lane 3 async-oracle — CLOSED: on-loop calls serve
+  stale-while-revalidate (immediate stale hit past TTL, single
+  background AsyncClient refresh with 10s respawn backoff, cold cache
+  returns None into the caller's O4 fail-open); off-loop blocking
+  fetch unchanged. No call-site changes (blast radius zero).
+- Lane 5 canary + binding — CLOSED: derived claim keys are checked
+  against the stored claim_pubkey AT SIGNING TIME (fail-closed — the
+  funds guard; hsm drift = visible retryable error, never an
+  invalid-witness broadcast), plus the startup canary
+  (sha256(makesecret('swap-canary')) bound in the jsondb; mismatch =
+  loud BROKEN alarm, fail-open by design).
 
 **Deployment status:** these fixes are on `port/electrum-4.8` @
 7e816c6+ but NOT yet shipped — the inr2 image predates them. Next

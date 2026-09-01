@@ -11,6 +11,7 @@ Priority in get_chain_fee: CLN estimate > oracle > static fallback.
 The oracle is fail-open: any error, timeout, or out-of-range value falls
 back — it must never block a claim (R3: don't sit on confirmed lockups).
 """
+import asyncio
 import time
 from typing import Optional, Type
 
@@ -23,8 +24,12 @@ from .constants import AbstractNet
 _MIN_SAT_VB = 1
 _MAX_SAT_VB = 300
 _CACHE_TTL_SEC = 300
+# on-loop refresh respawn backoff (a dead endpoint would otherwise get
+# one new task per fee call)
+_REFRESH_BACKOFF_SEC = 10.0
 
 _cache: dict = {}  # url -> (fetched_at_monotonic, sat_vb)
+_last_refresh_attempt: dict = {}
 
 
 def default_oracle_url(net: Type[AbstractNet]) -> Optional[str]:
@@ -38,14 +43,7 @@ def default_oracle_url(net: Type[AbstractNet]) -> Optional[str]:
     return None  # regtest/testnet4: no public oracle, CLN/fallback only
 
 
-def fetch_fee_sat_vb(base_url: str, *, timeout: float = 5.0) -> Optional[float]:
-    """halfHourFee from a mempool.space-compatible API, cached 5 min.
-
-    Returns None on ANY failure — callers fall back, never block."""
-    now = time.monotonic()
-    hit = _cache.get(base_url)
-    if hit is not None and now - hit[0] < _CACHE_TTL_SEC:
-        return hit[1]
+def _fetch_uncached(base_url: str, timeout: float) -> Optional[float]:
     try:
         resp = httpx.get(f"{base_url.rstrip('/')}/v1/fees/recommended",
                          timeout=timeout)
@@ -55,7 +53,56 @@ def fetch_fee_sat_vb(base_url: str, *, timeout: float = 5.0) -> Optional[float]:
         return None
     if not (_MIN_SAT_VB <= sat_vb <= _MAX_SAT_VB):
         return None
-    _cache[base_url] = (now, sat_vb)
+    return sat_vb
+
+
+async def _refresh_cache(base_url: str, timeout: float) -> None:
+    """Async fetch (httpx.AsyncClient — never blocks the event loop)."""
+    sat_vb = None
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{base_url.rstrip('/')}/v1/fees/recommended")
+            resp.raise_for_status()
+            sat_vb = float(resp.json()["halfHourFee"])
+    except Exception:
+        sat_vb = None
+    if sat_vb is not None and _MIN_SAT_VB <= sat_vb <= _MAX_SAT_VB:
+        _cache[base_url] = (time.monotonic(), sat_vb)
+
+
+def fetch_fee_sat_vb(base_url: str, *, timeout: float = 5.0) -> Optional[float]:
+    """halfHourFee from a mempool.space-compatible API, cached 5 min.
+
+    Returns None on ANY failure — callers fall back, never block.
+
+    C3 (security review 2026-08-31): when invoked ON the event loop
+    (claims, prepay pricing, offers), a direct sync httpx.get stalled
+    the WHOLE plugin for up to `timeout` per cache miss. On-loop calls
+    now serve stale-while-revalidate: the cache hit returns
+    immediately (even past TTL), a single background task refreshes,
+    and a cold cache returns None this once (the caller's fail-open
+    path — CLN estimate or fallback — prices the fee; correctness is
+    unchanged per O4). Off-loop callers keep the blocking fetch."""
+    now = time.monotonic()
+    hit = _cache.get(base_url)
+    if hit is not None and now - hit[0] < _CACHE_TTL_SEC:
+        return hit[1]
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        last_attempt = _last_refresh_attempt.get(base_url, 0.0)
+        if now - last_attempt >= _REFRESH_BACKOFF_SEC:
+            _last_refresh_attempt[base_url] = now
+            loop.create_task(_refresh_cache(base_url, timeout))
+        if hit is not None:
+            return hit[1]  # stale but immediate; refresh in flight
+        return None  # cold: caller's fail-open prices this round
+    sat_vb = _fetch_uncached(base_url, timeout)
+    if sat_vb is not None:
+        _cache[base_url] = (now, sat_vb)
     return sat_vb
 
 

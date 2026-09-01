@@ -24,6 +24,7 @@ _stub.RPCError = RuntimeError
 sys.modules.setdefault("bitcoinrpc", _stub)
 
 from plugin.submarine_swaps import SwapData, SwapManager
+from electrum_ecc import ECPrivkey
 
 
 def _hsm_deriver(label: str) -> bytes:
@@ -89,10 +90,16 @@ class TestSwapDataFields:
 
 class TestHsmDerivation:
     def test_get_swap_privkey_derives_from_hsm(self):
-        """New-format swap: _get_swap_privkey calls the HSM deriver."""
+        """New-format swap: _get_swap_privkey calls the HSM deriver AND
+        the derived key must match the script's claim_pubkey (the C4
+        binding — a fixture carrying an inconsistent pubkey is now
+        refused, so pin the consistent one)."""
         sm = _sm()
         payment_hash = sha256(b"test").hexdigest()
-        s = _swap(preimage_seed="aa" * 16, claim_pubkey="03abc")
+        consistent_pub = ECPrivkey(
+            _hsm_deriver(f"swap-claim-{payment_hash}")).get_public_key_bytes(
+                compressed=True).hex()
+        s = _swap(preimage_seed="aa" * 16, claim_pubkey=consistent_pub)
         s._payment_hash = payment_hash
         key = sm._get_swap_privkey(s)
         assert len(key) == 32
