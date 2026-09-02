@@ -220,3 +220,47 @@ async def test_received_tx_outpoints_are_cached_across_passes():
     await rpc.get_addr_outputs(ADDR)
     after = sum(1 for m, _ in rpc.iface.calls if m == "getrawtransaction")
     assert after == before, "second pass must not re-fetch received txs"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_txid_is_not_cached_and_retries():
+    """Re-review 2026-09-01 A1: a get_transaction None (esplora 404 for a
+    wallet-known tx) must NOT poison the outpoint cache — the next pass
+    retries it. (The old cache[txid] = [] permanently blinded the
+    outpoint; once spent, UtxosNotFoundError every pass = the exhaustion
+    class resurrected.)"""
+    rpc = _make_rpc(decoys=0, support_prevout=True)
+    state = {"fail_get": True}
+
+    async def acall(method, params=None, timeout=None):
+        if method == "listreceivedbyaddress":
+            return [{"amount": 20340 / 1e8, "txids": [LOCKUP_TXID]}]
+        if method == "listunspent":
+            return []
+        if method == "gettxspendingprevout":
+            # once the funding resolves, the claim is visible to prevout
+            return ([{"txid": CLAIM_TXID, "vin": 0, "height": 320100}]
+                    if not state["fail_get"] else [{"txid": None}])
+        raise AssertionError(method)
+
+    async def get_tx(txid_hex):
+        if txid_hex == LOCKUP_TXID and state["fail_get"]:
+            return None  # esplora "unknown" for a tx the wallet knows
+        if txid_hex == LOCKUP_TXID:
+            return _raw_lockup_tx()
+        if txid_hex == CLAIM_TXID:
+            return _raw_claim_tx()
+        return FakeTx([FakeOutput(ADDR, 330)])
+
+    rpc.iface.acall = acall
+    rpc.get_transaction = get_tx
+    # first pass: the funding is spent-but-unresolvable -> fail LOUD
+    # (retryable next pass) — and must not poison the cache
+    with pytest.raises(UtxosNotFoundError):
+        await rpc.get_addr_outputs(ADDR)
+    assert LOCKUP_TXID not in rpc._addr_outpoint_cache[ADDR], \
+        "negative result must never be cached"
+    state["fail_get"] = False
+    # next pass resolves it — the retry path the fix guarantees
+    outs = await rpc.get_addr_outputs(ADDR)
+    assert LOCKUP_TXID in rpc._addr_outpoint_cache[ADDR]

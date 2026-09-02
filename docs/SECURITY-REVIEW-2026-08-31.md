@@ -213,3 +213,31 @@ full suite green):
 deploy window must include this ref (build → scp → compose up, per
 AGENTS.md Deployment; coordinate with the parallel session that owns
 the box).
+
+## Re-review (2026-09-01 night, post-fix adversarial pass) — 3 findings, all fixed same-night
+
+- **[HIGH, FIXED] negative-result cache poisoning (A1):** the outpoint
+  cache stored `[]` for a get_transaction None — in esplora mode that is
+  routinely a lag/reindex artifact for a wallet-known tx; the blind spot
+  was permanent, and once those outputs were spent the reconciliation
+  raised UtxosNotFoundError every pass = the exhaustion class resurrected
+  via side door. Fix: never cache negatives; unresolvable txids retry
+  next pass (fail-loud meanwhile). Test pins no-poison + retry.
+- **[MEDIUM, FIXED] silent legacy fallback (A3):** a PERMANENTLY missing
+  gettxspendingprevout (Core <24) fell back to the exhaustible walk with
+  debug-only logging. Fix: warn-once (method-not-found detected,
+  transient stays quiet).
+- **[MEDIUM, FIXED] stale-serve-forever oracle (B1):** a dead endpoint
+  pinned the last feerate indefinitely with zero signal while
+  cln_chain's INFO line made stale look alive. Fix: once-per-url
+  WARNING when serving >1h-stale (alarm wired via the wallet logger).
+- Noted, unfixed (LOW): `_claim_swap_locks` dict grows unbounded (one
+  lock per swap ever claimed); option-E deadline-boundary race widened
+  by the ≥1-conf hold (a lockup confirming exactly at the M-deadline
+  block can be failed by the gate — liveness only, client refunds);
+  `zip` length assert absent (fail-loud downstream); fire-and-forget
+  refresh task ref (theoretical GC hazard, self-healing via respawn).
+- Probed-and-sound: breaker composes with event-dedup containment
+  (write-before-check self-heals); re-executed DMs after failed persist
+  degrade to R6/clean-error; positive cache entries reorg-proof;
+  cross-address isolation holds.

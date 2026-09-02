@@ -240,6 +240,10 @@ class CLNChainWallet:
     def get_chain_fee(self, *, size_vbyte: int) -> int:
         """Uses CLN lightning-feerates to get required fee for given size. Fees are very conservative due to bitcoin core
         fee estimation algorithm."""
+        # wire the oracle's stale alarm once (re-review 2026-09-01 B1)
+        from . import fee_oracle as _fee_oracle
+        if _fee_oracle.stale_alarm is None:
+            _fee_oracle.stale_alarm = self.logger.warning
         speed_target_blocks = self.config.confirmation_speed_target_blocks
         try:
             feerates = self.rpc.feerates("perkb")

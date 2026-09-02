@@ -418,14 +418,22 @@ class BitcoinCoreRPC:
 
     async def _received_outpoints(self, received_txids: List[str], locking_addr: str) -> List[dict]:
         """[(txid, vout, value)] of every output paying locking_addr among
-        received_txids, parsed once and cached (tx outputs are immutable)."""
+        received_txids, parsed once and cached (tx outputs are immutable).
+
+        Negative results are NEVER cached (re-review 2026-09-01 A1): a
+        get_transaction None in esplora mode is the backend's 404 —
+        routinely a lag/reindex artifact for a tx the wallet knows — and
+        caching it empty permanently blinded that outpoint, resurrecting
+        the exact exhaustion class this module fixed once its outputs
+        were spent. Unresolvable txids are retried next pass instead."""
         cache = self._addr_outpoint_cache.setdefault(locking_addr, {})
+        missing = False
         for txid in received_txids:
             if txid in cache:
                 continue
             tx = await self.get_transaction(txid)
             if tx is None:
-                cache[txid] = []  # unresolvable now; re-parse skipped until restart
+                missing = True
                 continue
             cache[txid] = [(i, o.value) for i, o in enumerate(tx.outputs())
                            if o.address == locking_addr and o.value > 0]
@@ -433,6 +441,10 @@ class BitcoinCoreRPC:
         for txid in received_txids:
             for vout, value in cache.get(txid, []):
                 out.append({"txid": txid, "vout": vout, "value": value})
+        if missing:
+            self._logger.debug(
+                "ChainMonitor: unresolvable received txids for "
+                f"{locking_addr[:16]}… — retried next pass (never cached)")
         return out
 
     async def _fetch_spent_utxos_by_prevout(self, received_txids: List[str],
@@ -458,9 +470,23 @@ class BitcoinCoreRPC:
             spenders = await self.iface.acall(method="gettxspendingprevout",
                                               params=[outpoints], timeout=HttpxTimeout(10))
         except Exception as e:
-            self._logger.debug(f"ChainMonitor: prevout-indexed reconciliation "
-                               f"unavailable ({e}); falling back to the "
-                               f"listtransactions walk")
+            # warn-once per process for a PERMANENTLY missing RPC (Core
+            # <24 method-not-found silently reinstated the decoy-exhaustion
+            # class with only debug logs — re-review 2026-09-01 A3);
+            # transient failures stay debug-quiet to avoid spam
+            msg = str(e)
+            permanent = "32601" in msg or "not found" in msg.lower()
+            if permanent and not getattr(self, "_warned_prevout_missing", False):
+                self._warned_prevout_missing = True
+                self._logger.warning(
+                    "ChainMonitor: gettxspendingprevout unavailable on this "
+                    "bitcoind (Core <24?) — reconciliation falls back to the "
+                    "listtransactions walk, which is EXHAUSTIBLE by dust "
+                    f"decoys; upgrade Core ≥24 ({e})")
+            else:
+                self._logger.debug(f"ChainMonitor: prevout-indexed reconciliation "
+                                   f"unavailable ({e}); falling back to the "
+                                   f"listtransactions walk")
             return None
         spent_utxos = []
         for op, sp in zip(outpoints, spenders):

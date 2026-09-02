@@ -27,9 +27,18 @@ _CACHE_TTL_SEC = 300
 # on-loop refresh respawn backoff (a dead endpoint would otherwise get
 # one new task per fee call)
 _REFRESH_BACKOFF_SEC = 10.0
+# serving stale beyond this trips a once-per-process WARNING — a dead
+# oracle otherwise pins an ancient feerate forever with zero signal,
+# while cln_chain's INFO "using oracle feerate X" makes stale look
+# alive (re-review 2026-09-01 B1)
+_STALE_ALARM_SEC = 3600.0
 
 _cache: dict = {}  # url -> (fetched_at_monotonic, sat_vb)
 _last_refresh_attempt: dict = {}
+_warned_stale: set = set()
+# wired by the wallet layer at startup (cln_chain) — the module itself
+# has no logger; None disables the alarm (tests)
+stale_alarm = None
 
 
 def default_oracle_url(net: Type[AbstractNet]) -> Optional[str]:
@@ -98,6 +107,15 @@ def fetch_fee_sat_vb(base_url: str, *, timeout: float = 5.0) -> Optional[float]:
             _last_refresh_attempt[base_url] = now
             loop.create_task(_refresh_cache(base_url, timeout))
         if hit is not None:
+            age = now - hit[0]
+            if age > _STALE_ALARM_SEC and base_url not in _warned_stale:
+                _warned_stale.add(base_url)
+                if stale_alarm is not None:
+                    stale_alarm(
+                        f"fee oracle stale: serving {hit[1]} sat/vB cached "
+                        f"{int(age / 60)} min ago and refresh keeps failing "
+                        f"({base_url}) — claims are pricing against a "
+                        f"potentially dead market view")
             return hit[1]  # stale but immediate; refresh in flight
         return None  # cold: caller's fail-open prices this round
     sat_vb = _fetch_uncached(base_url, timeout)

@@ -241,3 +241,65 @@ class TestHsmCanary:
         errs = [m for lvl, m in sm.logger.lines if lvl == 'error']
         assert any('HSM CANARY MISMATCH' in m for m in errs), \
             "the alarm must be loud"
+
+
+class TestReReviewFixes:
+    """Re-review 2026-09-01: A3 warn-once for a permanently missing
+    gettxspendingprevout; B1 stale-serve-forever alarm."""
+
+    async def test_prevout_permanently_missing_warns_once(self):
+        from tests.test_spent_reconciliation import _make_rpc, FakeIface, ADDR
+        rpc = _make_rpc(decoys=1, support_prevout=False)
+
+        class _Err(Exception):
+            pass
+
+        async def boom(method, params=None, timeout=None):
+            if method == "gettxspendingprevout":
+                raise _Err("RPC method not found (code -32601)")
+            return await FakeIface(1, True).acall(method, params, timeout)
+
+        async def quiet(method, params=None, timeout=None):
+            if method == "gettxspendingprevout":
+                raise _Err("timeout")
+            return await FakeIface(1, True).acall(method, params, timeout)
+
+        rpc.iface.acall = boom
+        await rpc.get_addr_outputs(ADDR)
+        await rpc.get_addr_outputs(ADDR)
+        lines = rpc._logger.lines
+        permanent_warns = [m for lvl, m in lines
+                           if lvl == 'warn' and 'gettxspendingprevout unavailable' in m]
+        assert len(permanent_warns) == 1, "warn exactly once per process"
+
+        rpc2 = _make_rpc(decoys=1, support_prevout=True)
+        rpc2.iface.acall = quiet
+        await rpc2.get_addr_outputs(ADDR)
+        trans = [m for lvl, m in rpc2._logger.lines if lvl == 'warn']
+        assert not trans, "transient failures stay debug-quiet"
+
+    async def test_stale_oracle_alarms(self):
+        fee_oracle._cache.clear()
+        fee_oracle._warned_stale.clear()
+        fee_oracle._last_refresh_attempt.clear()
+        alarms = []
+        fee_oracle.stale_alarm = alarms.append
+        stale_time = time.monotonic() - (fee_oracle._STALE_ALARM_SEC + 60)
+        fee_oracle._cache["https://oracle.test/api"] = (stale_time, 5.0)
+
+        class _Loop:
+            def create_task(self, coro):
+                coro.close()
+                return SimpleNamespace(done=lambda: True)
+
+        orig = fee_oracle.asyncio.get_running_loop
+        fee_oracle.asyncio.get_running_loop = lambda: _Loop()
+        try:
+            out = fetch_fee_sat_vb("https://oracle.test/api")
+            out2 = fetch_fee_sat_vb("https://oracle.test/api")
+        finally:
+            fee_oracle.asyncio.get_running_loop = orig
+            fee_oracle.stale_alarm = None
+        assert out == 5.0 and out2 == 5.0
+        assert len(alarms) == 1 and "stale" in alarms[0], \
+            "one alarm per url while refresh keeps failing"
