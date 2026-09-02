@@ -29,6 +29,31 @@ Sibling repos: `../lightning-playground` (lab, e2e experiments, inr2 ops),
 `../electrum` (client-side reference), `../boltz-bridge` (HTTP→Nostr proxy),
 `../bolts` + `../greatspectations` (spec-quote checking, see below).
 
+## Ops coordination (MANDATORY — opscoord; canonical text in
+## ../boltz-bridge/AGENTS.md and ../lightning-playground/AGENTS.md)
+
+Shared resources (testnet wallets, the inr2 box, live surfaces) are
+coordinated through **opscoord** — the ledger lives at
+`/home/ubuntu/ops-runs/`, lib + CLI at
+`../lightning-playground/scripts/lib/opscoord.mjs`. For THIS repo the
+practical rules:
+
+- **Boot:** `export OPENSESSION=<short-id>` +
+  `node ../lightning-playground/scripts/lib/opscoord.mjs session begin
+  "<purpose>" --touches plugin:cln-swap` — close with
+  `session end --status green|waived:<reason>`.
+- **Wallet-touching lab/ops work** (funding the lab, draws on
+  cln-swap/cln-hub/swallet, container restarts on inr2):
+  `opscoord reserve <wallet> <sat> --purpose "<why>"` first;
+  `--exclusive` for anything destructive to concurrent claims
+  (consolidations, refills); `opscoord journal --event <name> -- ...`
+  for infra mutations (container rebuilds/restarts, datastore wipes).
+- Python callers use the same CLI (subprocess) — the argv + exit-code
+  contract is the interface (exit 3 = contended/over-budget).
+- Check `opscoord session list` + `opscoord report` before touching
+  shared surfaces — the parallel-session forensics this replaces cost
+  three live incidents (playground #89).
+
 ## Naming: swap directions are named OPPOSITE to Boltz
 
 This codebase uses **Electrum's** naming (it is a port of electrum's
