@@ -337,9 +337,16 @@ class SwapManager:
     @staticmethod
     def _swap_integrity_errors(payment_hash_hex: str, swap: SwapData) -> list:
         """Issue #22 (audit F21) load-integrity: the key material the
-        claim/refund paths need. privkey + redeem_script are required in
-        BOTH directions (refund for forward, claim for reverse). preimage
-        is Optional by design in both — the client holds it for forwards,
+        claim/refund paths need. Since the HSM-split (#36/#43) the key
+        material for EITHER direction is `privkey` (old format, stored)
+        OR `claim_pubkey` (new format — the key is HSM-derived at
+        use-time and checked against it, see _get_swap_privkey); the
+        live-earned 2026-09-06 bug kept the pre-HSM plaintext-privkey
+        requirement and quarantined EVERY new-format swap at every
+        restart (24+ records on cln-swap-mutinynet, first at
+        quarantined_at 1788282573 — one day after the HSM deploy).
+        `redeem_script` is required in both directions. preimage is
+        Optional by design in both — the client holds it for forwards,
         it is extracted from the spending tx for reverses — but WHEN
         present it must hash to the record's payment_hash (a mismatch
         means fields from different records were merged)."""
@@ -351,14 +358,21 @@ class SwapManager:
         except ValueError:
             errors.append('payment_hash key is not valid 32-byte hex')
             payment_hash = None
-        for field in ('privkey', 'redeem_script'):
+        has_stored_privkey = False
+        try:
+            raw = hex_to_bytes(swap.privkey) if swap.privkey else None
+            if raw and len(raw) == 32:
+                has_stored_privkey = True
+        except (ValueError, TypeError):
+            has_stored_privkey = False
+        if not has_stored_privkey and not getattr(swap, 'claim_pubkey', None):
+            errors.append('privkey missing/unparsable')
+        for field in ('redeem_script',):
             value = getattr(swap, field, None)
             try:
                 raw = hex_to_bytes(value) if value else None
                 if not raw:
                     raise ValueError('missing')
-                if field == 'privkey' and len(raw) != 32:
-                    raise ValueError(f'{len(raw)} bytes, need 32')
             except (ValueError, TypeError):
                 errors.append(f'{field} missing/unparsable')
         _stored_preimage = swap.preimage if swap.preimage else None
