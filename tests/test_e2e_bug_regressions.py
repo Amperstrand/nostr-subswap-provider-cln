@@ -116,6 +116,7 @@ class TestDbRoundTrip:
             "corrupt_str": "garbage",
         }
         ln._tombstones = {}
+        ln._dispatching_holds = set()
         ln._invoice_lock = __import__("threading").Lock()
         ln._logger = MagicMock()
 

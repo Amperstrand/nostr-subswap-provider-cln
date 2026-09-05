@@ -449,8 +449,23 @@ class SwapManager:
                         tracker.note_nostr_up()
                     last_advertised_max = None
                     while transport.is_connected.is_set() and not transport.dead.is_set():
-                        # todo: publish everytime fees have changed
-                        self.server_update_pairs()
+                        # audit 2026-09-05 P1-E: the pairs update reaches
+                        # four bare raise surfaces (listfunds probes →
+                        # CapacityProbeError, feerates) — unguarded it
+                        # killed the task → taskgroup escalation → #16
+                        # hard exit on a transient RPC blip. publish_offer
+                        # in this same loop got the withdraw-and-retry
+                        # treatment; the pairs update never did.
+                        try:
+                            self.server_update_pairs()
+                        except Exception:
+                            self.logger.error(f'updating pairs failed — withdrawing offer, '
+                                              f'refusing new swap requests:\n'
+                                              f'{traceback.format_exc()}')
+                            self.is_initialized.clear()
+                            tracker.note_nostr_down('pairs update failed')
+                            await asyncio.sleep(10)
+                            continue
                         # issue #20 (audit F06): bound the announce. A relay
                         # that went away makes aionostr's send/reconnect
                         # block for its full quadratic retry schedule —
@@ -513,10 +528,16 @@ class SwapManager:
             # #28: re-register the hold-invoice callback too — the dict
             # starts empty each process, so a FUNDED hold parked before a
             # restart never fired its funding callback afterward (live
-            # 2026-08-26: parked 607s then watchdog-cancelled). Only
-            # is_reverse (server-PoV onchain_to_ln carries the funding
-            # obligation) + registered + unfunded.
-            if not swap.is_reverse and swap.registered and swap.funding_txid is None:
+            # 2026-08-26: parked 607s then watchdog-cancelled).
+            # audit 2026-09-05 P1-F: the old gate required swap.registered
+            # — a flag whose ONLY writer is the d2 phase-2 handler, so
+            # this re-registration was provably dead code for d1 (the
+            # direction it was written for). Gate on the hold still
+            # existing instead: a hold that survived the restart needs
+            # its funding callback, one that is gone means the swap
+            # already finished or failed.
+            if not swap.is_reverse and swap.funding_txid is None \
+                    and self.lnworker.get_hold_invoice(swap.payment_hash) is not None:
                 self.lnworker.register_hold_invoice_callback(
                     payment_hash=swap.payment_hash, callback=self.hold_invoice_callback)
 
@@ -664,15 +685,31 @@ class SwapManager:
         # with the 278-sat prepay already settled. Cancel regardless of
         # registration state; unregister only if present.
         if not swap.is_reverse:
-            if swap.payment_hash.hex() in self.lnworker._hold_invoice_callbacks:
-                self.lnworker.unregister_hold_invoice_callback(swap.payment_hash)
-            for payment_hash in [swap.payment_hash, swap.prepay_hash]:
-                # prepay hash should already be settled at this point
-                invoice = self.lnworker.get_hold_invoice(payment_hash)
-                if invoice:
-                    invoice.cancel_all_htlcs()
-                    self.lnworker.delete_hold_invoice(payment_hash, False)
-                self.lnworker.delete_payment_info(payment_hash, False)
+            # audit 2026-09-05 P0-A: with our funding tx LIVE onchain
+            # (funding_txid set — broadcast returned, only the persist
+            # failed) the payer's holds must stay parked; cancelling
+            # them refunds the payer while the client still claims the
+            # lockup = double-get. Mirror F23's record gate onto the
+            # cancel branch: only a swap that never reached the chain
+            # may tear its holds down (the R5/live-cff928cd behavior).
+            if swap.funding_txid is None:
+                if swap.payment_hash.hex() in self.lnworker._hold_invoice_callbacks:
+                    self.lnworker.unregister_hold_invoice_callback(swap.payment_hash)
+                for payment_hash in [swap.payment_hash, swap.prepay_hash]:
+                    # prepay hash should already be settled at this point
+                    invoice = self.lnworker.get_hold_invoice(payment_hash)
+                    if invoice:
+                        invoice.cancel_all_htlcs()
+                        self.lnworker.delete_hold_invoice(payment_hash, False)
+                    self.lnworker.delete_payment_info(payment_hash, False)
+            else:
+                self.logger.error(
+                    f'failing d1 swap {swap.payment_hash.hex()} ({reason}) with '
+                    f'funding tx {swap.funding_txid} live — payer holds LEFT '
+                    f'PARKED; the claim→extract→settle lifecycle is the only '
+                    f'safe exit (P0-A)')
+                if swap.payment_hash.hex() in self.lnworker._hold_invoice_callbacks:
+                    self.lnworker.unregister_hold_invoice_callback(swap.payment_hash)
         else:
             self.lnworker.delete_invoice(swap.payment_hash, False)
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
@@ -694,6 +731,21 @@ class SwapManager:
         _preimage = self._get_swap_preimage(swap)
         assert _preimage, f"Cannot settle without preimage: {swap.payment_hash.hex()}"
         hold_invoice = self.lnworker.get_hold_invoice(swap.payment_hash)
+        if hold_invoice is None:
+            # audit 2026-09-05 P2-G: a racing _fail_swap (or the #28/#80
+            # watchdog) already deleted the hold — settling is
+            # impossible and retrying forever (the old None.settle
+            # AttributeError, contained but every-pass) never pops the
+            # record. Terminal: drop it loudly and let the payer HTLCs
+            # ride to their own verdict.
+            self.logger.error(
+                f'finishing normal swap {swap.payment_hash.hex()}: hold already '
+                f'gone (racing fail/watchdog) — dropping record, payer HTLCs '
+                f'ride to their own verdict')
+            self.lnwatcher.remove_callback(swap.lockup_address)
+            self.swaps.pop(swap.payment_hash.hex(), None)
+            self.db.write()
+            return
         hold_invoice.settle(_preimage.hex())
         if not hold_invoice.funding_status == InvoiceState.SETTLED:
             self.logger.error(f'hold invoice settling failed: {swap.payment_hash.hex()}')
@@ -975,7 +1027,12 @@ class SwapManager:
             if 'imported before' in str(_e):
                 self.logger.warning(
                     f'_claim_swap: {swap.lockup_address} lost its wallet import — re-registering')
-                await self.lnwatcher.register_address(swap.lockup_address)
+                # audit 2026-09-05 P0-C: rescan from genesis — a plain
+                # re-import with timestamp "now" never sees the funding
+                # tx that may already be confirmed, leaving the swap
+                # blind until `expired` tears down a dispatched hold.
+                await self.lnwatcher.register_address(
+                    swap.lockup_address, rescan_from=0)
                 return
             raise
 
@@ -1026,7 +1083,17 @@ class SwapManager:
                 # issue #22 (audit F10): persist the observed spend before
                 # any early-return branch below can skip a later write
                 self.db.write()
-                if spent_height > 0 and current_height - spent_height > REDEEM_AFTER_DOUBLE_SPENT_DELAY:
+                # audit 2026-09-05 P0-B (electrum parity, submarine_swaps.py
+                # `if spent_height > 0 and swap.preimage:`): never stop
+                # watching while the preimage is still unextracted — the
+                # d1 payer's parked HTLCs can only be settled by the
+                # extraction below. The port dropped this gate and deleted
+                # the swap after REDEEM_AFTER_DOUBLE_SPENT_DELAY blocks of
+                # plugin blindness (restart loop / bitcoind outage),
+                # stranding the hold until CLTV while the client kept the
+                # onchain claim.
+                if spent_height > 0 and self._get_swap_preimage(swap) is not None \
+                        and current_height - spent_height > REDEEM_AFTER_DOUBLE_SPENT_DELAY:
                     self.logger.info(f'stop watching finished reverse swap {swap.lockup_address}')
                     swap.is_redeemed = True
                     # issue #22 (audit F10): flush is_redeemed before the
@@ -1325,6 +1392,20 @@ class SwapManager:
                         f'and emergency reserve)')
                 self.broadcast_funding_tx(swap, tx)
             except Exception as e:
+                if swap.funding_txid is not None:
+                    # audit 2026-09-05 P0-A: broadcast_funding_tx stamps
+                    # funding_txid only after a successful broadcast —
+                    # reaching here with it set means the tx IS live and
+                    # only the persist failed. The swap is alive, not
+                    # failed: keep the payer's holds parked, keep the
+                    # record (F23), and let the claim→extract→settle
+                    # lifecycle finish it. The write retries on the next
+                    # state change; a crash self-heals via chain rescan.
+                    self.logger.error(
+                        f'funding tx {swap.funding_txid} broadcast but persist '
+                        f'failed for {key[:10]}: {e} — swap stays live, holds '
+                        f'parked (P0-A)')
+                    return
                 self.logger.error(f'funding tx failed, failing swap {key[:10]}: {e}')
                 self._fail_swap(swap, f'funding tx failed: {e}')
 
@@ -1808,8 +1889,18 @@ class SwapManager:
     # a coroutine — on this sync method it crashed the entire module at
     # import, so upstream's own tests could never import it
     def broadcast_funding_tx(self, swap: SwapData, tx: PartialTransaction) -> None:
-        swap.funding_txid = tx.txid()
+        # audit 2026-09-05 P0-A: broadcast FIRST, stamp funding_txid only
+        # after the broadcast returned. Stamping before meant a persist
+        # failure (or misclassified broadcast error) routed into
+        # _fail_swap with funding_txid set — which cancelled the payer's
+        # parked HTLCs while the funding tx was live onchain (payer
+        # refunded + client claims the lockup = double-get). With this
+        # ordering: broadcast raises → funding_txid stays None →
+        # _fail_swap's funding-gated cancel is the correct R5 behavior;
+        # broadcast ok + db.write raises → funding_txid IS set →
+        # hold_invoice_callback's except keeps the holds parked.
         self.wallet.broadcast_transaction(tx)
+        swap.funding_txid = tx.txid()
         # issue #22 (audit F10): flush AFTER the broadcast — writing
         # before it would persist funding_txid for a tx that never went
         # out, and hold_invoice_callback (one-shot per funding) would

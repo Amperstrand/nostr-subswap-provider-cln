@@ -35,6 +35,7 @@ def _ln():
     ln._hold_invoices = {}
     ln._hold_invoice_callbacks = {}
     ln._tombstones = {}
+    ln._dispatching_holds = set()
     ln._bundle_main_of = {}
     ln._db = SimpleNamespace(write=lambda: None)
     return ln

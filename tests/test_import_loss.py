@@ -14,8 +14,12 @@ SRC = (Path(__file__).resolve().parent.parent
 
 def test_claim_swap_catches_unknown_address_and_re_registers():
     assert "'imported before' in str(_e)" in SRC  # the UnknownAddressError message class
-    # the recovery action, not just the catch
-    assert 'await self.lnwatcher.register_address(swap.lockup_address)' in SRC
+    # the recovery action, not just the catch — audit 2026-09-05 P0-C:
+    # the re-import must RESCAN (rescan_from=0); a plain "now" re-import
+    # never sees an already-confirmed funding tx and the swap rides
+    # blind into `expired`
+    assert 'await self.lnwatcher.register_address(' in SRC
+    assert 'rescan_from=0' in SRC
     # the fatal path is gone: get_addr_outputs must sit inside the try
     try_block = SRC.split('try:\n            txos = await self.lnwatcher.get_addr_outputs')
     assert len(try_block) >= 2, 'get_addr_outputs must be inside a try (the raw call crash-looped)'
@@ -89,8 +93,11 @@ def test_main_loop_re_registers_hold_callbacks():
     m = _re.search(r'\n    async def ', fn[10:])
     fn = fn[:m.start() + 10] if m else fn
     assert 'register_hold_invoice_callback' in fn, 'main_loop must re-register hold callbacks'
-    # the guard: only is_reverse (server PoV) + registered + unfunded swaps
-    assert 'swap.registered and swap.funding_txid is None' in fn
+    # the guard, audit 2026-09-05 P1-F: the old `swap.registered` gate was
+    # dead code for d1 (the flag's only writer is the d2 phase-2 handler)
+    # — gate on the hold still existing instead
+    assert 'get_hold_invoice(swap.payment_hash) is not None' in fn
+    assert 'swap.registered and swap.funding_txid is None' not in fn
 
 
 def test_create_normal_swap_still_registers_live():

@@ -18,8 +18,17 @@ class CLNPlugin:
         # getmanifest with the method list collected so far, so anything
         # added later would never be dispatched (issue #21 observability
         # surface: swapprovider-health)
-        for name, func in (rpc_methods or []):
-            self.plugin.add_method(name, func, background=False)
+        # audit 2026-09-05 F2/F4: pyln-client (24.11 and deployed 26.6.6
+        # alike) executes EVERY method inline on the single dispatch
+        # thread and has no coroutine support — a handler that blocks
+        # (swapclient's full swap) or is async def (orphans, live-broken
+        # with JSONEncoder errors) wedges or breaks the whole pipe.
+        # Slow/async handlers therefore register background=True and
+        # answer via request.set_result themselves.
+        for entry in (rpc_methods or []):
+            name, func = entry[0], entry[1]
+            background = entry[2] if len(entry) > 2 else False
+            self.plugin.add_method(name, func, background=background)
         # Create but don't start the thread yet
         self.__task = None
 

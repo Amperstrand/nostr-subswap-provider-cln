@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import time
 from typing import Optional
 
@@ -49,14 +50,14 @@ class CLNSwapProvider:
         # at every stage (parts missing during init report as "starting")
         rpc_methods = [("swapprovider-health", self._swapprovider_health_rpc),
                        ("swapprovider-swaps", self._swapprovider_swaps_rpc),
-                       ("swapprovider-orphans", self._swapprovider_orphans_rpc)]
+                       ("swapprovider-orphans", self._swapprovider_orphans_rpc, True)]
         if getattr(PluginConfig, "SWAP_MODE_DEFAULT", None) is None:
             # client RPCs register unconditionally (they no-op with a
             # clean error outside client mode); this keeps getmanifest
             # stable across SWAP_MODE changes without a restart race
             rpc_methods += [
                 ("swapclient-offers", self._swapclient_offers_rpc),
-                ("swapclient", self._swapclient_swap_rpc),
+                ("swapclient", self._swapclient_swap_rpc, True),
                 ("swapclient-status", self._swapclient_status_rpc),
             ]
         self.plugin_handler = await CLNPlugin(rpc_methods=rpc_methods)
@@ -142,22 +143,37 @@ class CLNSwapProvider:
              "max_reverse": o.max_reverse, "age_s": int(time.time()) - o.timestamp}
             for o in self.swap_client.offers.values()]}
 
-    def _swapclient_swap_rpc(self, plugin=None, amount_sat=None, **kwargs) -> dict:
+    def _swapclient_swap_rpc(self, plugin=None, request=None, amount_sat=None, **kwargs) -> None:
         """`lightning-cli swapclient amount_sat=<n> [provider=<hex>]`:
-        run one gated reverse swap (pay LN, receive onchain)."""
+        run one gated reverse swap (pay LN, receive onchain).
+
+        audit 2026-09-05 F2: registered background=True — a reverse
+        swap runs minutes, and pyln runs background=False handlers on
+        the single dispatch thread, so the old fut.result(timeout=400)
+        froze the ENTIRE plugin pipe (hooks included) for its duration.
+        Now the handler returns immediately and answers via
+        request.set_result when the swap completes."""
+        def reply(payload: dict) -> None:
+            if request is not None:
+                request.set_result(payload)
+
         if self.swap_client is None:
-            return {"error": "not in client mode (SWAP_MODE=client)"}
+            return reply({"error": "not in client mode (SWAP_MODE=client)"})
         if not amount_sat:
-            return {"error": "amount_sat required (satoshis)"}
+            return reply({"error": "amount_sat required (satoshis)"})
         fut = asyncio.run_coroutine_threadsafe(
             self.swap_client.reverse_swap(
                 lightning_amount_sat=int(amount_sat),
                 provider=kwargs.get("provider")),
             self._asyncio_loop)
-        try:
-            return fut.result(timeout=400)
-        except Exception as e:
-            return {"error": f"{type(e).__name__}: {e}"}
+
+        def _done(f: concurrent.futures.Future) -> None:
+            try:
+                reply(f.result())
+            except Exception as e:
+                reply({"error": f"{type(e).__name__}: {e}"})
+
+        fut.add_done_callback(_done)
 
     def _swapclient_status_rpc(self, plugin=None, **kwargs) -> dict:
         """`lightning-cli swapclient-status`: our swap rows."""
@@ -186,19 +202,36 @@ class CLNSwapProvider:
         from .attribution import list_recent_swaps
         return list_recent_swaps(self, limit=limit)
 
-    async def _swapprovider_orphans_rpc(self, plugin=None, **kwargs) -> dict:
+    def _swapprovider_orphans_rpc(self, plugin=None, request=None, **kwargs) -> None:
         """`lightning-cli swapprovider-orphans`: on-demand orphan-HTLC
         scan (#44 comment class) — inbound parked HTLCs no swap/hold/
         payment record owns, aged past the grace window. Read-only;
         detection only (no safe per-HTLC fail exists in CLN — dev-fail
-        kills the whole channel)."""
+        kills the whole channel).
+
+        audit 2026-09-05 F4: this handler used to be async def — pyln
+        has no coroutine support, so the dispatcher JSON-serialized the
+        coroutine object and the RPC has NEVER worked live (-32600
+        JSONEncoder errors, verified on cln-swap-signet). Sync handler,
+        background=True, answer via request.set_result."""
+        def reply(payload: dict) -> None:
+            if request is not None:
+                request.set_result(payload)
+
         if self.swap_manager is None:
-            return {'error': 'starting'}
-        try:
-            orphans = await self.swap_manager._scan_orphan_htlcs()
-            return {'orphans': orphans, 'count': len(orphans)}
-        except Exception as e:
-            return {'error': f'orphan scan failed: {e!r}'}
+            return reply({'error': 'starting'})
+        fut = asyncio.run_coroutine_threadsafe(
+            self.swap_manager._scan_orphan_htlcs(),
+            self._asyncio_loop)
+
+        def _done(f: concurrent.futures.Future) -> None:
+            try:
+                orphans = f.result()
+                reply({'orphans': orphans, 'count': len(orphans)})
+            except Exception as e:
+                reply({'error': f'orphan scan failed: {e!r}'})
+
+        fut.add_done_callback(_done)
 
     async def _pyln_pipe_watchdog(self):
         """#23 pyln pipe late-death detection: if the dispatch thread

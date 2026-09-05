@@ -147,11 +147,16 @@ class TestRegistrationGate:
             "server_add_swap_invoice must set swap.registered = True")
 
     def test_gate_reads_the_registered_flag(self):
-        # source contract: _claim_swap's reverse (onchain_to_ln) branch must gate
-        # on swap.registered before the claim fall-through
+        # source contract: _claim_swap's reverse (onchain_to_ln) claim is
+        # gated by LN COMMITMENT (the #10-option-B sweep-grace window).
+        # audit 2026-09-05 P1-F: the old regex matched the (dead)
+        # main_loop `swap.registered` line incidentally — the real gate
+        # is _has_ln_commitment; `registered` stays a persisted marker
+        # that only server_add_swap_invoice writes (d2 phase-2)
         src = (_plugin / "submarine_swaps.py").read_text()
-        assert re.search(r"if not .*registered", src), (
-            "_claim_swap must gate the onchain_to_ln claim on swap.registered")
+        assert re.search(r"if not self\._has_ln_commitment\(swap\):", src), (
+            "_claim_swap must gate the onchain_to_ln claim on LN commitment "
+            "(_has_ln_commitment → sweep-grace hold)")
 
     def test_registered_field_stays_in_the_schema(self):
         # production jsondb records carry `registered` — dropping the

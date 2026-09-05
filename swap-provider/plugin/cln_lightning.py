@@ -17,7 +17,7 @@ from .plugin_config import PluginConfig
 from .constants import MIN_FINAL_CLTV_DELTA_FOR_CLIENT, MIN_FINAL_CLTV_DELTA_ACCEPTED, MIN_FINAL_CLTV_DELTA_FOR_INVOICE
 from .utils import call_blocking_with_timeout, ShortID
 from .lnutil import LnFeatures, filter_suitable_recv_chans, hex_to_bytes, bytes_to_hex
-from .invoices import HoldInvoice, DuplicateInvoiceCreationError, Htlc, InvoiceState
+from .invoices import HoldInvoice, DuplicateInvoiceCreationError, Htlc, InvoiceState, HtlcState
 from .lnaddr import LnAddr, lnencode_unsigned
 from .bitcoin import COIN
 
@@ -74,6 +74,11 @@ class CLNLightning:
         self._bundle_main_of = db.get_dict('bundle_main_of')
         self._decoded_invoices = {}  # bolt11 -> decoded dict (see handle_htlc)
         self._payment_secret_key = plugin_instance.derive_secret("payment_secret")
+        # audit 2026-09-05 F1/P1-4: holds whose funding callback is being
+        # dispatched OUTSIDE _invoice_lock (see callback_handler) — the
+        # expiry sweeper must not cancel them mid-dispatch (the #80
+        # in-flight window before funding_dispatched_at is stamped)
+        self._dispatching_holds = set()
         self.monitoring_tasks = [] # type: List[asyncio.Task]
         self._logger.debug("CLNLightning initialized")
 
@@ -182,6 +187,15 @@ class CLNLightning:
                 f"— leaving parked for escrow resolution (#80 guard)")
             return False
 
+        if invoice.payment_hash.hex() in self._dispatching_holds:
+            # audit 2026-09-05 F1/P1-4: dispatch in flight (callback runs
+            # outside _invoice_lock) — funding_dispatched_at is not
+            # stamped yet, so the #80 guard above cannot see it
+            self._logger.info(
+                f"check_invoice_expiry: funding dispatch in flight for "
+                f"{invoice.payment_hash.hex()} — deferring sweep")
+            return False
+
         if (invoice.funding_status is InvoiceState.FUNDED
                 and invoice.created_at + invoice.expiry * 2 < time.time()):
             self._logger.warning(
@@ -251,8 +265,11 @@ class CLNLightning:
         """Iterate through the hold invoices and call the callback if the invoice is fully funded"""
         while True:
             time.sleep(5)
-            try:
-                for payment_hash, callback in list(self._hold_invoice_callbacks.items()):
+            # audit 2026-09-05 P1-4 (the #6/PD-3 class, never applied to
+            # THIS loop): per-invoice isolation — one poisoned entry must
+            # not starve every later swap's funding dispatch every pass.
+            for payment_hash, callback in list(self._hold_invoice_callbacks.items()):
+                try:
                     with self._invoice_lock:
                         invoice = self.get_hold_invoice(payment_hash)
                         if invoice is None:
@@ -265,44 +282,57 @@ class CLNLightning:
                             # poisoned the iteration for every other swap
                             self._hold_invoice_callbacks.pop(payment_hash, None)
                             continue
-                        if invoice.funding_status is InvoiceState.FUNDED:
-                            prepay_invoice_hash = invoice.get_prepay_invoice()
-                            prepay_invoice = self.get_hold_invoice(prepay_invoice_hash) \
-                                if prepay_invoice_hash is not None else None
-                            gate = self._bundle_prepay_state(invoice, prepay_invoice)
-                            if gate is PrepayGate.WAIT:
-                                continue
-                            if gate is PrepayGate.ABORT:
-                                # Issue #3: the sweeper should have torn this
-                                # main down with its expired prepay; if we
-                                # still see it, fail safe NOW — cancel the
-                                # payer's HTLCs, never fund on a broken bundle.
-                                self._logger.error(
-                                    f"callback_handler: bundled prepay "
-                                    f"{prepay_invoice_hash.hex()} of {invoice.payment_hash.hex()} "
-                                    f"vanished unfunded — cancelling main (issue #3)")
-                                invoice.cancel_all_htlcs()
-                                self.unregister_hold_invoice_callback(invoice.payment_hash)
-                                self.delete_hold_invoice(invoice.payment_hash)
-                                continue
-                            if prepay_invoice is not None:
-                                # redeem the prepay invoice first
-                                prepay_invoice.settle(self.get_preimage(prepay_invoice_hash))
-                                self.update_invoice(prepay_invoice)
-                                self._logger.debug(f"callback_handler: prepay invoice "
-                                                   f"{prepay_invoice.payment_hash.hex()} redeemed")
-                            # #23/#28: the funding-callback dispatch IS the
-                            # money moment — if it silently no-ops (empty
-                            # registry after restart, the #28 class), only
-                            # this line distinguishes "never called" from
-                            # "called and failed". Default-visible.
-                            self._logger.info(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
-                                                f"calling callback")
-
-                            # Call the callback
-                            callback(invoice.payment_hash)
+                        if invoice.funding_status is not InvoiceState.FUNDED:
+                            continue
+                        prepay_invoice_hash = invoice.get_prepay_invoice()
+                        prepay_invoice = self.get_hold_invoice(prepay_invoice_hash) \
+                            if prepay_invoice_hash is not None else None
+                        gate = self._bundle_prepay_state(invoice, prepay_invoice)
+                        if gate is PrepayGate.WAIT:
+                            continue
+                        if gate is PrepayGate.ABORT:
+                            # Issue #3: the sweeper should have torn this
+                            # main down with its expired prepay; if we
+                            # still see it, fail safe NOW — cancel the
+                            # payer's HTLCs, never fund on a broken bundle.
+                            self._logger.error(
+                                f"callback_handler: bundled prepay "
+                                f"{prepay_invoice_hash.hex()} of {invoice.payment_hash.hex()} "
+                                f"vanished unfunded — cancelling main (issue #3)")
+                            invoice.cancel_all_htlcs()
                             self.unregister_hold_invoice_callback(invoice.payment_hash)
-                            # #80: the FUNDED-abandonment watchdog below must
+                            self.delete_hold_invoice(invoice.payment_hash)
+                            continue
+                        if prepay_invoice is not None:
+                            # redeem the prepay invoice first
+                            prepay_invoice.settle(self.get_preimage(prepay_invoice_hash))
+                            self.update_invoice(prepay_invoice)
+                            self._logger.debug(f"callback_handler: prepay invoice "
+                                               f"{prepay_invoice.payment_hash.hex()} redeemed")
+                        # #23/#28: the funding-callback dispatch IS the
+                        # money moment — if it silently no-ops (empty
+                        # registry after restart, the #28 class), only
+                        # this line distinguishes "never called" from
+                        # "called and failed". Default-visible.
+                        self._logger.info(f"callback_handler: invoice {invoice.payment_hash.hex()} fully funded, "
+                                          f"calling callback")
+                        # audit 2026-09-05 F1: the callback builds and
+                        # broadcasts the funding tx (seconds of chain
+                        # RPCs). It used to run INSIDE _invoice_lock,
+                        # which plugin_htlc_accepted_hook needs on the
+                        # pyln dispatch thread — one slow dispatch froze
+                        # the whole plugin pipe (every htlc_accepted and
+                        # RPC behind it; the #23 watchdog sees a healthy
+                        # blocked-alive thread). Unregister + mark
+                        # dispatching under the lock, then dispatch
+                        # outside it.
+                        self.unregister_hold_invoice_callback(invoice.payment_hash)
+                        dispatch_key = invoice.payment_hash.hex()
+                        self._dispatching_holds.add(dispatch_key)
+                    try:
+                        callback(invoice.payment_hash)
+                        with self._invoice_lock:
+                            # #80: the FUNDED-abandonment watchdog must
                             # never cancel a hold whose swap already committed
                             # onchain funds — the escrow's resolution (client
                             # claim → _finish_normal_swap settles this hold
@@ -313,10 +343,13 @@ class CLNLightning:
                             invoice.funding_dispatched_at = int(time.time())
                             self.update_invoice(invoice)
                             self._logger.info(f"callback_handler: callback returned for "
-                                                f"{invoice.payment_hash.hex()} — funding dispatched")
-
-            except Exception as e:
-                self._logger.error(f"callback_handler encountered an error:\n{traceback.format_exc()}")
+                                              f"{invoice.payment_hash.hex()} — funding dispatched")
+                    finally:
+                        with self._invoice_lock:
+                            self._dispatching_holds.discard(dispatch_key)
+                except Exception as e:
+                    self._logger.error(f"callback_handler error on invoice "
+                                       f"{payment_hash}:\n{traceback.format_exc()}")
 
     def plugin_htlc_accepted_hook(self, onion, htlc, request, plugin, *args, **kwargs) -> None:
         if "forward_to" in kwargs:  # ignore forwards
@@ -339,11 +372,47 @@ class CLNLightning:
 
             # htlc that affects one of our stored hold invoices
             try:
-                if self.handle_htlc(invoice, htlc, onion, request):
-                    self.update_invoice(invoice)  # saves the changes to the invoice
+                changed = self.handle_htlc(invoice, htlc, onion, request)
             except Exception:
                 self._logger.error(f"plugin_htlc_accepted_hook failed:\n{traceback.format_exc()}")
                 return request.set_result({"result": "continue"})
+            if not changed:
+                return
+            try:
+                self.update_invoice(invoice)
+            except Exception:
+                # audit 2026-09-05 P0-D: persistence failed AFTER
+                # handle_htlc's verdict. Two forbidden reactions:
+                # (a) answering `continue` for a parked (ACCEPTED, still
+                #     pending) HTLC — lightningd would fail it as
+                #     unknown-hash while memory counts it funded → the
+                #     funding callback dispatches an escrow against
+                #     HTLCs the payer got refunded for;
+                # (b) answering anything when the HTLC was already
+                #     failed/settled (request resolved) — the second
+                #     set_result raises into pyln's dispatcher and kills
+                #     the dispatch thread (pipe death, crash-loop under
+                #     the same datastore outage).
+                # Correct: mirror lightningd. Parked → roll the in-memory
+                # add back and answer fail; already-answered → verdict
+                # stands, persist retries on the next state change.
+                stored = invoice.find_htlc(Htlc.from_cln_dict(htlc, request))
+                if stored is not None and stored.state is HtlcState.ACCEPTED:
+                    invoice.incoming_htlcs.discard(stored)
+                    if invoice.funding_status is InvoiceState.FUNDED \
+                            and not invoice.is_fully_funded():
+                        invoice.funding_status = InvoiceState.UNFUNDED
+                    self._logger.error(
+                        f"plugin_htlc_accepted_hook: persistence failed for parked "
+                        f"htlc {payment_hash_hex} — rolled back and failing it so "
+                        f"memory mirrors lightningd:\n{traceback.format_exc()}")
+                    return request.set_result({"result": "fail",
+                                               "failure_message": "400F"})
+                self._logger.error(
+                    f"plugin_htlc_accepted_hook: persistence failed after htlc "
+                    f"verdict for {payment_hash_hex} — verdict stands, will "
+                    f"re-persist on next change:\n{traceback.format_exc()}")
+                return
 
     def update_invoice(self, invoice: HoldInvoice) -> None:
         """Update the invoice in the db so it reflects all internal changes by calling __setattr__ in the StoredDict"""

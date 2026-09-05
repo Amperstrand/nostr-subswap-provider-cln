@@ -104,7 +104,12 @@ class Htlc:
     request_callback: Optional[Callable] = field()
 
     def __hash__(self):
-        return hash(self.short_channel_id + str(self.channel_id) + str(self.created_at))
+        # audit 2026-09-05 F3: must hash on EXACTLY the __eq__ fields —
+        # including created_at here while __eq__ ignores it let the set
+        # hold duplicates of the same logical HTLC (a replayed HTLC gets
+        # a new created_at), double-counting in is_fully_funded (R7)
+        # behind the find_htlc guard.
+        return hash(self.short_channel_id + str(self.channel_id))
 
     def __eq__(self, other):
         if not isinstance(other, Htlc):

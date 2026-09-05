@@ -205,9 +205,16 @@ class BitcoinCoreRPC:
             raise BitcoinCoreRPCError(f"ChainMonitor is_up_to_date: Could not get blockchain info: {e}")
         return True
 
-    async def register_address(self, address: str) -> None:
+    async def register_address(self, address: str, rescan_from: int | None = None) -> None:
         """Add an address to the wallet so bitcoin core begins monitoring it. This should happen right after creation
-        so we don't have to rescan which would be very slow."""
+        so we don't have to rescan which would be very slow.
+
+        rescan_from: audit 2026-09-05 P0-C — the import-loss recovery
+        re-registers an address the watch wallet dropped; with the
+        default "now" the re-import never rescans, so an already-funded
+        lockup stays invisible forever and the swap rides into
+        `expired`, which cancels the dispatched payer hold. Recovery
+        callers pass rescan_from=0 (full rescan of the descriptor)."""
 
         # Create a descriptor for the address
         descriptor = descsum_create(f"addr({address})")
@@ -215,7 +222,7 @@ class BitcoinCoreRPC:
         # Create the import request
         import_request = [{
             "desc": descriptor,
-            "timestamp": "now",  # Use "now" to avoid rescanning
+            "timestamp": rescan_from if rescan_from is not None else "now",
             "internal": False,
             "active": False  # We only want to watch the address, not make it active
         }]
