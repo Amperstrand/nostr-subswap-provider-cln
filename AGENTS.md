@@ -391,3 +391,27 @@ actionable was implemented, deployed, and verified. Summary:
   export instead
 - The plugin repo has ~117 commits of port/electrum-4.8 lineage; always
   check which branch you're on in shared repos before committing
+
+## Session 2026-09-05/06 — audit-and-improve round (3-lane deep audit + live deploy)
+
+Full detail in commits 8594c93 + c1f57da. Deployed as `lab-cln-subswap:audit-r2`
+(signet + mutinynet; compose tags updated, backups `*.bak-20260906-audit-r1`).
+
+- 4 P0 funds-loss fixes (double-get on post-broadcast failure; REDEEM
+  preimage gate w/ electrum parity; import-loss rescan; hook
+  except-continue divergence + double-response crash) + pipe/lock
+  hygiene (funding dispatch out of _invoice_lock, per-invoice callback
+  isolation, pyln background registration, Htlc hash/eq) + P1-E/F, P2-G.
+  19+5 pins, suite 485/485.
+- Live-earned on the r1 boot: HSM-format records (privkey=null +
+  claim_pubkey) were quarantined at EVERY restart since the #43 deploy
+  (60 signet + 24 mutinynet historical quarantines, all now
+  expired/complete — zero need recovery). Integrity rule now mirrors
+  _get_swap_privkey. Verified live: zero privkey-class quarantines on
+  the r2 boots.
+- opscoord ledger root absent on both this workstation and inr2 —
+  session/mutation journaling fell to the commit trail this round.
+- swapprovider-orphans works live for the first time since f10b0cd.
+- Known residual (ledgered for next round): clnrest response-lost on
+  sendpsbt with server-side commit (P0-A residual window); on-loop sync
+  RPCs; amputation self-heal; settled-tombstone replay semantics.
