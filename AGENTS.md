@@ -15,6 +15,16 @@ tracker. ElementsProject/lightning#9452 predates the rule; its body was
 corrected 2026-08-30 under explicit owner authorization (dust-shortfall
 mechanism) — no further upstream writes without the same.
 
+**UPDATE 2026-09-06 (owner directive — the CHANNEL rule, canonical text
+in ../boltz-bridge/AGENTS.md):** sign-off alone no longer authorizes an
+agent-executed post on non-member repos — no `gh` writes (comments,
+issues, PRs, reviews, gists) even after explicit per-text approval;
+the owner does the copy-paste into GitHub. Member orgs (verify:
+`gh api user/orgs`) keep the owner-gate flow. Read the target repo's
+CONTRIBUTING/AI policy before drafting; where the target requires
+human-written comments, the posted text must be the owner's own words.
+Fork-branch pushes to our namespace stay allowed.
+
 ## Project Summary
 
 A Core Lightning plugin that turns the CLN node itself into an Electrum-
