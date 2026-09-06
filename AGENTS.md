@@ -412,6 +412,12 @@ Full detail in commits 8594c93 + c1f57da. Deployed as `lab-cln-subswap:audit-r2`
 - opscoord ledger root absent on both this workstation and inr2 —
   session/mutation journaling fell to the commit trail this round.
 - swapprovider-orphans works live for the first time since f10b0cd.
-- Known residual (ledgered for next round): clnrest response-lost on
-  sendpsbt with server-side commit (P0-A residual window); on-loop sync
-  RPCs; amputation self-heal; settled-tombstone replay semantics.
+- Round 2 (commits cee577e + 8a54-class boot fix) resolved the on-loop
+  claim-path RPCs (staged), amputation self-heal + patch salvage, and
+  settled-tombstone replay semantics (resolve-with-preimage, CLTV-
+  bounded) — deployed as audit-r3 (both boxes, verified live incl.
+  quarantine prune aging out 22 signet records). Remaining residual:
+  clnrest response-lost on sendpsbt with server-side commit (P0-A
+  residual window); the broader on-loop RPC surface (non-claim paths);
+  dead-code removals (forward filter, dead d2 preimage block, the
+  write-only swap indexes).
