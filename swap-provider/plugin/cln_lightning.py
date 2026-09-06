@@ -87,6 +87,8 @@ class CLNLightning:
         # R2-2: age out settled-tombstones past the replay horizon
         if self._prune_tombstones():
             self._db.write()
+        self.monitoring_tasks = [] # type: List[asyncio.Task]
+        self._logger.debug("CLNLightning initialized")
 
     def _prune_tombstones(self) -> bool:
         """R2-2: drop settled-tombstones older than the parked-HTLC
@@ -105,8 +107,6 @@ class CLNLightning:
                 f"tombstone(s) past the {self.TOMBSTONE_MAX_AGE_SEC}s "
                 f"replay horizon")
         return bool(stale)
-        self.monitoring_tasks = [] # type: List[asyncio.Task]
-        self._logger.debug("CLNLightning initialized")
 
     async def run(self):
         # These loops are immortal BY DESIGN and must stay NON-DAEMON

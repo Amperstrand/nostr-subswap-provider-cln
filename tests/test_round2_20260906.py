@@ -324,3 +324,25 @@ class TestHygieneBundle:
         assert "02" * 32 in sm.quarantined_swaps
         assert "03" * 32 in sm.quarantined_swaps
         sm.db.write.assert_called_once()
+
+
+class TestConstructorWiring:
+    def test_cln_lightning_init_sets_every_run_dependency(self):
+        """Deploy-earned 2026-09-06 (audit-r3 boot crash): an edit that
+        anchored on an __init__ line terminated the constructor early —
+        run() crashed on missing monitoring_tasks. Construction via the
+        REAL __init__ must set every attribute run() depends on."""
+        from plugin.cln_lightning import CLNLightning
+        db = MagicMock()
+        db.get_dict.side_effect = lambda k: {}
+        db.write = MagicMock()
+        plugin_instance = MagicMock()
+        plugin_instance.plugin.rpc = MagicMock()
+        plugin_instance.derive_secret = lambda label: b"\x11" * 32
+        cln = CLNLightning(plugin_instance=plugin_instance,
+                           config=SimpleNamespace(), db=db, logger=_logger())
+        for attr in ("monitoring_tasks", "_dispatching_holds", "_tombstones",
+                     "_hold_invoices", "_invoice_lock", "_payment_secret_key"):
+            assert hasattr(cln, attr), (
+                f"CLNLightning.__init__ incomplete: {attr} unset — run() "
+                f"would crash (the audit-r3 boot class)")
