@@ -233,10 +233,35 @@ class JsonDB:  # (Logger):
         self.encoder = None
         self.pending_changes = []
         self._modified = False
+        # round 2 R2-1a/R2-1b (audit 2026-09-05 persistence lane): set
+        # BEFORE load_data — both damage-recovery classes (tail
+        # amputation, patch-salvage) mark it and __init__ heals the
+        # stored key with one forced consolidation below
+        self._needs_healing_write = False
         # load data
         data = self.load_data(s)
         # convert to StoredDict
         self.data = StoredDict(data, self, [])
+        if self._needs_healing_write:
+            # R2-1a: without this, the stored datastore key keeps the
+            # damaged tail and every append lands AFTER the damage —
+            # the next boot amputates damage PLUS everything written
+            # since recovery (empirically reproduced by the audit):
+            # swap records vanish silently, holds lose their state.
+            # One full rewrite heals it; a failing write must not
+            # abort the boot — the loaded state stands and healing
+            # retries at the next boot.
+            try:
+                self.set_modified(True)
+                self.write_and_force_consolidation()
+                self.logger.error(
+                    'JsonDB: healed the stored key after damage recovery '
+                    '(forced consolidation) — post-recovery writes durable')
+            except Exception as e:
+                self.logger.error(
+                    f'JsonDB: recovery consolidation FAILED ({e!r}) — '
+                    f'loaded state stands, the stored key still carries '
+                    f'damage; healing retries at next boot')
         # write file in case there was a db upgrade
         # if self.storage and self.storage.file_exists():
         #     await self.write_and_force_consolidation()
@@ -267,10 +292,31 @@ class JsonDB:  # (Logger):
         if not isinstance(data, dict):
             raise WalletFileException("Malformed wallet file (not dict)")
         if patches:
-            # apply patches
-            self.logger.debug('found %d patches'%len(patches))
-            patch = jsonpatch.JsonPatch(patches)
-            data = patch.apply(data)
+            # apply patches ONE OP AT A TIME (R2-1b): a datastore append
+            # whose response was lost leaves the caller re-appending the
+            # same ops — the duplicated remove then raised
+            # JsonPatchConflict out of the whole-block apply and crashed
+            # the boot with NO recovery (manual datastore surgery).
+            # Sequential application salvages the longest valid prefix;
+            # the poison tail is quarantined loudly and the healing
+            # consolidation in __init__ rewrites the key clean.
+            self.logger.debug('found %d patches' % len(patches))
+            applied = 0
+            for i, op in enumerate(patches):
+                try:
+                    data = jsonpatch.JsonPatch([op]).apply(data)
+                    applied = i + 1
+                except Exception as e:
+                    dropped = ',\n'.join(json.dumps(p) for p in patches[applied:])
+                    self._report_discarded_fragment(dropped)
+                    self.logger.error(
+                        f'JsonDB: patch {i} ({op.get("op")} {op.get("path")}) '
+                        f'failed to apply ({e!r}) — salvaging the {applied} '
+                        f'valid patch(es) before it, dropping the remaining '
+                        f'{len(patches) - applied} (the response-lost '
+                        f'double-append class)')
+                    self._needs_healing_write = True
+                    break
             self.set_modified(True)
         return data
 
@@ -321,6 +367,8 @@ class JsonDB:  # (Logger):
                 # forensic: ERROR + quarantine fragment (below), and
                 # the intact prefix still loads.
                 self._report_discarded_fragment(s[i - 2:])
+                # R2-1a: mark for the healing consolidation in __init__
+                self._needs_healing_write = True
                 return self.load_data(prefix[0:-2])
 
     # markers: a discarded fragment containing any of these may carry

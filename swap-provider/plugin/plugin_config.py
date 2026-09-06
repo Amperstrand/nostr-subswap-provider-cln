@@ -161,7 +161,10 @@ class PluginConfig:
         # R3: honest advertised cap — the offer must not promise capacity
         # the node cannot fund (clamped again at server_update_pairs time)
         if max_amt := os.getenv("MAX_SWAP_AMOUNT"):
-            config.max_swap_amount = int(max_amt.strip())
+            # R2-4: the only money-bound env without a range check — a
+            # typo'd negative/zero cap silently advertised nonsense and
+            # refused every swap while looking like a capacity problem
+            config.max_swap_amount = _validated_max_swap_amount(max_amt)
         else:
             config.max_swap_amount = 10_000_000
             config.logger.warning(f"No MAX_SWAP_AMOUNT in env. Advertising default "
@@ -348,3 +351,13 @@ class Keypair(OnlyPubkeyKeypair):
     def from_private_key(cls, privkey: bytes) -> 'Keypair':
         pubkey: bytes = ecc.ECPrivkey(privkey).get_public_key_bytes()
         return cls(pubkey=pubkey, privkey=privkey)
+
+
+# R2-4: range-checked MAX_SWAP_AMOUNT — fail loud at startup (the
+# SWAP_MODES-typos contract) instead of silently advertising a broken cap
+def _validated_max_swap_amount(raw: str) -> int:
+    value = int(raw.strip())
+    if not 10_000 <= value <= 1_000_000_000:
+        raise ValueError(
+            f"MAX_SWAP_AMOUNT must be 10000..1000000000 sat, got {value}")
+    return value

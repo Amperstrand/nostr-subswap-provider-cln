@@ -89,6 +89,7 @@ def _mk_sm(*, stuck_fee, recommended_fee) -> SwapManager:
     sm._create_and_sign_claim_tx = MagicMock(return_value=fake_tx)
     sm._has_ln_commitment = lambda s: True
     sm._payment_parked = lambda s: True
+    sm._payment_parked_state = lambda s: 'parked'  # R2-3: claim path probes state directly
     return sm
 
 

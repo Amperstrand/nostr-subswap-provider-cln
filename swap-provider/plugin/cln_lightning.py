@@ -47,6 +47,11 @@ class PrepayGate(Enum):
 
 class CLNLightning:
     INBOUND_LIQUIDITY_FACTOR = 0.9  # Buffer factor for inbound liquidity calculation (use only 90% of inbound capacity)
+    # R2-2: settled-tombstone retention — replays only happen while
+    # lightningd still owes a fulfill for a parked HTLC, which is bounded
+    # by its CLTV (~2 weeks). Past that the preimage in the tombstone is
+    # dead weight (and a secret) — age it out.
+    TOMBSTONE_MAX_AGE_SEC = 14 * 24 * 3600
 
     def __init__(self, *, plugin_instance: CLNPlugin, config: PluginConfig, db: JsonDB, logger: PluginLogger):
         # self.MIN_FINAL_CLTV_DELTA_ACCEPTED: int = config.cln_config["cltv-final"]["value_int"]
@@ -79,6 +84,27 @@ class CLNLightning:
         # expiry sweeper must not cancel them mid-dispatch (the #80
         # in-flight window before funding_dispatched_at is stamped)
         self._dispatching_holds = set()
+        # R2-2: age out settled-tombstones past the replay horizon
+        if self._prune_tombstones():
+            self._db.write()
+
+    def _prune_tombstones(self) -> bool:
+        """R2-2: drop settled-tombstones older than the parked-HTLC
+        CLTV horizon (their preimage is a secret kept only for the
+        replay window). Boolean (cancelled/expired) tombstones carry no
+        timestamp and no secret — kept."""
+        now = int(time.time())
+        stale = [k for k, v in self._tombstones.items()
+                 if isinstance(v, dict)
+                 and now - int(v.get("settled_at", 0)) > self.TOMBSTONE_MAX_AGE_SEC]
+        for k in stale:
+            self._tombstones.pop(k, None)
+        if stale:
+            self._logger.info(
+                f"_prune_tombstones: aged out {len(stale)} settled "
+                f"tombstone(s) past the {self.TOMBSTONE_MAX_AGE_SEC}s "
+                f"replay horizon")
+        return bool(stale)
         self.monitoring_tasks = [] # type: List[asyncio.Task]
         self._logger.debug("CLNLightning initialized")
 
@@ -361,6 +387,18 @@ class CLNLightning:
             invoice = self.get_hold_invoice(bytes.fromhex(payment_hash_hex))
             if invoice is None:  # htlc doesn't belong to a hold invoice we know about
                 if payment_hash_hex in self._tombstones:
+                    tomb = self._tombstones[payment_hash_hex]
+                    # R2-2: a SETTLED hold's tombstone resolves the
+                    # replay — failing it refunded the payer after the
+                    # client already claimed the escrow (lightningd's
+                    # async fulfill-commit replay window)
+                    if isinstance(tomb, dict) and tomb.get("preimage"):
+                        self._logger.info(f"plugin_htlc_accepted_hook: resolving "
+                                          f"replayed htlc for settled hold "
+                                          f"{payment_hash_hex[:12]}…")
+                        return request.set_result(
+                            {"result": "resolve",
+                             "payment_key": tomb["preimage"]})
                     # hold deleted/expired (issue #25): fail immediately —
                     # mirrors invoices.Htlc.fail()'s 400F shape
                     self._logger.info(f"plugin_htlc_accepted_hook: failing htlc for "
@@ -620,7 +658,8 @@ class CLNLightning:
         self._hold_invoices[invoice.payment_hash.hex()] = invoice
         self._db.write()
 
-    def delete_hold_invoice(self, payment_hash: Union[bytes, str], write_db: bool = True) -> None:
+    def delete_hold_invoice(self, payment_hash: Union[bytes, str], write_db: bool = True,
+                            settled_preimage: Union[bytes, str, None] = None) -> None:
         if isinstance(payment_hash, bytes):
             payment_hash = payment_hash.hex()
         self._logger.debug(f"delete_hold_invoice: {payment_hash}")
@@ -629,8 +668,22 @@ class CLNLightning:
         if res is None:
             return
         # issue #25: tombstone the hash so replayed/late HTLCs for this
-        # deleted hold fail instead of parking (persisted via db dict)
-        self._tombstones[payment_hash] = True
+        # deleted hold fail instead of parking (persisted via db dict).
+        # round 2 R2-2 (owner option A): a SETTLED hold's tombstone
+        # carries the preimage and RESOLVES replays — lightningd's
+        # fulfill commit is async, so a restart in that window replays
+        # HTLCs we already settled; failing them refunded the payer
+        # AFTER the client claimed the escrow. Cancelled/expired holds
+        # (no settled_preimage) keep the boolean fail shape.
+        if settled_preimage is not None:
+            if isinstance(settled_preimage, bytes):
+                settled_preimage = settled_preimage.hex()
+            self._tombstones[payment_hash] = {
+                "preimage": settled_preimage,
+                "settled_at": int(time.time()),
+            }
+        else:
+            self._tombstones[payment_hash] = True
         # Issue #3: if this was a bundled prepay, drop the reverse index
         self._bundle_main_of.pop(payment_hash, None)
         if write_db:

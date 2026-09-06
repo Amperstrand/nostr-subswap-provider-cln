@@ -401,6 +401,24 @@ class SwapManager:
             f"processed")
         self.db.write()
 
+    QUARANTINE_RETENTION_BLOCKS = 1008  # ~1 week past refund unlock
+
+    def _prune_quarantined_swaps(self, tip: int) -> None:
+        """R2-4b: drop quarantined records whose locktime fell more than
+        QUARANTINE_RETENTION_BLOCKS behind the tip. Records with a live
+        or recent locktime (including operator-restorable ones) stay."""
+        stale = [k for k, v in self.quarantined_swaps.items()
+                 if isinstance(v, dict)
+                 and int(v.get('swap', {}).get('locktime', tip)) < tip - self.QUARANTINE_RETENTION_BLOCKS]
+        for k in stale:
+            self.quarantined_swaps.pop(k, None)
+        if stale:
+            self.logger.info(
+                f'quarantine prune: aged out {len(stale)} record(s) past '
+                f'{self.QUARANTINE_RETENTION_BLOCKS} blocks behind tip '
+                f'{tip} — old-format secrets age out with them')
+            self.db.write()
+
     def _load_integrity_scan(self) -> None:
         """Issues #18/#22 (audit R3/F21): cheap consistency scan at db
         load — every swap carries lockup_address + locktime (WARN only),
@@ -534,6 +552,16 @@ class SwapManager:
     async def main_loop(self):
         if self.is_initialized.is_set():
             raise Exception("swap manager main_loop called twice, already running")
+        # R2-4b: quarantined records past their retention horizon are
+        # dropped — old-format ones carry PLAINTEXT privkey/preimage
+        # forever otherwise (the HSM-split's secrets-age-out promise did
+        # not cover the quarantine). Recent/live-locktime records stay
+        # for operator forensics (restore = explicit operator action).
+        try:
+            tip = await self.wallet.get_local_height()
+            self._prune_quarantined_swaps(tip)
+        except Exception as e:
+            self.logger.warning(f'quarantine prune skipped ({e!r}) — retry at next restart')
         # readd all swaps to lnwatcher
         for k, swap in self.swaps.items():
             if swap.is_redeemed:
@@ -729,6 +757,8 @@ class SwapManager:
             self.invoices_to_pay.pop(swap.payment_hash.hex(), None)
         self.invoices_awaiting_funding.discard(swap.payment_hash.hex())
         self._funding_gate_deadline.pop(swap.payment_hash.hex(), None)
+        if swap.prepay_hash is not None:
+            self.prepayments.pop(swap.prepay_hash, None)
         if swap.funding_txid is None or swap.is_redeemed:
             # issue #22 (audit F23): only a swap that leaves the record
             # store drops its chain watch. While our funding is live
@@ -764,10 +794,22 @@ class SwapManager:
         if not hold_invoice.funding_status == InvoiceState.SETTLED:
             self.logger.error(f'hold invoice settling failed: {swap.payment_hash.hex()}')
             return
-        self.lnworker.delete_hold_invoice(swap.payment_hash, False)
+        # R2-2: settled holds tombstone WITH the preimage so replayed
+        # HTLCs (lightningd's async fulfill-commit window) resolve
+        # instead of refunding the payer after the client claimed
+        self.lnworker.delete_hold_invoice(swap.payment_hash, False,
+                                          settled_preimage=_preimage)
         if swap.prepay_hash:
-            self.lnworker.delete_hold_invoice(swap.prepay_hash, False)
+            self.lnworker.delete_hold_invoice(
+                swap.prepay_hash, False,
+                settled_preimage=self.lnworker.get_preimage(swap.prepay_hash))
         self.lnworker.delete_payment_info(swap.payment_hash, False)
+        # R2-4a: the prepay index leak — populated only by d1 swaps, but
+        # pruned only in delete_finished_reverse_swap (which serves d2,
+        # whose prepay_hash is always None): the #14-item-8 fix landed
+        # on the wrong leg
+        if swap.prepay_hash is not None:
+            self.prepayments.pop(swap.prepay_hash, None)
         self.lnwatcher.remove_callback(swap.lockup_address)
         self.swaps.pop(swap.payment_hash.hex())
         self.db.write()
@@ -1143,7 +1185,7 @@ class SwapManager:
                             return self._fail_swap(swap, 'refund tx confirmed')
                         elif spent_height == 0:  # still unconfirmed, we check if bumping is neccessary
                             claim_tx_fee = claim_tx.get_fee()
-                            recommended_fee = self.get_claim_fee()
+                            recommended_fee = await asyncio.to_thread(self.get_claim_fee)
                             if claim_tx_fee * 1.1 < recommended_fee:
                                 should_bump_fee = True
                                 # #52: the replacement must clear BIP-125
@@ -1210,7 +1252,7 @@ class SwapManager:
                                 f'{our_claim_txid}: {e!r}')
                             claim_tx_fee = None
                         if claim_tx_fee is not None:
-                            recommended_fee = self.get_claim_fee()
+                            recommended_fee = await asyncio.to_thread(self.get_claim_fee)
                             if claim_tx_fee * 1.1 < recommended_fee:
                                 should_bump_fee = True
                                 bump_fee_floor = max(
@@ -1271,13 +1313,18 @@ class SwapManager:
             # earlier leaves a client-loss corner: our payment failing
             # permanently post-claim = unfillable hold + lockup taken.
             # Not parked yet → the client refunds at CLTV instead.
-            if self._get_swap_preimage(swap) is not None and not self._payment_parked(swap):
+            # R2-3: listpays is a blocking lightningd RPC — run it off
+            # the event loop (a busy lightningd froze ALL claims while
+            # this sat in the park gate)
+            parked_state = await asyncio.to_thread(
+                self._payment_parked_state, swap)
+            if self._get_swap_preimage(swap) is not None and parked_state != 'parked':
                 # #42: definitively never-parked past the claim window is
                 # terminal — the deferred state has no other exit (live:
                 # 21b4256e deferred every pass for 300+ blocks, secrets
                 # riding in the datastore). 'unknown' (RPC outage) and
                 # pre-grace keep the deferral.
-                if (self._payment_parked_state(swap) == 'absent'
+                if (parked_state == 'absent'
                         and current_height > swap.locktime + self.config.sweep_grace_blocks):
                     self._expire_never_parked_swap(swap)
                     return
@@ -1510,7 +1557,8 @@ class SwapManager:
     ) -> Tuple[SwapData, str, Optional[str]]:
         """creates a hold invoice"""
         if prepay:
-            prepay_amount_sat = self.get_claim_fee() * 2
+            # R2-3: feerates is a blocking lightningd RPC — off the loop
+            prepay_amount_sat = await asyncio.to_thread(self.get_claim_fee) * 2
             invoice_amount_sat = lightning_amount_sat - prepay_amount_sat
         else:
             invoice_amount_sat = lightning_amount_sat
@@ -2464,8 +2512,14 @@ class NostrTransport:  # (Logger):
             # regression guard (issue #11): an exception raised by any one
             # DM can never propagate to this loop
             try:
-                if 'reply_to' in content:
-                    self.dm_replies[content['reply_to']].set_result(content)
+                # R2-4c: any nostr key can send a DM with a junk
+                # reply_to — the old defaultdict access created one
+                # never-awaited Future per junk DM (unbounded, free
+                # spam). Only futures WE created are demuxed; junk falls
+                # through to the unknown-shape warning. pop() bounds the
+                # client-side dict too.
+                if 'reply_to' in content and content['reply_to'] in self.dm_replies:
+                    self.dm_replies.pop(content['reply_to']).set_result(content)
                 elif self.sm.is_server and 'method' in content:
                     await self.handle_request(content)
                     tracker.note_success('nostr-consumer')

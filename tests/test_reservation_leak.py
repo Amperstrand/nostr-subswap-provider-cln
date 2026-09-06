@@ -177,6 +177,7 @@ def _sm_with_parked_invoice(callbacks):
     sm.invoices_to_pay = {}
     sm.invoices_awaiting_funding = set()
     sm._funding_gate_deadline = {}
+    sm.prepayments = {}
     sm.lnwatcher = MagicMock()
     sm.lnworker = MagicMock()
     sm.lnworker._hold_invoice_callbacks = callbacks
