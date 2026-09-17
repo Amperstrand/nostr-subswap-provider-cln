@@ -401,3 +401,38 @@ actionable was implemented, deployed, and verified. Summary:
   export instead
 - The plugin repo has ~117 commits of port/electrum-4.8 lineage; always
   check which branch you're on in shared repos before committing
+
+## Process hygiene — teardown + orphan collection (2026-09-17 sweep)
+
+Context: sessions for this repo run on shared boxes (ai-legion-small: 32 GB,
+many concurrent agent sessions; oomd killed the whole user manager there on
+2026-09-16). The 2026-09-17 orphan sweep found this repo's leftovers still
+running long after their sessions ended: `fakeprov.py` (launched Aug 22 from
+this repo's cwd, its `../electrum/.venv` interpreter since deleted) and
+liveness stub processes (`stub-echo.py`, `stub-ready-silent.py`,
+`stub-garbage.py`) holding signet wss connections with zero connected peers.
+
+### What this repo spawns (and its teardown)
+
+| Artifact | How it starts | Teardown when done |
+|---|---|---|
+| `fakeprov.py` / fake backends | test rigs | `pkill -f fakeprov` |
+| nostr stubs (`tests/nostr/stub-*.py`) | liveness rigs | `pkill -f "stub-(echo\|garbage\|ready)"` |
+| electrum daemons / venv tooling | manual test runs | `pgrep -af electrum`, verify each, kill owned ones |
+
+### Orphan hunt (run before ending a session; on box-health alerts)
+
+```bash
+pgrep -af "fakeprov\|stub-echo\|stub-garbage\|stub-ready" | grep -v grep
+ss -tnp 2>/dev/null | grep python3   # stubs hold wss peers — zero peers for days = stranded
+```
+
+### Rules
+
+1. Backends launch under `systemd-run --user --unit=nostr-subswap-<name>
+   --same-dir ...` (teardown: `systemctl --user stop nostr-subswap-<name>`)
+   or wrapped in `timeout` — never a bare `nohup`/`setsid` without a stop path.
+2. Scratch (fake providers, stubs, their venvs) lives in the repo or in a
+   `/tmp/opencode/<session>` dir the same session deletes at exit.
+3. A session that dies leaves its garbage to the NEXT session in this repo:
+   run the orphan hunt first, collect, then start work.
