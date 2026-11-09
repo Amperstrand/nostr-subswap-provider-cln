@@ -204,6 +204,7 @@ class SwapManager:
                  db: JsonDB, plugin_config: PluginConfig, logger: PluginLogger, chain_monitor: ChainMonitor):
         self.logger = logger
         self.normal_fee = None
+        self.pinned_fees = None
         self.lockup_fee = None
         self.claim_fee = None  # part of the boltz prococol, not used by Electrum
         self.percentage = None
@@ -303,20 +304,42 @@ class SwapManager:
                             cadence = 30
                         else:
                             cadence = 600
-                        # issue #20: wake early if the DM consumer dies —
-                        # withdraw immediately instead of announcing into a
-                        # dead request pipeline for the rest of the cadence
+                        # issue #390: fee-watched cadence — the announced
+                        # fees were pinned at publish time; a >2% live move
+                        # must republish EARLY or requesters keep quoting
+                        # the stale offer. Slice the cadence into 30s
+                        # watches that keep issue #20's dead-flag bound.
                         try:
-                            await asyncio.wait_for(transport.dead.wait(), timeout=cadence)
-                        except asyncio.TimeoutError:
-                            pass  # normal cadence expiry
-                        if transport.dead.is_set():
-                            self.logger.error('nostr DM consumer died — withdrawing offer '
-                                              '(no further kind-30315 republishes) and '
-                                              'refusing new swap requests until the '
-                                              'transport restarts')
-                            self.is_initialized.clear()
-                            break
+                            prev = dict(self._effective_fees())
+                        except (TypeError, AttributeError):
+                            # bare/mock instances: no fee snapshot -> the
+                            # watch degrades to a plain cadence sleep
+                            prev = None
+                        elapsed = 0
+                        republished = False
+                        while elapsed < cadence and not republished:
+                            try:
+                                await asyncio.wait_for(transport.dead.wait(), timeout=30)
+                            except asyncio.TimeoutError:
+                                pass  # normal slice expiry
+                            if transport.dead.is_set():
+                                self.logger.error('nostr DM consumer died — withdrawing offer '
+                                                  '(no further kind-30315 republishes) and '
+                                                  'refusing new swap requests until the '
+                                                  'transport restarts')
+                                self.is_initialized.clear()
+                                break
+                            cur = (self.normal_fee, self.lockup_fee, self.claim_fee)
+                            if prev and any(c and p and abs(c - p) > max(1, int(p * 0.02))
+                                            for c, p in zip(cur, prev.values())):
+                                self.logger.info(f'feerate moved >2% ({prev} -> {cur}); '
+                                                 'republishing offer early')
+                                republished = True
+                            else:
+                                elapsed += 30
+                        # republished or cadence expired -> next outer
+                        # iteration re-publishes at the loop top; a dead
+                        # transport falls out of the outer while entirely.
             except asyncio.TimeoutError:
                 self.logger.warning(f"Nostr timeout, restarting Nostr module")
             await asyncio.sleep(15)
@@ -1094,6 +1117,40 @@ class SwapManager:
         self.lockup_fee = self.normal_fee
         self.claim_fee = self.normal_fee
 
+    def pin_fees_to_offer(self) -> None:
+        """Freeze the fees the last published offer announced.
+
+        The nostr offer is the ONLY fee source the client can guard
+        against; if request-time accounting used the live cache
+        (refreshed on the 10-min offer cadence), any fee rise between
+        a client reading the offer and its request trips the client's
+        fee-guard ("mining fee larger than announced") — the #390
+        live-fire symptom. Quote and request accounting must therefore
+        use exactly the fees the current offer carries.
+        """
+        self.pinned_fees = {
+            'normal': self.normal_fee,
+            'lockup': self.lockup_fee,
+            'claim': self.claim_fee,
+        }
+
+
+    def _effective_fees(self):
+        """Request-time fees: exactly the last PUBLISHED offer's, so the
+        client's fee-guard (fed by the same offer) can never trip on
+        intra-cycle drift. Falls back to the live cache before the
+        first offer is published."""
+        pinned = getattr(self, 'pinned_fees', None)
+        if pinned:
+            return (pinned['normal'], pinned['lockup'], pinned['claim'])
+        live = tuple(getattr(self, a, None)
+                     for a in ('normal_fee', 'lockup_fee', 'claim_fee'))
+        if all(f is not None for f in live):
+            return live
+        # bare instance (test fixtures bypass __init__); callers treat
+        # falsy fees as a no-op
+        return (None, None, None)
+
     def get_max_amount(self):
         return self._max_amount
 
@@ -1113,19 +1170,20 @@ class SwapManager:
             return
         x = Decimal(send_amount)
         percentage = Decimal(self.percentage)
+        normal_fee, lockup_fee, _claim_fee = self._effective_fees()
         if is_reverse:
             if not self.check_invoice_amount(x):
                 return
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L948
             percentage_fee = math.ceil(percentage * x / 100)
-            base_fee = self.lockup_fee
+            base_fee = lockup_fee
             x -= percentage_fee + base_fee
             x = math.floor(x)
             if x < dust_threshold():
                 return
         else:
-            x -= self.normal_fee
+            x -= normal_fee
             percentage_fee = math.ceil(x * percentage / (100 + percentage))
             x -= percentage_fee
             if not self.check_invoice_amount(x):
@@ -1143,11 +1201,12 @@ class SwapManager:
             return
         x = Decimal(recv_amount)
         percentage = Decimal(self.percentage)
+        normal_fee, lockup_fee, _claim_fee = self._effective_fees()
         if is_reverse:
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L928
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L958
-            base_fee = self.lockup_fee
+            base_fee = lockup_fee
             x += base_fee
             x = math.ceil(x / ((100 - percentage) / 100))
             if not self.check_invoice_amount(x):
@@ -1159,7 +1218,7 @@ class SwapManager:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L708
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/rates/FeeProvider.ts#L90
             percentage_fee = math.ceil(percentage * x / 100)
-            x += percentage_fee + self.normal_fee
+            x += percentage_fee + normal_fee
         x = int(x)
         return x
 
@@ -1418,6 +1477,9 @@ class NostrTransport:  # (Logger):
             tags=tags,
             private_key=self.nostr_private_key)
         self.logger.debug(f'published offer: {content} | event id: {event_id}')
+        # issue #390: the fees quoted in this offer are now the pinned
+        # request-time fees until the next publish
+        self.sm.pin_fees_to_offer()
         self.sm.is_initialized.set()
 
     @log_exceptions
