@@ -125,6 +125,7 @@ class SwapManager:
                  db: JsonDB, plugin_config: PluginConfig, logger: PluginLogger, chain_monitor: ChainMonitor):
         self.logger = logger
         self.normal_fee = None
+        self.pinned_fees = None
         self.lockup_fee = None
         self.claim_fee = None  # part of the boltz prococol, not used by Electrum
         self.percentage = None
@@ -171,13 +172,20 @@ class SwapManager:
                     await transport.is_connected.wait()
                     self.logger.info(f'nostr is connected')
                     while True:
-                        # todo: publish everytime fees have changed
                         self.server_update_pairs()
                         await transport.publish_offer()
                         if not self.is_initialized.is_set():  # if publish offer didn't set initialized we retry faster
                             await asyncio.sleep(10)
                             continue
-                        await asyncio.sleep(600)
+                        for _ in range(20):  # 20 x 30s = the old 600s cadence, fee-watched
+                            await asyncio.sleep(30)
+                            prev = dict(self._effective_fees())
+                            self.server_update_pairs()
+                            cur = (self.normal_fee, self.lockup_fee, self.claim_fee)
+                            if any(c and p and abs(c - p) > max(1, int(p * 0.02)) for c, p in zip(cur, prev.values())):
+                                self.logger.info(f'feerate moved >2% ({prev} -> {cur}); republishing offer early')
+                                await transport.publish_offer()
+                                break
             except asyncio.TimeoutError:
                 self.logger.warning(f"Nostr timeout, restarting Nostr module")
             await asyncio.sleep(15)
@@ -633,6 +641,33 @@ class SwapManager:
         self.lockup_fee = self.get_fee(size_vb=LOCKUP_FEE_SIZE)
         self.claim_fee = self.get_fee(size_vb=CLAIM_FEE_SIZE)
 
+    def pin_fees_to_offer(self) -> None:
+        """Freeze the fees the last published offer announced.
+
+        The nostr offer is the ONLY fee source the client can guard
+        against; if request-time accounting used the live cache
+        (refreshed on the 10-min offer cadence), any fee rise between
+        a client reading the offer and its request trips the client's
+        fee-guard ("mining fee larger than announced") — the #390
+        live-fire symptom. Quote and request accounting must therefore
+        use exactly the fees the current offer carries.
+        """
+        self.pinned_fees = {
+            'normal': self.normal_fee,
+            'lockup': self.lockup_fee,
+            'claim': self.claim_fee,
+        }
+
+
+    def _effective_fees(self):
+        """Request-time fees: exactly the last PUBLISHED offer's, so the
+        client's fee-guard (fed by the same offer) can never trip on
+        intra-cycle drift. Falls back to the live cache before the
+        first offer is published."""
+        if self.pinned_fees:
+            return (self.pinned_fees['normal'], self.pinned_fees['lockup'], self.pinned_fees['claim'])
+        return (self.normal_fee, self.lockup_fee, self.claim_fee)
+
     def get_max_amount(self):
         return self._max_amount
 
@@ -652,19 +687,20 @@ class SwapManager:
             return
         x = Decimal(send_amount)
         percentage = Decimal(self.percentage)
+        normal_fee, lockup_fee, _claim_fee = self._effective_fees()
         if is_reverse:
             if not self.check_invoice_amount(x):
                 return
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L948
             percentage_fee = math.ceil(percentage * x / 100)
-            base_fee = self.lockup_fee
+            base_fee = lockup_fee
             x -= percentage_fee + base_fee
             x = math.floor(x)
             if x < dust_threshold():
                 return
         else:
-            x -= self.normal_fee
+            x -= normal_fee
             percentage_fee = math.ceil(x * percentage / (100 + percentage))
             x -= percentage_fee
             if not self.check_invoice_amount(x):
@@ -682,11 +718,12 @@ class SwapManager:
             return
         x = Decimal(recv_amount)
         percentage = Decimal(self.percentage)
+        normal_fee, lockup_fee, _claim_fee = self._effective_fees()
         if is_reverse:
             # see/ref:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L928
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L958
-            base_fee = self.lockup_fee
+            base_fee = lockup_fee
             x += base_fee
             x = math.ceil(x / ((100 - percentage) / 100))
             if not self.check_invoice_amount(x):
@@ -698,7 +735,7 @@ class SwapManager:
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/service/Service.ts#L708
             # https://github.com/BoltzExchange/boltz-backend/blob/e7e2d30f42a5bea3665b164feb85f84c64d86658/lib/rates/FeeProvider.ts#L90
             percentage_fee = math.ceil(percentage * x / 100)
-            x += percentage_fee + self.normal_fee
+            x += percentage_fee + normal_fee
         x = int(x)
         return x
 
@@ -892,6 +929,7 @@ class NostrTransport:  # (Logger):
             tags=tags,
             private_key=self.nostr_private_key)
         self.logger.debug(f'published fee update. Update: {update} | Event id: {event_id}')
+        self.sm.pin_fees_to_offer()
         self.sm.is_initialized.set()
 
     @log_exceptions
