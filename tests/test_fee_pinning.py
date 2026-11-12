@@ -137,3 +137,17 @@ def test_dust_guard_still_applies():
     s = _stub(10**9, 10**9, 10**9)  # absurd fees
     s.pin_fees_to_offer()
     assert s._get_recv_amount(100000, is_reverse=True) is None
+
+
+def test_module_imports_without_workarounds():
+    """The live plugin crashed at getmanifest (deployed 2026-11-12):
+    a sync method carried @log_exceptions, which asserts coroutines at
+    import time. This suite's log_exceptions passthrough monkeypatch had
+    been masking that. The module must import BARE — no patches first."""
+    import subprocess, sys
+    code = "import sys; sys.path.insert(0, 'swap-provider'); " \
+           "import plugin.submarine_swaps as m; " \
+           "assert hasattr(m, 'SwapManager'); print('BARE-IMPORT-OK')"
+    r = subprocess.run([sys.executable, "-c", code], cwd=".",
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "BARE-IMPORT-OK" in r.stdout, r.stderr[-500:]

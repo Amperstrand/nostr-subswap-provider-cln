@@ -620,7 +620,9 @@ class SwapManager:
         )
         return tx
 
-    @log_exceptions
+    # NOTE: @log_exceptions asserts coroutines at import time; this method
+    # is sync (crashed the live plugin at getmanifest — deployed 2026-11-12,
+    # reverted same minute). Do not decorate sync methods with it.
     def broadcast_funding_tx(self, swap: SwapData, tx: PartialTransaction) -> None:
         swap.funding_txid = tx.txid()
         self.wallet.broadcast_transaction(tx)
